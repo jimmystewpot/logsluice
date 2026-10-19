@@ -442,6 +442,5 @@ fn recovery_releases_unreferenced_resources() {
 
     let recovered = RecoveredState::load(&store, &ctx).unwrap();
     assert!(recovered.resources.is_empty());
-    assert_eq!(recovered.released_resources, vec![7]);
     assert!(store.resources().unwrap().is_empty());
 }

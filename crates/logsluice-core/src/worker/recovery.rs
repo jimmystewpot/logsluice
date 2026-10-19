@@ -35,8 +35,6 @@ pub struct RecoveredState {
     pub known_partitions: Vec<(Arc<str>, i32)>,
     /// Number of pending disk spill files found on startup.
     pub spill_files: usize,
-    /// Resource IDs that had no remaining live window references during recovery.
-    pub released_resources: Vec<u32>,
 }
 
 impl Default for RecoveredState {
@@ -57,7 +55,6 @@ impl RecoveredState {
             tickets: Vec::new(),
             known_partitions: Vec::new(),
             spill_files: 0,
-            released_resources: Vec::new(),
         }
     }
 
@@ -168,7 +165,6 @@ impl RecoveredState {
             tickets,
             known_partitions,
             spill_files,
-            released_resources,
         })
     }
 

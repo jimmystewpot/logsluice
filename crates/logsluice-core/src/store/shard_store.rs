@@ -790,12 +790,6 @@ impl ShardStore {
         Ok(())
     }
 
-    /// Returns the filesystem directory path for this shard store.
-    #[must_use]
-    pub fn shard_dir(&self) -> &Path {
-        &self.opts.shard_dir
-    }
-
     /// Returns the sorted list of all keyspace names currently present in the underlying database.
     #[must_use]
     pub fn list_keyspace_names(&self) -> Vec<String> {
@@ -813,6 +807,12 @@ impl ShardStore {
     #[doc(hidden)]
     pub fn set_fail_drop_after_tail(&mut self, fail: bool) {
         self.fail_drop_after_tail = fail;
+    }
+
+    /// Returns the filesystem directory path for this shard store.
+    #[must_use]
+    pub fn shard_dir(&self) -> &Path {
+        &self.opts.shard_dir
     }
 
     /// Calculates total physical storage size in bytes by walking `shard_dir`.
@@ -898,16 +898,16 @@ fn tail_create_options(max_mem: u64) -> KeyspaceCreateOptions {
         .max_memtable_size(max_mem)
 }
 
-fn parse_hdr_epoch(name: &str) -> Option<u64> {
-    if name.len() == 25 && name.starts_with('w') && name.ends_with("_hdr") {
+fn parse_tail_epoch(name: &str) -> Option<u64> {
+    if name.len() == 26 && name.starts_with('w') && name.ends_with("_tail") {
         name[1..21].parse::<u64>().ok()
     } else {
         None
     }
 }
 
-fn parse_tail_epoch(name: &str) -> Option<u64> {
-    if name.len() == 26 && name.starts_with('w') && name.ends_with("_tail") {
+fn parse_hdr_epoch(name: &str) -> Option<u64> {
+    if name.len() == 25 && name.starts_with('w') && name.ends_with("_hdr") {
         name[1..21].parse::<u64>().ok()
     } else {
         None

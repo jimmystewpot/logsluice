@@ -1,0 +1,232 @@
+//! Disk spill writer managing unacknowledged aggregate records during sink outages.
+
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+
+use crate::emission::SliceRecord;
+use crate::error::{AggError, AggResult};
+
+/// Spill writer handling atomic disk persistence and replay of unacknowledged slices.
+#[derive(Clone, Debug)]
+pub struct SpillWriter {
+    spill_dir: PathBuf,
+}
+
+impl SpillWriter {
+    /// Creates a new `SpillWriter` managing the `spill/` directory under `dir`.
+    ///
+    /// If `dir` already ends with `spill`, uses `dir` directly; otherwise uses `dir.join("spill")`.
+    #[must_use]
+    pub fn new(dir: PathBuf) -> Self {
+        let spill_dir = if dir.file_name().is_some_and(|name| name == "spill") {
+            dir
+        } else {
+            dir.join("spill")
+        };
+        Self { spill_dir }
+    }
+
+    /// Returns a reference to the underlying spill directory path.
+    #[must_use]
+    pub fn spill_dir(&self) -> &Path {
+        &self.spill_dir
+    }
+
+    /// Atomically persists `records` for `ticket_id` as NDJSON to `spill/{ticket_id:020}.ndjson`.
+    ///
+    /// Uses write -> fsync -> atomic rename.
+    ///
+    /// # Errors
+    /// Returns [`AggError::Io`] or [`AggError::Codec`] if disk write or serialization fails.
+    pub fn spill(&mut self, ticket_id: u64, records: &[SliceRecord]) -> AggResult<()> {
+        fs::create_dir_all(&self.spill_dir).map_err(AggError::Io)?;
+
+        let filename = format!("{ticket_id:020}.ndjson");
+        let target_path = self.spill_dir.join(&filename);
+        let temp_path = self.spill_dir.join(format!(".{ticket_id:020}.ndjson.tmp"));
+
+        let mut file = File::create(&temp_path).map_err(AggError::Io)?;
+        for record in records {
+            let line = serde_json::to_string(record).map_err(|e| AggError::Codec(e.to_string()))?;
+            file.write_all(line.as_bytes()).map_err(AggError::Io)?;
+            file.write_all(b"\n").map_err(AggError::Io)?;
+        }
+        file.sync_all().map_err(AggError::Io)?;
+        drop(file);
+
+        fs::rename(&temp_path, &target_path).map_err(AggError::Io)?;
+
+        if let Ok(dir_file) = File::open(&self.spill_dir) {
+            let _ = dir_file.sync_all();
+        }
+
+        Ok(())
+    }
+
+    /// Reads all pending spill files, returning them sorted by ticket ID.
+    ///
+    /// # Errors
+    /// Returns [`AggError::Io`] or [`AggError::Codec`] if reading or deserializing fails.
+    pub fn pending(&self) -> AggResult<Vec<(u64, Vec<SliceRecord>)>> {
+        if !self.spill_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let entries = fs::read_dir(&self.spill_dir).map_err(AggError::Io)?;
+        let mut results = Vec::new();
+
+        for entry in entries {
+            let entry = entry.map_err(AggError::Io)?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let file_name = match path.file_name().and_then(|s| s.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+
+            if file_name.starts_with('.') || !file_name.ends_with(".ndjson") {
+                continue;
+            }
+
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let ticket_id = match stem.parse::<u64>() {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+
+            let file = File::open(&path).map_err(AggError::Io)?;
+            let reader = BufReader::new(file);
+            let mut records = Vec::new();
+
+            for line in reader.lines() {
+                let line = line.map_err(AggError::Io)?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let record: SliceRecord =
+                    serde_json::from_str(&line).map_err(|e| AggError::Codec(e.to_string()))?;
+                records.push(record);
+            }
+
+            results.push((ticket_id, records));
+        }
+
+        results.sort_by_key(|(id, _)| *id);
+        Ok(results)
+    }
+
+    /// Deletes the spill file for `ticket_id` if it exists.
+    ///
+    /// # Errors
+    /// Returns [`AggError::Io`] if deletion fails.
+    pub fn remove(&mut self, ticket_id: u64) -> AggResult<()> {
+        let filename = format!("{ticket_id:020}.ndjson");
+        let target_path = self.spill_dir.join(&filename);
+        if target_path.exists() {
+            fs::remove_file(&target_path).map_err(AggError::Io)?;
+        }
+        Ok(())
+    }
+
+    /// Counts pending `.ndjson` spill files in the spill directory without opening or deserializing them.
+    #[must_use]
+    pub fn count_files(&self) -> usize {
+        let Ok(entries) = fs::read_dir(&self.spill_dir) else {
+            return 0;
+        };
+        let mut count = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !file_name.starts_with('.') && file_name.ends_with(".ndjson") {
+                count += 1;
+            }
+        }
+        count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    use crate::codec::tail::ExemplarTail;
+    use crate::codec::ticket::EmitReason;
+    use crate::resource::ResourceScopePayload;
+
+    fn sample_record(_ticket_id: u64, digest: u128) -> SliceRecord {
+        SliceRecord {
+            window_start_ms: 0,
+            window_end_ms: 60_000,
+            emit_reason: EmitReason::Close,
+            emitter_id: "emitter-0".to_string(),
+            digest,
+            slice_seq: 0,
+            slice_id: format!("emitter-0:0:{digest:032x}:0"),
+            resource: Arc::new(ResourceScopePayload {
+                resource: Default::default(),
+                scope_name: "test".to_string(),
+                scope_version: "1.0".to_string(),
+                scope_attrs: Default::default(),
+            }),
+            tail: ExemplarTail {
+                severity: 0,
+                body: None,
+                dims: Vec::new(),
+                attrs: Vec::new(),
+            },
+            counters: vec![[1, 0, 0, 0]],
+            minmax: vec![(10, 20)],
+        }
+    }
+
+    #[test]
+    fn test_spill_write_pending_remove() {
+        let tmp = tempdir().expect("tempdir");
+        let mut writer = SpillWriter::new(tmp.path().to_path_buf());
+
+        assert_eq!(writer.count_files(), 0);
+        assert!(writer.pending().expect("pending").is_empty());
+
+        let r1 = sample_record(42, 100);
+        let r2 = sample_record(42, 200);
+        writer.spill(42, &[r1.clone(), r2.clone()]).expect("spill");
+
+        let r3 = sample_record(10, 300);
+        writer.spill(10, std::slice::from_ref(&r3)).expect("spill");
+
+        assert_eq!(writer.count_files(), 2);
+        let pending = writer.pending().expect("pending");
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].0, 10);
+        assert_eq!(pending[0].1, vec![r3]);
+        assert_eq!(pending[1].0, 42);
+        assert_eq!(pending[1].1, vec![r1, r2]);
+
+        writer.remove(10).expect("remove");
+        assert_eq!(writer.count_files(), 1);
+        let pending = writer.pending().expect("pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, 42);
+
+        writer.remove(42).expect("remove");
+        assert_eq!(writer.count_files(), 0);
+        let pending = writer.pending().expect("pending");
+        assert!(pending.is_empty());
+    }
+}

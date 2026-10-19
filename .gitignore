@@ -1,0 +1,6 @@
+/target
+**/.DS_Store
+*.swp
+/lcov.info
+/clippy-report.json
+/bench-output.txt

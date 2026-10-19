@@ -1,0 +1,36 @@
+[package]
+name = "logsluice"
+description = "Standalone async Tokio pipeline, OTLP/JSON log router, field normalizers, and slice renderer for logsluice."
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+hashbrown = { workspace = true }
+humantime-serde = { workspace = true }
+indexmap = { workspace = true }
+logsluice-core = { workspace = true }
+metrics = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+serde_yaml_ng = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }

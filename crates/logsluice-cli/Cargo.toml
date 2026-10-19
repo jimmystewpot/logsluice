@@ -1,0 +1,33 @@
+[package]
+name = "logsluice-cli"
+description = "Deterministic crash-recovery replay harness and offline PVC state drain CLI for logsluice."
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "logsluice"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+futures-channel = { workspace = true }
+hashbrown = { workspace = true }
+logsluice-core = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }

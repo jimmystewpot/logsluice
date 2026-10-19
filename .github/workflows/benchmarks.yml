@@ -10,7 +10,7 @@ jobs:
   benchmark-smoke:
     name: Criterion Hot-Path Smoke (PR)
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-logsluice
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
@@ -23,7 +23,7 @@ jobs:
   benchmark-continuous:
     name: Criterion Continuous Benchmark (main)
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-logsluice
     permissions:
       contents: write
     steps:

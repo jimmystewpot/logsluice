@@ -59,6 +59,28 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
     assert!(dependabot.contains("package-ecosystem: \"cargo\""));
     assert!(dependabot.contains("package-ecosystem: \"github-actions\""));
 
+    for wf_rel in [
+        ".github/workflows/ci.yml",
+        ".github/workflows/sonarcloud.yml",
+        ".github/workflows/benchmarks.yml",
+        ".github/workflows/release.yml",
+    ] {
+        let wf = fs::read_to_string(root.join(wf_rel)).unwrap();
+        assert!(
+            wf.contains("runs-on: arc-runner-logsluice"),
+            "{wf_rel} must specify runs-on: arc-runner-logsluice"
+        );
+        for line in wf.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("runs-on:") {
+                assert_eq!(
+                    trimmed, "runs-on: arc-runner-logsluice",
+                    "{wf_rel} contains non-ARC runner declaration: {trimmed}"
+                );
+            }
+        }
+    }
+
     for crate_dir in [
         "crates/logsluice-core",
         "crates/logsluice",

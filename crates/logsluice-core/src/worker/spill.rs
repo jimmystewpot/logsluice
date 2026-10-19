@@ -66,11 +66,12 @@ impl SpillWriter {
 
     /// Reads all pending spill files, returning them sorted by ticket ID.
     ///
-    /// Corrupt or unreadable `.ndjson` files are quarantined by renaming them to
+    /// Corrupt `.ndjson` files are quarantined by renaming them to
     /// `<id>.ndjson.corrupt` and skipped so valid spill files can still be replayed.
     ///
     /// # Errors
-    /// Returns [`AggError::Io`] if reading the spill directory fails.
+    /// Returns [`AggError::Io`] if reading the spill directory, reading a spill file, or
+    /// quarantining a corrupt file fails.
     pub fn pending(&self) -> AggResult<Vec<(u64, Vec<SliceRecord>)>> {
         if !self.spill_dir.exists() {
             return Ok(Vec::new());
@@ -95,21 +96,23 @@ impl SpillWriter {
                 continue;
             }
 
-            let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) => s,
-                None => continue,
-            };
+            let ticket_id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok());
 
-            let ticket_id = match stem.parse::<u64>() {
-                Ok(id) => id,
-                Err(_) => continue,
-            };
-
-            match Self::read_spill_file(&path) {
-                Ok(records) => results.push((ticket_id, records)),
-                Err(_) => {
+            match ticket_id {
+                Some(id) => match Self::read_spill_file(&path) {
+                    Ok(records) => results.push((id, records)),
+                    Err(AggError::Codec(_)) => {
+                        let corrupt_path = path.with_extension("ndjson.corrupt");
+                        fs::rename(&path, corrupt_path).map_err(AggError::Io)?;
+                    }
+                    Err(err) => return Err(err),
+                },
+                None => {
                     let corrupt_path = path.with_extension("ndjson.corrupt");
-                    let _ = fs::rename(&path, corrupt_path);
+                    fs::rename(&path, corrupt_path).map_err(AggError::Io)?;
                 }
             }
         }
@@ -275,5 +278,32 @@ mod tests {
         let second = writer.pending().expect("second pending call");
         assert_eq!(second, first);
         assert_eq!(writer.count_files(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_propagates_error_when_quarantine_rename_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().expect("tempdir");
+        let writer = SpillWriter::new(tmp.path().to_path_buf());
+        fs::create_dir_all(writer.spill_dir()).expect("create spill dir");
+
+        let corrupt_orig = writer.spill_dir().join(format!("{:020}.ndjson", 1));
+        fs::write(&corrupt_orig, b"{broken json\n").expect("write corrupt file");
+
+        fs::set_permissions(writer.spill_dir(), fs::Permissions::from_mode(0o555))
+            .expect("chmod 0555");
+
+        let res = writer.pending();
+
+        fs::set_permissions(writer.spill_dir(), fs::Permissions::from_mode(0o755))
+            .expect("restore chmod 0755");
+
+        assert!(
+            matches!(res, Err(AggError::Io(_))),
+            "expected AggError::Io when quarantine rename fails, got {res:?}"
+        );
+        assert!(corrupt_orig.exists());
     }
 }

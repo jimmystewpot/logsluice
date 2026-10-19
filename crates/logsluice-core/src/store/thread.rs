@@ -155,6 +155,7 @@ pub struct StoreHandle<F> {
     tx: SyncSender<StoreCommand<F>>,
     fail_next_flush: Arc<AtomicBool>,
     fail_next_disk_bytes: Arc<AtomicBool>,
+    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<F> Clone for StoreHandle<F> {
@@ -163,6 +164,7 @@ impl<F> Clone for StoreHandle<F> {
             tx: self.tx.clone(),
             fail_next_flush: Arc::clone(&self.fail_next_flush),
             fail_next_disk_bytes: Arc::clone(&self.fail_next_disk_bytes),
+            queued: std::sync::Arc::clone(&self.queued),
         }
     }
 }
@@ -179,9 +181,40 @@ impl<F> StoreHandle<F> {
     /// # Errors
     /// Returns [`AggError::Channel`] if the worker thread receiver has disconnected.
     pub fn send(&self, cmd: StoreCommand<F>) -> AggResult<()> {
-        self.tx
-            .send(cmd)
-            .map_err(|e| AggError::Channel(e.to_string()))
+        self.queued
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.tx.send(cmd).map_err(|e| {
+            self.queued
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            AggError::Channel(e.to_string())
+        })
+    }
+
+    /// Attempts to send a storage command without blocking the calling thread.
+    ///
+    /// # Errors
+    /// Returns `Err(cmd)` with the original command if the bounded queue is full or disconnected.
+    #[allow(clippy::result_large_err)]
+    pub fn try_send(&self, cmd: StoreCommand<F>) -> Result<(), StoreCommand<F>> {
+        self.queued
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        match self.tx.try_send(cmd) {
+            Ok(()) => Ok(()),
+            Err(
+                std::sync::mpsc::TrySendError::Full(cmd)
+                | std::sync::mpsc::TrySendError::Disconnected(cmd),
+            ) => {
+                self.queued
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                Err(cmd)
+            }
+        }
+    }
+
+    /// Returns the number of commands currently buffered in the storage command queue.
+    #[must_use]
+    pub fn queue_depth(&self) -> usize {
+        self.queued.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Arms a one-shot simulated `apply_flush` error on the next `StoreCommand::Flush` processed by this shard.
@@ -231,6 +264,8 @@ impl StoreThread {
         let shared_fail_next_disk_bytes = Arc::new(AtomicBool::new(false));
         let thread_fail_next_flush = Arc::clone(&shared_fail_next_flush);
         let thread_fail_next_disk_bytes = Arc::clone(&shared_fail_next_disk_bytes);
+        let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let thread_queued = std::sync::Arc::clone(&queued);
 
         let join_handle = std::thread::Builder::new()
             .name("shard-store-worker".to_string())
@@ -240,6 +275,7 @@ impl StoreThread {
                 let mut fail_next_rows = false;
                 let mut last_disk_bytes = store.disk_bytes().unwrap_or(0);
                 while let Ok(cmd) = rx_cmd.recv() {
+                    thread_queued.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                     match cmd {
                         StoreCommand::Flush(buf) => {
                             let (batch, finalizers) = buf.into_flush();
@@ -445,6 +481,7 @@ impl StoreThread {
                 tx: tx_cmd,
                 fail_next_flush: shared_fail_next_flush,
                 fail_next_disk_bytes: shared_fail_next_disk_bytes,
+                queued,
             },
             rx_event,
             join_handle,

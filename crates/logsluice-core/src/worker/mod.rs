@@ -212,6 +212,8 @@ pub struct WorkerStats {
     pub dropped_events_total: u64,
     /// Number of disk spill files currently stored.
     pub spill_files: usize,
+    /// Number of storage commands currently queued or deferred awaiting dispatch.
+    pub store_cmd_queue_depth: usize,
 }
 
 /// Shard aggregation worker managing in-memory buffering, state machines, and lifecycle transitions.
@@ -227,7 +229,7 @@ pub struct ShardWorker<F> {
     windows: HashMap<u64, WindowState>,
     last_flush_ms: i64,
     stats: WorkerStats,
-    pending_commands: Vec<StoreCommand<F>>,
+    pending_commands: VecDeque<StoreCommand<F>>,
     pending_rows: HashMap<u64, Vec<JoinedRow>>,
     disk_override: Option<u64>,
     disk_full: bool,
@@ -271,7 +273,7 @@ impl<F> ShardWorker<F> {
             windows: recovered.windows,
             last_flush_ms: 0,
             stats: WorkerStats::default(),
-            pending_commands: Vec::new(),
+            pending_commands: VecDeque::new(),
             pending_rows: HashMap::new(),
             disk_override: None,
             disk_full: false,
@@ -285,6 +287,22 @@ impl<F> ShardWorker<F> {
             persist_tickets_inflight: 0,
             evict_ack_epochs: HashMap::new(),
         }
+    }
+
+    /// Defers a storage command to be retried on the next worker output pass.
+    pub fn defer_command(&mut self, cmd: StoreCommand<F>) {
+        self.pending_commands.push_back(cmd);
+    }
+
+    /// Requeues multiple unsent storage commands in FIFO order to be retried on the next worker output pass.
+    pub fn requeue_commands(&mut self, cmds: impl IntoIterator<Item = StoreCommand<F>>) {
+        self.pending_commands.extend(cmds);
+    }
+
+    /// Returns the number of storage commands currently deferred in the worker retry queue.
+    #[must_use]
+    pub fn pending_commands_len(&self) -> usize {
+        self.pending_commands.len()
     }
 
     /// Returns the effective database disk usage in bytes, respecting any test override.
@@ -362,6 +380,7 @@ impl<F> ShardWorker<F> {
     pub fn is_drain_idle(&self) -> bool {
         if self.double_buf.flush_in_flight()
             || !self.double_buf.active().is_empty()
+            || !self.pending_commands.is_empty()
             || self.drain_in_progress
             || self.store_queries_inflight > 0
             || self.persist_tickets_inflight > 0
@@ -441,6 +460,7 @@ impl<F> ShardWorker<F> {
     /// Re-issues row read requests for all restored unacknowledged tickets.
     pub fn recovery_output(&mut self) -> WorkerOutput<F> {
         let mut output = WorkerOutput::default();
+        output.commands.extend(self.pending_commands.drain(..));
         self.drain_restored_tickets(&mut output);
         output
     }
@@ -448,7 +468,7 @@ impl<F> ShardWorker<F> {
     /// Initiates a clean shutdown drain of all buffered in-memory records and active windows.
     pub fn begin_drain(&mut self, deadline_ms: i64) -> WorkerOutput<F> {
         let mut output = WorkerOutput::default();
-        output.commands.append(&mut self.pending_commands);
+        output.commands.extend(self.pending_commands.drain(..));
         self.drain_deadline_ms = Some(deadline_ms);
 
         if !self.double_buf.active().is_empty() {
@@ -480,6 +500,7 @@ impl<F> ShardWorker<F> {
     /// Explicitly flushes the active L1 buffer to storage if not empty.
     pub fn flush_l1(&mut self, now_ms: i64) -> WorkerOutput<F> {
         let mut output = WorkerOutput::default();
+        output.commands.extend(self.pending_commands.drain(..));
         if !self.double_buf.active().is_empty()
             && let Some(swapped) = self.double_buf.try_swap()
         {
@@ -520,7 +541,8 @@ impl<F> ShardWorker<F> {
         if self.double_buf.active().len() >= self.ctx.cfg.storage.l1_coalesce_max_keys {
             if let Some(swapped) = self.double_buf.try_swap() {
                 self.last_flush_ms = now_ms;
-                self.pending_commands.push(StoreCommand::Flush(swapped));
+                self.pending_commands
+                    .push_back(StoreCommand::Flush(swapped));
             } else {
                 return Err((items, finalizer));
             }
@@ -674,7 +696,7 @@ impl<F> ShardWorker<F> {
     /// Advances the worker clock and triggers periodic flush, closing transitions, and purging.
     pub fn poll(&mut self, watermark: Option<i64>, now_ms: i64) -> WorkerOutput<F> {
         let mut output = WorkerOutput::default();
-        output.commands.append(&mut self.pending_commands);
+        output.commands.extend(self.pending_commands.drain(..));
 
         self.check_disk_threshold();
         self.drain_paced_queue(now_ms, &mut output);
@@ -955,7 +977,7 @@ impl<F> ShardWorker<F> {
     /// Handles an asynchronous event emitted by the shard storage thread.
     pub fn on_event(&mut self, ev: StoreEvent<F>, now_ms: i64) -> WorkerOutput<F> {
         let mut output = WorkerOutput::default();
-        output.commands.append(&mut self.pending_commands);
+        output.commands.extend(self.pending_commands.drain(..));
 
         match ev {
             StoreEvent::FlushDone {
@@ -1520,7 +1542,7 @@ impl<F> ShardWorker<F> {
     /// Handles acknowledgment of an emitted aggregate ticket from downstream delivery.
     pub fn on_ack(&mut self, ticket_id: u64, delivered: bool, now_ms: i64) -> WorkerOutput<F> {
         let mut output = WorkerOutput::default();
-        output.commands.append(&mut self.pending_commands);
+        output.commands.extend(self.pending_commands.drain(..));
 
         if delivered {
             self.unacked_tickets.remove(&ticket_id);
@@ -1571,6 +1593,7 @@ impl<F> ShardWorker<F> {
             resources_table_entries,
             dropped_events_total: self.stats.dropped_events_total,
             spill_files: self.spill_files(),
+            store_cmd_queue_depth: self.pending_commands.len(),
         }
     }
 

@@ -30,6 +30,8 @@ pub fn export(shard: u16, stats: &WorkerStats, router: &RouterStats) {
     gauge!("logsluice_resources_table_entries", "shard" => shard_str.clone())
         .set(stats.resources_table_entries as f64);
     gauge!("logsluice_spill_files", "shard" => shard_str.clone()).set(stats.spill_files as f64);
+    gauge!("logsluice_store_cmd_queue_depth", "shard" => shard_str.clone())
+        .set(stats.store_cmd_queue_depth as f64);
     counter!("logsluice_dropped_events_total", "shard" => shard_str)
         .absolute(stats.dropped_events_total);
 

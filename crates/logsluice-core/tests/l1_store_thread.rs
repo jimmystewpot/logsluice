@@ -415,3 +415,44 @@ fn disk_bytes_failure_after_committed_flush_still_reports_flush_done() {
     h.send(StoreCommand::Shutdown).unwrap();
     j.join().unwrap();
 }
+
+#[test]
+fn try_send_returns_command_when_queue_full() {
+    let (store, k, _d) = common::store_with_layout();
+    let (h, _ev, j) = StoreThread::spawn::<u32>(store, k).unwrap();
+
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    h.try_send(StoreCommand::TestPause(Arc::clone(&barrier)))
+        .expect("TestPause should enqueue when queue is empty");
+    // Wait until the store thread has popped TestPause and is stalled at the second barrier wait.
+    barrier.wait();
+
+    for epoch_ms in 0..64 {
+        h.try_send(StoreCommand::DeleteKeys {
+            epoch_ms,
+            keys: Vec::new(),
+        })
+        .unwrap_or_else(|_| panic!("expected slot {epoch_ms} to succeed before queue is full"));
+    }
+
+    let overflow_key = StorageKey24 {
+        epoch_ms: 999,
+        digest: 42,
+    };
+    let res = h.try_send(StoreCommand::DeleteKeys {
+        epoch_ms: 999,
+        keys: vec![overflow_key],
+    });
+    match res {
+        Err(StoreCommand::DeleteKeys { epoch_ms, keys }) => {
+            assert_eq!(epoch_ms, 999);
+            assert_eq!(keys, vec![overflow_key]);
+        }
+        other => panic!("expected Err(StoreCommand::DeleteKeys) when queue full, got {other:?}"),
+    }
+
+    // Release the stalled store thread and shut down cleanly.
+    barrier.wait();
+    h.send(StoreCommand::Shutdown).unwrap();
+    j.join().unwrap();
+}

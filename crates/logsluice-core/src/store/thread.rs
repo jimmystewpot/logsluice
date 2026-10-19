@@ -39,6 +39,8 @@ pub enum StoreCommand<F> {
         keys: Option<Vec<StorageKey24>>,
         /// Maximum number of rows to return in a single page.
         limit: usize,
+        /// Optional ticket ID when reading rows for crash recovery re-emission.
+        recovery_ticket: Option<u64>,
     },
     /// Delete expired or emitted keys from header and tail keyspaces.
     DeleteKeys {
@@ -101,6 +103,8 @@ pub enum StoreEvent<F> {
         rows: Vec<JoinedRow>,
         /// Key cursor for resuming the next scan page, if more rows exist.
         next_after: Option<StorageKey24>,
+        /// Optional ticket ID echoed from a crash recovery row lookup.
+        recovery_ticket: Option<u64>,
     },
     /// Tickets successfully persisted with `SyncAll` durability.
     TicketsPersisted(Vec<u64>),
@@ -123,6 +127,8 @@ pub enum StoreEvent<F> {
         keys: Option<Vec<StorageKey24>>,
         /// Storage error encountered during the row read.
         error: AggError,
+        /// Optional ticket ID echoed from a failed crash recovery row lookup.
+        recovery_ticket: Option<u64>,
     },
     /// Ticket successfully acknowledged and applied to header state.
     AckApplied {
@@ -313,6 +319,7 @@ impl StoreThread {
                             after,
                             keys,
                             limit,
+                            recovery_ticket,
                         } => {
                             if fail_next_rows {
                                 fail_next_rows = false;
@@ -322,6 +329,7 @@ impl StoreThread {
                                     after,
                                     keys,
                                     error: AggError::Channel("injected Rows failure".into()),
+                                    recovery_ticket,
                                 });
                                 continue;
                             }
@@ -333,6 +341,7 @@ impl StoreThread {
                                             reason,
                                             rows,
                                             next_after: None,
+                                            recovery_ticket,
                                         });
                                     }
                                     Err(error) => {
@@ -342,6 +351,7 @@ impl StoreThread {
                                             after,
                                             keys,
                                             error,
+                                            recovery_ticket,
                                         });
                                     }
                                 }
@@ -358,6 +368,7 @@ impl StoreThread {
                                             reason,
                                             rows,
                                             next_after,
+                                            recovery_ticket,
                                         });
                                     }
                                     Err(error) => {
@@ -367,6 +378,7 @@ impl StoreThread {
                                             after,
                                             keys,
                                             error,
+                                            recovery_ticket,
                                         });
                                     }
                                 }

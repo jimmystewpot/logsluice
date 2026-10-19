@@ -228,3 +228,115 @@ fn multi_resource_overflow_buckets_preserve_per_resource_totals() {
     let total: u64 = recs.iter().map(|r| r.counters[0][0]).sum();
     assert_eq!(total, 2 + 3 + 4 + 5 + 9);
 }
+
+#[test]
+fn recovery_rows_failure_does_not_misalign_next_ticket() {
+    let mut h = Harness::new(|c| {
+        c.window.emit.close_jitter_max = Duration::ZERO;
+        c.output.max_records_per_ticket = 1;
+    });
+    h.ingest(&[(1, 1_000), (2, 2_000)]);
+    h.advance(DAY + 31_000, Some(DAY));
+    let before = h.drain_emitted();
+    assert_eq!(before.len(), 2);
+    let before_key1 = before.iter().find(|r| r.digest == 1).unwrap().clone();
+    let before_key2 = before.iter().find(|r| r.digest == 2).unwrap().clone();
+
+    let mut h = h.restart_with(
+        |_| {},
+        |h| {
+            h.fail_next_rows();
+        },
+    );
+    let after = h.drain_emitted();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].digest, 2);
+    assert_eq!(after[0].slice_id, before_key2.slice_id);
+    assert_eq!(h.stats().recovery_failures_total, 1);
+    assert_eq!(h.stats().slices_reemitted_total, 1);
+
+    h.ack_all();
+
+    // Next poll retries only the failed ticket 1 without resetting closing.scan_started or re-scanning key 2.
+    h.advance(DAY + 32_000, Some(DAY));
+    let retried = h.drain_emitted();
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].digest, 1);
+    assert_eq!(retried[0].slice_id, before_key1.slice_id);
+    assert_eq!(h.stats().slices_reemitted_total, 2);
+
+    h.inspect_store(|store| {
+        let tickets = store.tickets().unwrap();
+        assert_eq!(tickets.len(), 1);
+        assert_eq!(tickets[0].entries[0].digest, 1);
+    });
+}
+
+#[test]
+fn recovery_records_for_error_leaves_ticket_persisted_and_unacked() {
+    let mut h = Harness::new(|c| c.window.emit.close_jitter_max = Duration::ZERO);
+    h.ingest(&[(1, 1_000)]);
+    h.advance(DAY + 31_000, Some(DAY));
+    let before = h.drain_emitted();
+    assert_eq!(before.len(), 1);
+
+    // Delete the resource scope before recovery so records_for returns Err on recovery Rows.
+    let mut h = h.restart_with(
+        |store| {
+            store.delete_resources(&[1]).unwrap();
+        },
+        |_| {},
+    );
+    assert!(h.drain_emitted().is_empty());
+    assert_eq!(h.stats().recovery_failures_total, 1);
+    assert_eq!(h.stats().slices_reemitted_total, 0);
+
+    // Ticket must remain persisted in _tickets and stored.emitted counters must remain zero.
+    h.inspect_store(|store| {
+        let tickets = store.tickets().unwrap();
+        assert_eq!(tickets.len(), 1);
+        let hdr = store
+            .header(&logsluice_core::key::StorageKey24 {
+                epoch_ms: 0,
+                digest: 1,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(hdr.total, vec![[1, 0, 0, 0]]);
+        assert_eq!(hdr.emitted, vec![[0, 0, 0, 0]]);
+        assert_eq!(hdr.slice_seq, 0);
+    });
+}
+
+#[test]
+fn recovery_ticket_with_no_entries_is_resolved() {
+    let mut h = Harness::new(|c| c.window.emit.close_jitter_max = Duration::ZERO);
+    h.ingest(&[(1, 1_000)]);
+    h.advance(DAY + 31_000, Some(DAY));
+    let _ = h.drain_emitted();
+    h.ack_all();
+
+    let mut h = h.restart_with(
+        |store| {
+            store
+                .put_tickets(&[logsluice_core::codec::ticket::Ticket {
+                    id: 42,
+                    window_epoch_ms: 0,
+                    reason: EmitReason::Close,
+                    entries: Vec::new(),
+                }])
+                .unwrap();
+        },
+        |_| {},
+    );
+    assert!(h.drain_emitted().is_empty());
+    assert!(!h.worker().has_inflight_tickets());
+
+    // Window 0 must transition to Closed and purge once watermark passes allowed_lateness.
+    h.advance(DAY + 3_700_000, Some(DAY + 3_600_001));
+    assert!(h.live_windows().is_empty());
+
+    h.inspect_store(|store| {
+        assert!(store.tickets().unwrap().is_empty());
+    });
+}

@@ -200,6 +200,8 @@ pub struct WorkerStats {
     pub tickets_inflight: usize,
     /// Total aggregate slices re-emitted upon crash recovery.
     pub slices_reemitted_total: u64,
+    /// Total recovery ticket re-emission attempts that failed due to missing rows, resources, or storage errors.
+    pub recovery_failures_total: u64,
     /// Total windows forced to close due to wall-clock timeouts.
     pub forced_closes_total: u64,
     /// Current database directory disk usage in bytes.
@@ -235,7 +237,6 @@ pub struct ShardWorker<F> {
     drain_in_progress: bool,
     drain_deadline_ms: Option<i64>,
     restored_tickets: Vec<Ticket>,
-    recovery_ticket_queue: VecDeque<u64>,
     store_queries_inflight: usize,
     persist_tickets_inflight: usize,
     evict_ack_epochs: HashMap<u64, u64>,
@@ -280,7 +281,6 @@ impl<F> ShardWorker<F> {
             drain_in_progress: false,
             drain_deadline_ms: None,
             restored_tickets: recovered.tickets,
-            recovery_ticket_queue: VecDeque::new(),
             store_queries_inflight: 0,
             persist_tickets_inflight: 0,
             evict_ack_epochs: HashMap::new(),
@@ -352,7 +352,9 @@ impl<F> ShardWorker<F> {
     /// Returns `true` if there are any in-flight tickets or paced emission batches queued.
     #[must_use]
     pub fn has_inflight_tickets(&self) -> bool {
-        self.ledger.inflight_len() > 0 || !self.paced_emit_queue.is_empty()
+        self.ledger.inflight_len() > 0
+            || self.ledger.ticket_count() > 0
+            || !self.paced_emit_queue.is_empty()
     }
 
     /// Returns `true` if all buffered state and pending drain operations have settled.
@@ -410,10 +412,20 @@ impl<F> ShardWorker<F> {
                 .collect();
 
             if keys.is_empty() {
+                if let Some(resolved) = self.ledger.resolve(ticket.id) {
+                    let epoch_ms = resolved.window_epoch_ms;
+                    output.commands.push(StoreCommand::Ack(resolved));
+                    if let Some(window) = self.windows.get_mut(&epoch_ms)
+                        && let WindowPhase::Closing(ref closing) = window.phase
+                        && closing.scan_complete
+                        && !self.ledger.has_inflight_for_window(epoch_ms)
+                    {
+                        window.transition_to_closed(0);
+                    }
+                }
                 continue;
             }
 
-            self.recovery_ticket_queue.push_back(ticket.id);
             self.store_queries_inflight += 1;
             output.commands.push(StoreCommand::Rows {
                 epoch_ms: ticket.window_epoch_ms,
@@ -421,6 +433,7 @@ impl<F> ShardWorker<F> {
                 after: None,
                 keys: Some(keys),
                 limit: self.ctx.cfg.output.max_records_per_ticket,
+                recovery_ticket: Some(ticket.id),
             });
         }
     }
@@ -456,6 +469,7 @@ impl<F> ShardWorker<F> {
                     after: None,
                     keys: None,
                     limit: self.ctx.cfg.output.max_records_per_ticket,
+                    recovery_ticket: None,
                 });
             }
         }
@@ -772,6 +786,7 @@ impl<F> ShardWorker<F> {
                             keys: Some(keys),
                             after: None,
                             limit: self.ctx.cfg.output.max_records_per_ticket,
+                            recovery_ticket: None,
                         });
                     }
                 }
@@ -805,6 +820,7 @@ impl<F> ShardWorker<F> {
                         keys: Some(keys),
                         after: None,
                         limit: self.ctx.cfg.output.max_records_per_ticket,
+                        recovery_ticket: None,
                     });
                 }
             }
@@ -842,6 +858,7 @@ impl<F> ShardWorker<F> {
                             after: None,
                             keys: None,
                             limit: self.ctx.cfg.output.max_records_per_ticket,
+                            recovery_ticket: None,
                         });
                     }
                 }
@@ -895,6 +912,7 @@ impl<F> ShardWorker<F> {
                         after: closing.scan_cursor,
                         keys: None,
                         limit: self.ctx.cfg.output.max_records_per_ticket,
+                        recovery_ticket: None,
                     });
                 }
             }
@@ -967,6 +985,7 @@ impl<F> ShardWorker<F> {
                                     after: None,
                                     keys: None,
                                     limit: self.ctx.cfg.output.max_records_per_ticket,
+                                    recovery_ticket: None,
                                 });
                             }
                         }
@@ -995,6 +1014,7 @@ impl<F> ShardWorker<F> {
                                     after: closing.scan_cursor,
                                     keys: None,
                                     limit: self.ctx.cfg.output.max_records_per_ticket,
+                                    recovery_ticket: None,
                                 });
                             }
                         }
@@ -1018,6 +1038,7 @@ impl<F> ShardWorker<F> {
                                     keys: Some(keys),
                                     after: None,
                                     limit: self.ctx.cfg.output.max_records_per_ticket,
+                                    recovery_ticket: None,
                                 });
                             }
                         }
@@ -1042,6 +1063,7 @@ impl<F> ShardWorker<F> {
                                     keys: Some(keys),
                                     after: None,
                                     limit: self.ctx.cfg.output.max_records_per_ticket,
+                                    recovery_ticket: None,
                                 });
                             }
                         }
@@ -1062,6 +1084,7 @@ impl<F> ShardWorker<F> {
                                 after: None,
                                 keys: None,
                                 limit: self.ctx.cfg.output.max_records_per_ticket,
+                                recovery_ticket: None,
                             });
                         }
                     }
@@ -1072,39 +1095,47 @@ impl<F> ShardWorker<F> {
                 reason,
                 rows,
                 next_after,
+                recovery_ticket,
             } => {
                 self.store_queries_inflight = self.store_queries_inflight.saturating_sub(1);
 
-                if let Some(ticket_id) = self.recovery_ticket_queue.pop_front() {
-                    if let Some(ticket) = self.ledger.get(ticket_id).cloned()
-                        && let Ok(records) = records_for(
+                if let Some(ticket_id) = recovery_ticket {
+                    if let Some(ticket) = self.ledger.get(ticket_id).cloned() {
+                        match records_for(
                             &ticket,
                             &rows,
                             &self.resources,
                             &self.ctx.emitter_id,
                             &self.ctx.clock,
                             self.ctx.cfg.emit_mode,
-                        )
-                    {
-                        self.stats.slices_reemitted_total += records.len() as u64;
-                        self.unacked_tickets.insert(
-                            ticket.id,
-                            UnackedTicket {
-                                ticket_id: ticket.id,
-                                first_emitted_ms: now_ms,
-                                records: records.clone(),
-                                backoff_ms: 5_000,
-                                next_retry_ms: None,
-                            },
-                        );
-                        self.enqueue_or_emit_paced(
-                            EmitBatch {
-                                ticket_id: ticket.id,
-                                records,
-                            },
-                            now_ms,
-                            &mut output,
-                        );
+                        ) {
+                            Ok(records) => {
+                                self.stats.slices_reemitted_total += records.len() as u64;
+                                self.unacked_tickets.insert(
+                                    ticket.id,
+                                    UnackedTicket {
+                                        ticket_id: ticket.id,
+                                        first_emitted_ms: now_ms,
+                                        records: records.clone(),
+                                        backoff_ms: 5_000,
+                                        next_retry_ms: None,
+                                    },
+                                );
+                                self.enqueue_or_emit_paced(
+                                    EmitBatch {
+                                        ticket_id: ticket.id,
+                                        records,
+                                    },
+                                    now_ms,
+                                    &mut output,
+                                );
+                            }
+                            Err(_) => {
+                                self.stats.recovery_failures_total += 1;
+                            }
+                        }
+                    } else {
+                        self.stats.recovery_failures_total += 1;
                     }
                 } else if reason == EmitReason::Evict {
                     if let Some(window) = self.windows.get_mut(&epoch_ms) {
@@ -1132,6 +1163,7 @@ impl<F> ShardWorker<F> {
                                 after: Some(next),
                                 keys: None,
                                 limit: self.ctx.cfg.output.max_records_per_ticket,
+                                recovery_ticket: None,
                             });
                         } else {
                             window.evict_in_progress = false;
@@ -1198,6 +1230,7 @@ impl<F> ShardWorker<F> {
                                 after: Some(next),
                                 keys: None,
                                 limit: self.ctx.cfg.output.max_records_per_ticket,
+                                recovery_ticket: None,
                             });
                         }
                     } else if reason == EmitReason::Close
@@ -1215,6 +1248,7 @@ impl<F> ShardWorker<F> {
                                 after: Some(next),
                                 keys: None,
                                 limit: self.ctx.cfg.output.max_records_per_ticket,
+                                recovery_ticket: None,
                             });
                         } else {
                             closing.scan_complete = true;
@@ -1279,6 +1313,7 @@ impl<F> ShardWorker<F> {
                                 after: Some(next),
                                 keys: None,
                                 limit: self.ctx.cfg.output.max_records_per_ticket,
+                                recovery_ticket: None,
                             });
                         } else if !closing.scan_complete {
                             closing.scan_complete = true;
@@ -1412,6 +1447,7 @@ impl<F> ShardWorker<F> {
                                         after: None,
                                         keys: Some(keys),
                                         limit: self.ctx.cfg.output.max_records_per_ticket,
+                                        recovery_ticket: None,
                                     });
                                 }
                             }
@@ -1425,9 +1461,11 @@ impl<F> ShardWorker<F> {
                 after,
                 keys,
                 error: _,
+                recovery_ticket,
             } => {
                 self.store_queries_inflight = self.store_queries_inflight.saturating_sub(1);
-                if let Some(ticket_id) = self.recovery_ticket_queue.pop_front() {
+                if let Some(ticket_id) = recovery_ticket {
+                    self.stats.recovery_failures_total += 1;
                     if let Some(ticket) = self.ledger.get(ticket_id).cloned() {
                         self.restored_tickets.push(ticket);
                     }
@@ -1439,6 +1477,7 @@ impl<F> ShardWorker<F> {
                         after,
                         keys,
                         limit: self.ctx.cfg.output.max_records_per_ticket,
+                        recovery_ticket: None,
                     });
                 } else if let Some(window) = self.windows.get_mut(&epoch_ms) {
                     match reason {
@@ -1526,6 +1565,7 @@ impl<F> ShardWorker<F> {
             keys_evicted_total: self.stats.keys_evicted_total,
             tickets_inflight,
             slices_reemitted_total: self.stats.slices_reemitted_total,
+            recovery_failures_total: self.stats.recovery_failures_total,
             forced_closes_total: self.stats.forced_closes_total,
             disk_bytes: self.effective_disk_bytes(),
             resources_table_entries,

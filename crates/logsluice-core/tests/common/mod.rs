@@ -463,7 +463,15 @@ impl Harness {
     }
 
     /// Restarts the harness without calling `recovery_output()`.
-    pub fn restart_unpumped(mut self) -> Self {
+    pub fn restart_unpumped(self) -> Self {
+        self.restart_unpumped_with(|_| {})
+    }
+
+    /// Restarts the harness without calling `recovery_output()`, invoking `mutate_store` before loading `RecoveredState`.
+    pub fn restart_unpumped_with<M>(mut self, mutate_store: M) -> Self
+    where
+        M: FnOnce(&mut ShardStore),
+    {
         if let Some(barrier) = self.store_barrier.take() {
             barrier.wait();
         }
@@ -492,7 +500,8 @@ impl Harness {
             layout: plan.layout(),
             worker_threads: self._cfg.storage.worker_threads,
         };
-        let store = ShardStore::open(opts, &meta).expect("failed to reopen shard store");
+        let mut store = ShardStore::open(opts, &meta).expect("failed to reopen shard store");
+        mutate_store(&mut store);
 
         let ctx = WorkerContext {
             cfg: Arc::clone(&self._cfg),
@@ -532,9 +541,53 @@ impl Harness {
     /// Restarts the harness: shuts down worker and store thread, closes DB,
     /// reopens DB, loads RecoveredState, creates new worker, and runs recovery output.
     pub fn restart(self) -> Self {
-        let mut new_h = self.restart_unpumped();
+        self.restart_with(|_| {}, |_| {})
+    }
+
+    /// Restarts the harness with hooks to mutate the `ShardStore` before loading `RecoveredState`
+    /// and to configure the harness before pumping `recovery_output()`.
+    pub fn restart_with<M, B>(self, mutate_store: M, before_recovery_pump: B) -> Self
+    where
+        M: FnOnce(&mut ShardStore),
+        B: FnOnce(&mut Self),
+    {
+        let mut new_h = self.restart_unpumped_with(mutate_store);
         let recovery_out = new_h.worker.recovery_output();
+        before_recovery_pump(&mut new_h);
         new_h.pump(recovery_out);
         new_h
+    }
+
+    /// Shuts down the worker and store thread, reopens the underlying `ShardStore`,
+    /// and invokes `f` for direct storage inspection.
+    pub fn inspect_store<R, F: FnOnce(&mut ShardStore) -> R>(mut self, f: F) -> R {
+        if let Some(barrier) = self.store_barrier.take() {
+            barrier.wait();
+        }
+        let _ = self.store_handle.send(StoreCommand::Shutdown);
+        if let Some(h) = self.join_handle.take() {
+            let _ = h.join();
+        }
+
+        let dir = self._dir.take().expect("tempdir");
+        let plan =
+            Arc::new(AggregationPlan::new(&self._cfg.aggregations).expect("failed to build plan"));
+        let meta = PodMeta::load_or_init(
+            dir.path(),
+            &self._cfg.output.emitter_id,
+            1,
+            &plan.schema_bytes(),
+        )
+        .expect("failed to init pod meta");
+        let opts = StoreOptions {
+            shard_dir: dir.path().join("shard_0"),
+            cache_bytes: 8 << 20,
+            hdr_memtable_bytes: 1 << 20,
+            tail_memtable_bytes: 1 << 20,
+            sync_wal: true,
+            layout: plan.layout(),
+        };
+        let mut store = ShardStore::open(opts, &meta).expect("failed to reopen shard store");
+        f(&mut store)
     }
 }

@@ -1,0 +1,45 @@
+[package]
+name = "logsluice-vector"
+description = "Optional Vector TaskTransform and LogEvent/EventFinalizers adapter bridge for logsluice."
+readme = "README.md"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/jimmystewpot/logsluice"
+publish = false
+
+[features]
+default = []
+
+[dependencies]
+bytes = { version = "1.11", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+futures = "0.3"
+logsluice = { path = "../../crates/logsluice" }
+logsluice-core = { path = "../../crates/logsluice-core" }
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+tokio = { version = "1.49", features = ["sync", "time", "rt", "macros"] }
+
+# When building inside a Vector source tree, uncomment the following dependencies
+# (adjusting the relative path or git rev to your Vector checkout) and enable your
+# Vector transform registration hook:
+#
+# vector-core = { git = "https://github.com/vectordotdev/vector.git", branch = "master" }
+# vector-lib = { git = "https://github.com/vectordotdev/vector.git", branch = "master" }
+# vector-config = { git = "https://github.com/vectordotdev/vector.git", branch = "master" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.49", features = ["full", "test-util"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+todo = "deny"

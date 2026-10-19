@@ -438,6 +438,9 @@ pub struct StorageAdapterConfig {
     /// Whether to synchronously flush write-ahead logs.
     #[serde(default = "default_sync_wal")]
     pub sync_wal: bool,
+    /// Background compaction and flush worker threads per shard database.
+    #[serde(default = "default_storage_worker_threads")]
+    pub worker_threads: usize,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -467,6 +470,9 @@ fn default_control_reserve_bytes() -> u64 {
 fn default_sync_wal() -> bool {
     true
 }
+fn default_storage_worker_threads() -> usize {
+    2
+}
 
 impl Default for StorageAdapterConfig {
     fn default() -> Self {
@@ -481,6 +487,7 @@ impl Default for StorageAdapterConfig {
             control_reserve_bytes: default_control_reserve_bytes(),
             on_disk_full: OnDiskFull::OverflowBucket,
             sync_wal: true,
+            worker_threads: default_storage_worker_threads(),
         }
     }
 }
@@ -1012,6 +1019,7 @@ impl SluiceConfig {
             control_reserve_bytes: self.storage.control_reserve_bytes,
             on_disk_full: self.storage.on_disk_full.into(),
             sync_wal: self.storage.sync_wal,
+            worker_threads: self.storage.worker_threads,
         };
 
         let window = WindowConfig {

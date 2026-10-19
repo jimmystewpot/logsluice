@@ -45,6 +45,7 @@ pub fn store_with_layout() -> (ShardStore, SimdKernelTable, TempDir) {
         tail_memtable_bytes: 1 << 20,
         sync_wal: true,
         layout: TEST_LAYOUT,
+        worker_threads: 2,
     };
     let store = ShardStore::open(opts, &meta).expect("failed to open shard store");
     (store, k, d)
@@ -192,6 +193,7 @@ impl Harness {
             tail_memtable_bytes: 1 << 20,
             sync_wal: true,
             layout: plan.layout(),
+            worker_threads: cfg.storage.worker_threads,
         };
         let store = ShardStore::open(opts, &meta).expect("failed to open shard store");
         let (store_handle, rx_event, join_handle) =
@@ -470,6 +472,7 @@ impl Harness {
             tail_memtable_bytes: 1 << 20,
             sync_wal: true,
             layout: plan.layout(),
+            worker_threads: self._cfg.storage.worker_threads,
         };
         let store = ShardStore::open(opts, &meta).expect("failed to reopen shard store");
 

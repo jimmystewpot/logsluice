@@ -38,6 +38,8 @@ pub struct StoreOptions {
     pub sync_wal: bool,
     /// Active numeric header layout describing banks and min/max slots.
     pub layout: HeaderLayout,
+    /// Background compaction and flush worker threads for this shard's fjall database.
+    pub worker_threads: usize,
 }
 
 /// A single key aggregation delta to be committed into a shard.
@@ -117,11 +119,19 @@ impl ShardStore {
     /// Opens or recovers a `ShardStore` at `opts.shard_dir`, cross-checking metadata against `meta`.
     ///
     /// # Errors
-    /// Returns [`AggError::MetaMismatch`] if stored metadata does not match configured shards,
-    /// salt, codec schema, window duration, or window offset, or [`AggError::Storage`] if database opening fails.
+    /// Returns [`AggError::Config`] if `opts.worker_threads == 0`, [`AggError::MetaMismatch`] if stored
+    /// metadata does not match configured shards, salt, codec schema, window duration, or window offset,
+    /// or [`AggError::Storage`] if database opening fails.
     pub fn open(opts: StoreOptions, meta: &PodMeta) -> AggResult<Self> {
+        if opts.worker_threads == 0 {
+            return Err(AggError::Config(
+                "storage.worker_threads must be >= 1".to_string(),
+            ));
+        }
+
         let db = Database::builder(&opts.shard_dir)
             .cache_size(opts.cache_bytes)
+            .worker_threads(opts.worker_threads)
             .open()?;
 
         let meta_ks = db.keyspace("_meta", KeyspaceCreateOptions::default)?;

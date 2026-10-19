@@ -1,0 +1,81 @@
+envelope_mode: auto
+emit_mode: delta_slice
+shards: 4
+
+acceleration:
+  simd_mode: auto
+
+source_position:
+  topic_field: "topic"
+  partition_field: "partition"
+  offset_field: "offset"
+
+storage:
+  data_dir: /var/lib/vector/agg_state
+  cache_size_total: 1.5GiB
+  l1_coalesce_max_keys: 100000
+  l1_flush_interval: 30s
+  hdr_max_memtable_size: 32MiB
+  tail_max_memtable_size: 16MiB
+  max_disk_bytes: 50GiB
+  control_reserve_bytes: 5GiB
+  on_disk_full: overflow_bucket
+  sync_wal: true
+
+window:
+  type: tumbling
+  duration: 24h
+  offset: 0s
+  timestamp_field: "@timestamp"
+  allowed_skew: 30s
+  allowed_lateness: 1h
+  max_future_drift: 5m
+  idle_timeout: 5m
+  caught_up_threshold: 2m
+  max_close_delay: 2h
+  late_emit_interval: 5m
+  max_closing_duration: 2h
+  source_id_field: "observer.hostname"
+  max_tracked_sources: 10000
+  emit:
+    strategy: on_close
+    close_jitter_max: 10m
+
+cardinality_control:
+  max_keys_per_window: 2000000
+  max_resource_share: 0.25
+  on_cap: overflow
+  evict_high_water: 0.9
+  evict_interval: 1m
+
+attributes_policy:
+  preserve_resource_and_scope: true
+  resource_attributes_exclude: ["k8s.pod.uid", "process.pid", "service.instance.id"]
+  body_policy: keep_first_exemplar
+  template_target_field: "log.template"
+  unmatched_log_attributes: drop
+  exclude_attributes: ["source.port", "session_id", "trace_id", "span_id"]
+
+normalizers:
+  "source.ip": { type: ip_cidr, ipv4_prefix: 24, ipv6_prefix: 48, when: { field: "event.action", equals: "deny" } }
+  "body":      { type: log_fingerprint }
+
+group_by: ["source.ip", "destination.ip", "destination.port", "network.transport", "event.action"]
+
+aggregations:
+  event_count: count
+  total_bytes: { sum: "network.bytes" }
+  total_packets: { sum: "network.packets" }
+  first_seen: { min: "@timestamp" }
+  last_seen: { max: "@timestamp" }
+
+output:
+  route_field: "_wa_route"
+  emitter_id: "${HOSTNAME}"
+  max_emit_rate_per_sec: 100000
+  max_records_per_ticket: 500
+  max_records_per_envelope: 500
+
+shutdown:
+  on_shutdown: emit_partial
+  drain_timeout: 50s

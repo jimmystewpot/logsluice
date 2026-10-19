@@ -1,0 +1,657 @@
+#![allow(missing_docs, clippy::unwrap_used, clippy::expect_used)]
+
+use std::sync::Arc;
+
+use logsluice::config::{AdapterConfig, BodyPolicy, SimdMode, UnmatchedLogAttributes};
+use logsluice::event::{FieldPath, LogEvent, ObjectMap, Value, value_to_string_lossy};
+use logsluice::extract::*;
+use logsluice::router::*;
+use logsluice_core::{
+    simd::SimdKernelTable,
+    watermark::{SourceKey, WatermarkConfig, WatermarkTracker},
+    worker::PurgeHorizon,
+};
+
+const NOW: i64 = 1792195800000; // 2026-10-17T00:10:00Z in ms
+const DAY_MS: i64 = 86_400_000;
+const T: &str = "2026-10-17T00:00:01Z";
+
+fn cfg() -> AdapterConfig {
+    serde_yaml_ng::from_str(include_str!("fixtures/spec_example.yaml")).unwrap()
+}
+
+fn ev(fields: &[(&str, Value)]) -> LogEvent {
+    let mut l = LogEvent::default();
+    for (k, v) in fields {
+        l.insert(&FieldPath::parse(k).unwrap(), v.clone());
+    }
+    l
+}
+
+fn test_router(cfg: AdapterConfig) -> Router {
+    let cfg = Arc::new(cfg);
+    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+    let horizons = (0..cfg.shards).map(|_| PurgeHorizon::new(0)).collect();
+    let watermark_cfg = WatermarkConfig {
+        allowed_skew_ms: cfg.window.allowed_skew.as_millis() as i64,
+        max_future_drift_ms: cfg.window.max_future_drift.as_millis() as i64,
+        idle_timeout_ms: cfg.window.idle_timeout.as_millis() as i64,
+        caught_up_threshold_ms: cfg.window.caught_up_threshold.as_millis() as i64,
+        seed_grace_ms: 0,
+        max_tracked_sources: cfg.window.max_tracked_sources,
+    };
+    let tracker = WatermarkTracker::new(watermark_cfg, 0);
+    Router::new(cfg, kernels, 12345, horizons, tracker).unwrap()
+}
+
+fn test_router_with_watermark(cfg: AdapterConfig, watermark_ms: i64) -> Router {
+    let cfg = Arc::new(cfg);
+    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+    let horizons = (0..cfg.shards).map(|_| PurgeHorizon::new(0)).collect();
+    let allowed_skew_ms = cfg.window.allowed_skew.as_millis() as i64;
+    let watermark_cfg = WatermarkConfig {
+        allowed_skew_ms,
+        max_future_drift_ms: cfg.window.max_future_drift.as_millis() as i64,
+        idle_timeout_ms: cfg.window.idle_timeout.as_millis() as i64,
+        caught_up_threshold_ms: cfg.window.caught_up_threshold.as_millis() as i64,
+        seed_grace_ms: 0,
+        max_tracked_sources: cfg.window.max_tracked_sources,
+    };
+    let mut tracker = WatermarkTracker::new(watermark_cfg, 0);
+    tracker.observe(SourceKey::Default, watermark_ms + allowed_skew_ms, NOW);
+    Router::new(cfg, kernels, 12345, horizons, tracker).unwrap()
+}
+
+fn test_router_with_horizon(cfg: AdapterConfig, horizon_ms: i64) -> Router {
+    let cfg = Arc::new(cfg);
+    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+    let horizons = (0..cfg.shards)
+        .map(|_| PurgeHorizon::new(horizon_ms))
+        .collect();
+    let watermark_cfg = WatermarkConfig {
+        allowed_skew_ms: cfg.window.allowed_skew.as_millis() as i64,
+        max_future_drift_ms: cfg.window.max_future_drift.as_millis() as i64,
+        idle_timeout_ms: cfg.window.idle_timeout.as_millis() as i64,
+        caught_up_threshold_ms: cfg.window.caught_up_threshold.as_millis() as i64,
+        seed_grace_ms: 0,
+        max_tracked_sources: cfg.window.max_tracked_sources,
+    };
+    let tracker = WatermarkTracker::new(watermark_cfg, 0);
+    Router::new(cfg, kernels, 12345, horizons, tracker).unwrap()
+}
+
+fn otlp_fixture(services: &[(&str, &[i64])]) -> LogEvent {
+    let mut resource_logs = Vec::new();
+
+    for (svc, timestamps) in services {
+        let mut resource_attrs = Vec::new();
+        let mut attr = ObjectMap::new();
+        attr.insert("key".into(), Value::from("service.name"));
+        let mut str_val = ObjectMap::new();
+        str_val.insert("stringValue".into(), Value::from(*svc));
+        attr.insert("value".into(), Value::Object(str_val));
+        resource_attrs.push(Value::Object(attr));
+
+        let mut resource = ObjectMap::new();
+        resource.insert("attributes".into(), Value::Array(resource_attrs));
+
+        let mut log_records = Vec::new();
+        for &ts_ms in *timestamps {
+            let mut record = ObjectMap::new();
+            record.insert("timeUnixNano".into(), Value::from(ts_ms * 1_000_000));
+            log_records.push(Value::Object(record));
+        }
+
+        let mut scope = ObjectMap::new();
+        scope.insert("name".into(), Value::from("test-scope"));
+        scope.insert("version".into(), Value::from("1.0.0"));
+
+        let mut scope_log = ObjectMap::new();
+        scope_log.insert("scope".into(), Value::Object(scope));
+        scope_log.insert("logRecords".into(), Value::Array(log_records));
+
+        let mut rl = ObjectMap::new();
+        rl.insert("resource".into(), Value::Object(resource));
+        rl.insert(
+            "scopeLogs".into(),
+            Value::Array(vec![Value::Object(scope_log)]),
+        );
+
+        resource_logs.push(Value::Object(rl));
+    }
+
+    let mut log = LogEvent::default();
+    log.insert_path("resourceLogs", Value::Array(resource_logs));
+    log
+}
+
+#[test]
+fn test_missing_and_invalid_timestamp_quarantined() {
+    let mut r = test_router(cfg());
+    let mut out = RouterOutput::new(4);
+    r.route(ev(&[("source.ip", "10.0.0.1".into())]), NOW, &mut out);
+    r.route(ev(&[("@timestamp", "not-a-time".into())]), NOW, &mut out);
+    let reasons: Vec<_> = out
+        .passthrough
+        .iter()
+        .map(|e| value_to_string_lossy(e.get_path("_wa_reason").unwrap()).into_owned())
+        .collect();
+    assert_eq!(reasons, vec!["missing_timestamp", "invalid_timestamp"]);
+    assert!(
+        out.passthrough
+            .iter()
+            .all(|e| { value_to_string_lossy(e.get_path("_wa_route").unwrap()) == "quarantine" })
+    );
+}
+
+#[test]
+fn test_metric_value_coercion() {
+    assert_eq!(metric_value(&Value::from(-5)), MetricValue::Int(-5));
+    assert_eq!(metric_value(&Value::from(2.9_f64)), MetricValue::Coerced(2));
+    assert_eq!(metric_value(&Value::from("abc")), MetricValue::Invalid);
+    let mut r = test_router(cfg());
+    let mut out = RouterOutput::new(4);
+    r.route(
+        ev(&[("@timestamp", T.into()), ("network.bytes", Value::from(-5))]),
+        NOW,
+        &mut out,
+    );
+    r.route(
+        ev(&[("@timestamp", T.into()), ("network.bytes", "abc".into())]),
+        NOW,
+        &mut out,
+    );
+    let items: Vec<_> = out.per_shard.iter().flatten().collect();
+    assert_eq!(items[0].counters[0][1], (-5i64) as u64);
+    assert_eq!(items[1].counters[0][1], 0);
+    assert_eq!(r.stats().field_type_errors_total, 1);
+}
+
+#[test]
+fn test_otlp_mixed_windows_and_scopes() {
+    let mut r = test_router(cfg());
+    let mut out = RouterOutput::new(4);
+    r.route(
+        otlp_fixture(&[("svc-a", &[DAY_MS - 1, DAY_MS]), ("svc-b", &[1])]),
+        NOW,
+        &mut out,
+    );
+    let items: Vec<_> = out.per_shard.iter().flatten().collect();
+    assert_eq!(items.len(), 3);
+    let epochs: std::collections::BTreeSet<_> = items.iter().map(|i| i.key.epoch_ms).collect();
+    assert_eq!(epochs.len(), 2);
+    let a: Vec<_> = items
+        .iter()
+        .filter(|i| i.resource.resource["service.name"] == "svc-a")
+        .collect();
+    assert!(std::sync::Arc::ptr_eq(&a[0].resource, &a[1].resource));
+}
+
+#[test]
+fn late_and_horizon_route_to_late() {
+    let mut r = test_router_with_watermark(cfg(), DAY_MS + 3_600_000);
+    let mut out = RouterOutput::new(4);
+    r.route(
+        ev(&[("@timestamp", "1970-01-01T00:00:01Z".into())]),
+        NOW,
+        &mut out,
+    );
+    assert_eq!(
+        value_to_string_lossy(out.passthrough[0].get_path("_wa_route").unwrap()),
+        "late"
+    );
+    let mut r = test_router_with_horizon(cfg(), DAY_MS);
+    let mut out = RouterOutput::new(4);
+    r.route(
+        ev(&[("@timestamp", "1970-01-01T00:00:01Z".into())]),
+        NOW,
+        &mut out,
+    );
+    assert_eq!(
+        value_to_string_lossy(out.passthrough[0].get_path("_wa_route").unwrap()),
+        "late"
+    );
+}
+
+#[test]
+fn source_position_extracted_and_shard_deterministic() {
+    let mut r = test_router(cfg());
+    let mut out = RouterOutput::new(4);
+    let e = ev(&[
+        ("@timestamp", T.into()),
+        ("source.ip", "10.0.0.1".into()),
+        ("topic", "fw".into()),
+        ("partition", Value::from(3)),
+        ("offset", Value::from(42)),
+    ]);
+    r.route(e.clone(), NOW, &mut out);
+    r.route(e, NOW, &mut out);
+    let (shard, items) = out
+        .per_shard
+        .iter()
+        .enumerate()
+        .find(|(_, v)| !v.is_empty())
+        .unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].position.as_ref().unwrap().offset, 42);
+    assert_eq!(shard as u64, (items[0].key.digest as u64) % 4);
+}
+
+#[test]
+fn test_per_shard_horizon_independence() {
+    let cfg = Arc::new(cfg());
+    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+    let watermark_cfg = WatermarkConfig {
+        allowed_skew_ms: cfg.window.allowed_skew.as_millis() as i64,
+        max_future_drift_ms: cfg.window.max_future_drift.as_millis() as i64,
+        idle_timeout_ms: cfg.window.idle_timeout.as_millis() as i64,
+        caught_up_threshold_ms: cfg.window.caught_up_threshold.as_millis() as i64,
+        seed_grace_ms: 0,
+        max_tracked_sources: cfg.window.max_tracked_sources,
+    };
+    let tracker = WatermarkTracker::new(watermark_cfg, 0);
+
+    let horizons: Vec<_> = (0..cfg.shards)
+        .map(|i| {
+            if i == 0 {
+                PurgeHorizon::new(DAY_MS)
+            } else {
+                PurgeHorizon::new(0)
+            }
+        })
+        .collect();
+
+    let mut r = Router::new(cfg, kernels, 12345, horizons, tracker).unwrap();
+
+    let mut found_shard0_late = false;
+    let mut found_other_admitted = false;
+
+    for ip_suffix in 0..100 {
+        let ip = format!("10.0.0.{ip_suffix}");
+        let e = ev(&[
+            ("@timestamp", "1970-01-01T00:00:01Z".into()),
+            ("source.ip", ip.into()),
+        ]);
+        let mut out = RouterOutput::new(4);
+        r.route(e, NOW, &mut out);
+
+        if !out.passthrough.is_empty() {
+            let reason = value_to_string_lossy(out.passthrough[0].get_path("_wa_route").unwrap());
+            if reason == "late" {
+                found_shard0_late = true;
+            }
+        } else {
+            let (shard, items) = out
+                .per_shard
+                .iter()
+                .enumerate()
+                .find(|(_, v)| !v.is_empty())
+                .unwrap();
+            if shard != 0 && !items.is_empty() {
+                found_other_admitted = true;
+            }
+        }
+        if found_shard0_late && found_other_admitted {
+            break;
+        }
+    }
+
+    assert!(
+        found_shard0_late,
+        "Event routing to shard 0 must be marked late"
+    );
+    assert!(
+        found_other_admitted,
+        "Event routing to other shards must be admitted"
+    );
+}
+
+#[test]
+fn test_otlp_metrics_and_normalizers() {
+    let r_cfg = cfg();
+    let mut r = test_router(r_cfg);
+    let mut out = RouterOutput::new(4);
+
+    let mut record = ObjectMap::new();
+    record.insert("timeUnixNano".into(), Value::from(10_000_000_000_i64));
+
+    let mut attrs = Vec::new();
+    let mut ip_attr = ObjectMap::new();
+    ip_attr.insert("key".into(), Value::from("source.ip"));
+    let mut ip_val = ObjectMap::new();
+    ip_val.insert("stringValue".into(), Value::from("192.168.1.55"));
+    ip_attr.insert("value".into(), Value::Object(ip_val));
+    attrs.push(Value::Object(ip_attr));
+
+    let mut act_attr = ObjectMap::new();
+    act_attr.insert("key".into(), Value::from("event.action"));
+    let mut act_val = ObjectMap::new();
+    act_val.insert("stringValue".into(), Value::from("deny"));
+    act_attr.insert("value".into(), Value::Object(act_val));
+    attrs.push(Value::Object(act_attr));
+
+    let mut bytes_attr = ObjectMap::new();
+    bytes_attr.insert("key".into(), Value::from("network.bytes"));
+    let mut bytes_val = ObjectMap::new();
+    bytes_val.insert("intValue".into(), Value::from(500));
+    bytes_attr.insert("value".into(), Value::Object(bytes_val));
+    attrs.push(Value::Object(bytes_attr));
+
+    record.insert("attributes".into(), Value::Array(attrs));
+
+    let mut scope_log = ObjectMap::new();
+    scope_log.insert(
+        "logRecords".into(),
+        Value::Array(vec![Value::Object(record)]),
+    );
+
+    let mut res_log = ObjectMap::new();
+    res_log.insert(
+        "scopeLogs".into(),
+        Value::Array(vec![Value::Object(scope_log)]),
+    );
+
+    let mut root = ObjectMap::new();
+    root.insert(
+        "resourceLogs".into(),
+        Value::Array(vec![Value::Object(res_log)]),
+    );
+
+    let event = LogEvent::from_map(root);
+    r.route(event, NOW, &mut out);
+
+    let items: Vec<_> = out.per_shard.iter().flatten().collect();
+    assert_eq!(items.len(), 1);
+
+    let dim_ip = items[0].exemplar.dims[0].as_ref().unwrap();
+    assert_eq!(std::str::from_utf8(dim_ip).unwrap(), "192.168.1.0");
+
+    assert_eq!(items[0].counters[0][0], 1);
+    assert_eq!(items[0].counters[0][1], 500);
+
+    assert_eq!(items[0].minmax_values[0], 10_000);
+    assert_eq!(items[0].minmax_values[1], 10_000);
+}
+
+#[test]
+fn otlp_mixed_batch_routes_valid_records_and_attaches_position_per_shard() {
+    use std::time::Duration;
+
+    let mut cfg: AdapterConfig =
+        serde_yaml_ng::from_str(include_str!("fixtures/spec_example.yaml")).unwrap();
+    cfg.shards = 2;
+    cfg.attributes_policy.unmatched_log_attributes = UnmatchedLogAttributes::KeepFirst;
+    let cfg = Arc::new(cfg);
+    let kernels = SimdKernelTable::detect(SimdMode::Scalar.into());
+    let horizons = vec![PurgeHorizon::new(i64::MIN), PurgeHorizon::new(i64::MIN)];
+    let wm = WatermarkTracker::new(
+        WatermarkConfig {
+            allowed_skew_ms: Duration::from_secs(30).as_millis() as i64,
+            max_future_drift_ms: Duration::from_secs(600).as_millis() as i64,
+            idle_timeout_ms: Duration::from_secs(300).as_millis() as i64,
+            caught_up_threshold_ms: Duration::from_secs(120).as_millis() as i64,
+            seed_grace_ms: 0,
+            max_tracked_sources: 10_000,
+        },
+        0,
+    );
+    let mut router = Router::new(cfg, kernels, 42, horizons, wm).unwrap();
+
+    let mut root = ObjectMap::new();
+    root.insert("topic".into(), Value::from("logs-otlp"));
+    root.insert("partition".into(), Value::from(0));
+    root.insert("offset".into(), Value::from(77));
+
+    let make_rec = |ts_opt: Option<&str>, msg: &str, host: &str| -> Value {
+        let mut r = ObjectMap::new();
+        if let Some(ts) = ts_opt {
+            r.insert("timeUnixNano".into(), Value::from(ts));
+        }
+        r.insert("severityText".into(), Value::from("ERROR"));
+        let mut body_map = ObjectMap::new();
+        body_map.insert("stringValue".into(), Value::from(msg));
+        r.insert("body".into(), Value::Object(body_map));
+        let mut attr_kv = ObjectMap::new();
+        attr_kv.insert("key".into(), Value::from("host"));
+        let mut attr_val = ObjectMap::new();
+        attr_val.insert("stringValue".into(), Value::from(host));
+        attr_kv.insert("value".into(), Value::Object(attr_val));
+        let mut extra_kv = ObjectMap::new();
+        extra_kv.insert("key".into(), Value::from("request_id"));
+        let mut extra_val = ObjectMap::new();
+        extra_val.insert("stringValue".into(), Value::from("req-123"));
+        extra_kv.insert("value".into(), Value::Object(extra_val));
+        let mut excl_kv = ObjectMap::new();
+        excl_kv.insert("key".into(), Value::from("trace_id"));
+        let mut excl_val = ObjectMap::new();
+        excl_val.insert("stringValue".into(), Value::from("drop-me"));
+        excl_kv.insert("value".into(), Value::Object(excl_val));
+        r.insert(
+            "attributes".into(),
+            Value::Array(vec![
+                Value::Object(attr_kv),
+                Value::Object(extra_kv),
+                Value::Object(excl_kv),
+            ]),
+        );
+        Value::Object(r)
+    };
+
+    let mut scope_log = ObjectMap::new();
+    scope_log.insert(
+        "logRecords".into(),
+        Value::Array(vec![
+            make_rec(Some("1700000005000000000"), "fail A", "web-1"),
+            make_rec(Some("1700000005000000000"), "fail B", "web-2"),
+            make_rec(None, "missing ts", "web-3"),
+        ]),
+    );
+    let mut res_log = ObjectMap::new();
+    res_log.insert(
+        "scopeLogs".into(),
+        Value::Array(vec![Value::Object(scope_log)]),
+    );
+    root.insert(
+        "resourceLogs".into(),
+        Value::Array(vec![Value::Object(res_log)]),
+    );
+
+    let mut out = RouterOutput::new(2);
+    router.route(LogEvent::from_map(root), 1_700_000_006_000, &mut out);
+
+    assert!(
+        router
+            .detected_otlp_handle()
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    let total_routed: usize = out.per_shard.iter().map(|s| s.len()).sum();
+    assert_eq!(total_routed, 2);
+    assert_eq!(out.passthrough.len(), 1);
+
+    let pt_log = &out.passthrough[0];
+    assert_eq!(
+        value_to_string_lossy(pt_log.get_path("_wa_route").unwrap()),
+        "quarantine"
+    );
+    assert_eq!(
+        value_to_string_lossy(pt_log.get_path("_wa_reason").unwrap()),
+        "missing_timestamp"
+    );
+    let pt_records = pt_log
+        .get_path("resourceLogs")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|rl| rl.as_object())
+        .and_then(|o| o.get("scopeLogs"))
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|sl| sl.as_object())
+        .and_then(|o| o.get("logRecords"))
+        .and_then(|v| v.as_array())
+        .unwrap();
+    assert_eq!(pt_records.len(), 1);
+
+    for shard_items in &out.per_shard {
+        if let Some(last) = shard_items.last() {
+            assert_eq!(
+                last.position
+                    .as_ref()
+                    .map(|p| (&*p.topic, p.partition, p.offset)),
+                Some(("logs-otlp", 0, 77))
+            );
+            assert!(last.exemplar.attrs.iter().any(|(k, _)| k == "request_id"));
+            assert!(!last.exemplar.attrs.iter().any(|(k, _)| k == "trace_id"));
+            assert_eq!(last.exemplar.severity, 17);
+        }
+    }
+}
+
+#[test]
+fn codec_schema_changes_when_attributes_policy_changes() {
+    let cfg1: AdapterConfig =
+        serde_yaml_ng::from_str(include_str!("fixtures/spec_example.yaml")).unwrap();
+    let mut cfg2 = cfg1.clone();
+    cfg2.attributes_policy.preserve_resource_and_scope =
+        !cfg1.attributes_policy.preserve_resource_and_scope;
+    assert_ne!(cfg1.codec_schema(), cfg2.codec_schema());
+
+    let mut cfg3 = cfg1.clone();
+    cfg3.attributes_policy
+        .exclude_attributes
+        .insert("custom_secret".into());
+    assert_ne!(cfg1.codec_schema(), cfg3.codec_schema());
+
+    let mut cfg4 = cfg1.clone();
+    cfg4.attributes_policy
+        .resource_attributes_exclude
+        .insert("extra.exclude".into());
+    assert_ne!(cfg1.codec_schema(), cfg4.codec_schema());
+
+    let mut cfg5 = cfg1.clone();
+    cfg5.attributes_policy.template_target_field = "custom.template".into();
+    assert_ne!(cfg1.codec_schema(), cfg5.codec_schema());
+
+    let mut cfg6 = cfg1.clone();
+    cfg6.attributes_policy.unmatched_log_attributes = UnmatchedLogAttributes::KeepFirst;
+    assert_ne!(cfg1.codec_schema(), cfg6.codec_schema());
+}
+
+#[test]
+fn native_attributes_policy_resource_scope_severity_and_body_drop() {
+    let mut c = cfg();
+    c.attributes_policy.preserve_resource_and_scope = true;
+    c.attributes_policy.unmatched_log_attributes = UnmatchedLogAttributes::KeepFirst;
+    c.attributes_policy.body_policy = BodyPolicy::Drop;
+
+    let mut r = test_router(c.clone());
+    let mut out = RouterOutput::new(4);
+
+    let e = ev(&[
+        ("@timestamp", T.into()),
+        ("source.ip", "10.0.0.1".into()),
+        ("network.bytes", Value::from(100)),
+        ("severity", "WARN".into()),
+        ("body", "should be dropped".into()),
+        ("resource.service.name", "payments".into()),
+        ("resource.k8s.pod.uid", "excluded-pod-uid".into()),
+        ("scope.name", "auth-lib".into()),
+        ("scope.version", "2.1".into()),
+        ("attributes.env", "prod".into()),
+        ("attributes.trace_id", "excluded-trace".into()),
+    ]);
+    r.route(e, NOW, &mut out);
+
+    let item = out.per_shard.iter().flatten().next().unwrap();
+    assert_eq!(item.exemplar.severity, 13);
+    assert!(item.exemplar.body.is_none());
+    assert!(
+        item.exemplar
+            .attrs
+            .iter()
+            .any(|(k, v)| k == "env" && v.as_ref() == b"prod")
+    );
+    assert!(!item.exemplar.attrs.iter().any(|(k, _)| k == "trace_id"));
+    assert!(!item.exemplar.attrs.iter().any(|(k, _)| k == "source.ip"));
+    assert!(
+        !item
+            .exemplar
+            .attrs
+            .iter()
+            .any(|(k, _)| k == "network.bytes")
+    );
+    assert_eq!(item.resource.scope_name, "auth-lib");
+    assert_eq!(item.resource.scope_version, "2.1");
+    assert_eq!(
+        item.resource.resource.get("service.name"),
+        Some(&serde_json::Value::String("payments".into()))
+    );
+    assert!(!item.resource.resource.contains_key("k8s.pod.uid"));
+    assert!(!item.resource.resource.contains_key("k8s"));
+
+    c.attributes_policy.preserve_resource_and_scope = false;
+    let mut r2 = test_router(c);
+    let mut out2 = RouterOutput::new(4);
+    r2.route(
+        ev(&[
+            ("@timestamp", T.into()),
+            ("source.ip", "10.0.0.1".into()),
+            ("resource.service.name", "payments".into()),
+            ("scope.name", "auth-lib".into()),
+        ]),
+        NOW,
+        &mut out2,
+    );
+    let item2 = out2.per_shard.iter().flatten().next().unwrap();
+    assert_eq!(item2.resource_hash, item2.resource.canonical_hash());
+    assert!(item2.resource.resource.is_empty());
+    assert!(item2.resource.scope_name.is_empty());
+}
+
+#[test]
+fn otlp_mixed_batch_isolates_multiple_quarantine_reasons_and_late_records() {
+    let mut r = test_router_with_watermark(cfg(), DAY_MS + 3_600_000);
+    let mut out = RouterOutput::new(4);
+
+    let make_lr = |ts_opt: Option<&str>| -> Value {
+        let mut m = ObjectMap::new();
+        if let Some(ts) = ts_opt {
+            m.insert("timeUnixNano".into(), Value::from(ts));
+        }
+        Value::Object(m)
+    };
+
+    let valid_ns = ((NOW - 1_000) * 1_000_000).to_string();
+    let future_ns = ((NOW + 10_000_000) * 1_000_000).to_string();
+    let late_ns = (1_000 * 1_000_000).to_string();
+
+    let mut scope_log = ObjectMap::new();
+    scope_log.insert(
+        "logRecords".into(),
+        Value::Array(vec![
+            make_lr(Some(&valid_ns)),
+            make_lr(None),
+            make_lr(Some("not-a-number")),
+            make_lr(Some(&future_ns)),
+            make_lr(Some(&late_ns)),
+        ]),
+    );
+    let mut res_log = ObjectMap::new();
+    res_log.insert(
+        "scopeLogs".into(),
+        Value::Array(vec![Value::Object(scope_log)]),
+    );
+    let mut root = ObjectMap::new();
+    root.insert(
+        "resourceLogs".into(),
+        Value::Array(vec![Value::Object(res_log)]),
+    );
+
+    r.route(LogEvent::from_map(root), NOW, &mut out);
+
+    let routed: Vec<_> = out.per_shard.iter().flatten().collect();
+    assert_eq!(routed.len(), 1);
+    assert_eq!(r.stats().quarantined_total, 3);
+    assert_eq!(r.stats().late_total, 1);
+    assert_eq!(out.passthrough.len(), 4);
+}

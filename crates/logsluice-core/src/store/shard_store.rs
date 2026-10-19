@@ -233,8 +233,8 @@ impl ShardStore {
                 }
             } else {
                 stats.hdr_reads += 1;
-                let mut hdr = match hdr_ks.get(key_bytes)? {
-                    Some(slice) => NumericHeader::decode(self.opts.layout, &slice)?,
+                let (mut hdr, had_existing_hdr) = match hdr_ks.get(key_bytes)? {
+                    Some(slice) => (NumericHeader::decode(self.opts.layout, &slice)?, true),
                     None => {
                         let mut zeroed =
                             NumericHeader::new_zeroed(self.opts.layout, entry.resource_scope_id);
@@ -243,11 +243,11 @@ impl ShardStore {
                                 zeroed.minmax[slot_idx] = (min_v, max_v);
                             }
                         }
-                        zeroed
+                        (zeroed, false)
                     }
                 };
 
-                hdr.last_update_s = entry.last_update_s;
+                hdr.last_update_s = hdr.last_update_s.max(entry.last_update_s);
                 (k.accumulate_counter_banks)(&mut hdr.total, &entry.delta);
 
                 for (slot_idx, &(min_v, max_v)) in entry.minmax.iter().enumerate() {
@@ -261,7 +261,7 @@ impl ShardStore {
                 write_batch.insert(&hdr_ks, key_bytes, encoded_hdr);
                 stats.hdr_writes += 1;
 
-                if let Some(ref tail) = entry.tail {
+                if !had_existing_hdr && let Some(ref tail) = entry.tail {
                     let tail_ks = self.get_or_create_tail_keyspace(entry.key.epoch_ms)?;
                     write_batch.insert(&tail_ks, key_bytes, tail.encode());
                     stats.tail_writes += 1;

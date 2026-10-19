@@ -489,3 +489,86 @@ fn conditional_evict_ack_deletes_quiescent_key_and_preserves_key_with_new_flush(
     assert_eq!(rows[0].header.slice_seq, 1);
     assert!(rows[0].tail.is_some());
 }
+
+#[test]
+fn existing_key_keeps_first_exemplar_tail() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+    let mut s = ShardStore::open(opts(d.path()), &meta).unwrap();
+
+    let key = StorageKey24 {
+        epoch_ms: 0,
+        digest: 42,
+    };
+    let tail_a = ExemplarTail {
+        severity: 9,
+        body: Some(bytes::Bytes::from_static(b"tail-a")),
+        dims: vec![],
+        attrs: vec![],
+    };
+    let tail_b = ExemplarTail {
+        severity: 13,
+        body: Some(bytes::Bytes::from_static(b"tail-b")),
+        dims: vec![],
+        attrs: vec![],
+    };
+
+    let mut e1 = entry(42, true, 1);
+    e1.tail = Some(tail_a.clone());
+    s.apply_flush(batch(vec![e1]), &k).unwrap();
+
+    let mut e2 = entry(42, false, 2);
+    e2.tail = Some(tail_b);
+    let st = s.apply_flush(batch(vec![e2]), &k).unwrap();
+    assert_eq!(s.tail(&key).unwrap(), Some(tail_a));
+    assert_eq!(st.tail_writes, 0);
+}
+
+#[test]
+fn evicted_key_flush_writes_fallback_tail() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+    let mut s = ShardStore::open(opts(d.path()), &meta).unwrap();
+
+    let key = StorageKey24 {
+        epoch_ms: 0,
+        digest: 77,
+    };
+    let tail_b = ExemplarTail {
+        severity: 13,
+        body: Some(bytes::Bytes::from_static(b"fallback-b")),
+        dims: vec![],
+        attrs: vec![],
+    };
+
+    let mut e = entry(77, false, 3);
+    e.tail = Some(tail_b.clone());
+    let st = s.apply_flush(batch(vec![e]), &k).unwrap();
+    assert_eq!(s.tail(&key).unwrap(), Some(tail_b));
+    assert_eq!(st.tail_writes, 1);
+}
+
+#[test]
+fn last_update_s_does_not_regress() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+    let mut s = ShardStore::open(opts(d.path()), &meta).unwrap();
+
+    let key = StorageKey24 {
+        epoch_ms: 0,
+        digest: 99,
+    };
+    let mut e1 = entry(99, true, 1);
+    e1.last_update_s = 100;
+    s.apply_flush(batch(vec![e1]), &k).unwrap();
+
+    let mut e2 = entry(99, false, 1);
+    e2.last_update_s = 50;
+    s.apply_flush(batch(vec![e2]), &k).unwrap();
+
+    let hdr = s.header(&key).unwrap().unwrap();
+    assert_eq!(hdr.last_update_s, 100);
+}

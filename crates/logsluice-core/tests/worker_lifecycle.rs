@@ -71,3 +71,32 @@ fn backpressure_when_l1_full_and_flush_busy() {
     h.advance(1, None);
     assert!(!h.ingest(&[(5, 5), (6, 6)]).backpressure);
 }
+
+#[test]
+fn poll_purges_out_of_order_windows_keep_max_horizon() {
+    let mut h = Harness::new(|c| {
+        c.window.emit.close_jitter_max = std::time::Duration::ZERO;
+        c.window.allowed_lateness = std::time::Duration::from_millis((2 * DAY) as u64);
+    });
+    h.ingest(&[(1, 1_000), (2, DAY + 1_000)]);
+    h.advance(2 * DAY + 31_000, Some(2 * DAY));
+    assert_eq!(h.drain_emitted().len(), 2);
+    h.ack_all();
+
+    // Ingest a late event into the older closed window [0, DAY) so it has an in-flight
+    // LateRevision ticket when the watermark advances past the purge threshold for both windows.
+    h.ingest(&[(1, 2_000)]);
+    h.advance(2 * DAY + 331_000, Some(2 * DAY));
+    assert_eq!(h.drain_emitted().len(), 1);
+
+    // Newer closed window [DAY, 2 * DAY) is purged first; older closed window [0, DAY) waits on ack.
+    h.advance(2 * DAY + 332_000, Some(4 * DAY + 1));
+    assert_eq!(h.live_windows(), vec![0]);
+    assert_eq!(h.horizon(), 2 * DAY);
+
+    // Acking and polling purges the older closed window [0, DAY) last; horizon must not regress.
+    h.ack_all();
+    h.advance(2 * DAY + 333_000, Some(4 * DAY + 1));
+    assert!(h.live_windows().is_empty());
+    assert_eq!(h.horizon(), 2 * DAY);
+}

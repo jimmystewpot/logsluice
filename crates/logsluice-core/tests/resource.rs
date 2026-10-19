@@ -182,3 +182,78 @@ fn test_filtered_edge_cases() {
     assert!(filtered_all.resource.is_empty());
     assert_eq!(filtered_all.scope_name, "s");
 }
+
+#[test]
+fn canonical_hash_golden_values() {
+    let empty = ResourceScopePayload {
+        resource: BTreeMap::new(),
+        scope_name: String::new(),
+        scope_version: String::new(),
+        scope_attrs: BTreeMap::new(),
+    };
+    let resource_only = ResourceScopePayload {
+        resource: BTreeMap::from([
+            ("service.name".into(), json!("auth")),
+            ("k8s.pod.uid".into(), json!("p1")),
+        ]),
+        scope_name: String::new(),
+        scope_version: String::new(),
+        scope_attrs: BTreeMap::new(),
+    };
+    let scope_and_attrs = ResourceScopePayload {
+        resource: BTreeMap::from([
+            ("service.name".into(), json!("worker")),
+            ("service.version".into(), json!("1.2.3")),
+        ]),
+        scope_name: "tracer".into(),
+        scope_version: "2.0".into(),
+        scope_attrs: BTreeMap::from([
+            ("library.name".into(), json!("tokio")),
+            ("retries".into(), json!(3)),
+        ]),
+    };
+
+    assert_eq!(empty.canonical_hash(), 0xcd8e_7288_c1c1_b81d);
+    assert_eq!(resource_only.canonical_hash(), 0x6df8_dc0a_b42d_963e);
+    assert_eq!(scope_and_attrs.canonical_hash(), 0xdb33_5490_c4e5_95f9);
+}
+
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn arb_json_scalar() -> impl Strategy<Value = serde_json::Value> {
+        prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|n| serde_json::json!(n)),
+            "[a-zA-Z0-9._:/-]{0,32}".prop_map(serde_json::Value::String),
+        ]
+    }
+
+    fn arb_resource_scope_payload() -> impl Strategy<Value = ResourceScopePayload> {
+        (
+            proptest::collection::btree_map("[a-zA-Z0-9._-]{1,16}", arb_json_scalar(), 0..8),
+            "[a-zA-Z0-9._-]{0,16}",
+            "[0-9.]{0,8}",
+            proptest::collection::btree_map("[a-zA-Z0-9._-]{1,16}", arb_json_scalar(), 0..8),
+        )
+            .prop_map(|(resource, scope_name, scope_version, scope_attrs)| {
+                ResourceScopePayload {
+                    resource,
+                    scope_name,
+                    scope_version,
+                    scope_attrs,
+                }
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn canonical_hash_matches_serde_json_xxh3_oneshot(p in arb_resource_scope_payload()) {
+            let bytes = serde_json::to_vec(&p).expect("serialize");
+            let expected = xxhash_rust::xxh3::xxh3_64(&bytes);
+            prop_assert_eq!(p.canonical_hash(), expected);
+        }
+    }
+}

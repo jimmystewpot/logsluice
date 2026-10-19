@@ -1,0 +1,47 @@
+name: Benchmarks
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  benchmark-smoke:
+    name: Criterion Hot-Path Smoke (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Run Criterion hot_path quick suite
+        run: cargo bench -p logsluice-core --bench hot_path -- --quick
+
+  benchmark-continuous:
+    name: Criterion Continuous Benchmark (main)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Run Criterion hot_path in bencher format
+        run: cargo bench -p logsluice-core --bench hot_path -- --output-format bencher | tee bench-output.txt
+      - name: Record benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: logsluice-core Criterion Benchmarks
+          tool: "cargo"
+          output-file-path: bench-output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: false
+          alert-threshold: "150%"
+          comment-on-alert: false
+          fail-on-alert: false

@@ -26,7 +26,7 @@ use logsluice_core::{
     },
 };
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use crate::generate::EventGenerator;
 
@@ -202,7 +202,7 @@ impl ShardDriver {
         while self.unacked_tickets.len() > keep_unacked {
             let ticket_id = self.unacked_tickets.remove(0);
             let delivered = match nack_rate {
-                Some(rate) if rate > 0.0 => rng.gen_range(0.0..1.0) >= rate,
+                Some(rate) if rate > 0.0 => rng.random_range(0.0..1.0) >= rate,
                 _ => true,
             };
             let out = self.worker.on_ack(ticket_id, delivered, now_ms);

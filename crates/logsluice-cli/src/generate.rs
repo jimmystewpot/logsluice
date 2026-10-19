@@ -1,7 +1,7 @@
 //! Deterministic synthetic event generator for replay harness.
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 /// A generated synthetic event with a key ID and timestamp.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,7 +43,7 @@ impl Iterator for EventGenerator {
             return None;
         }
 
-        let key_id = self.rng.gen_range(0..self.keys);
+        let key_id = self.rng.random_range(0..self.keys);
         // Advance time gradually: 1 ms every 5 events
         let event_ms = self.base_ts_ms + (self.generated as i64) / 5;
         self.generated += 1;
@@ -74,5 +74,12 @@ mod tests {
         assert_eq!(v1, v2);
         assert_eq!(g1.size_hint(), (0, Some(0)));
         assert!(v1.iter().all(|e| e.key_id < 10 && e.event_ms >= 1_000));
+    }
+
+    #[test]
+    fn generator_clamps_zero_keys_without_panicking() {
+        let events: Vec<GeneratedEvent> = EventGenerator::new(7, 0, 5, 2_000).collect();
+        assert_eq!(events.len(), 5);
+        assert!(events.iter().all(|e| e.key_id == 0));
     }
 }

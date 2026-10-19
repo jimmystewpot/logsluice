@@ -184,3 +184,29 @@ fn drain_rejects_unsupported_format_and_missing_meta() {
         "expected missing pod_meta.json error"
     );
 }
+
+#[test]
+fn replay_with_nack_rate_exercises_rng_and_matches_totals() {
+    let d = tempfile::tempdir().unwrap();
+    let o = bin()
+        .args([
+            "replay",
+            "--events",
+            "5000",
+            "--keys",
+            "100",
+            "--seed",
+            "13",
+            "--shards",
+            "2",
+            "--nack-rate",
+            "0.25",
+            "--data-dir",
+        ])
+        .arg(d.path())
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{s}");
+    assert!(s.contains("totals_match=true"));
+}

@@ -33,6 +33,8 @@ pub struct RecoveredState {
     pub tickets: Vec<Ticket>,
     /// Sorted list of all known source stream partitions.
     pub known_partitions: Vec<(Arc<str>, i32)>,
+    /// Number of pending disk spill files found on startup.
+    pub spill_files: usize,
 }
 
 impl Default for RecoveredState {
@@ -52,6 +54,7 @@ impl RecoveredState {
             ledger: TicketLedger::new(1),
             tickets: Vec::new(),
             known_partitions: Vec::new(),
+            spill_files: 0,
         }
     }
 
@@ -127,6 +130,9 @@ impl RecoveredState {
             windows.insert(epoch_ms, window);
         }
 
+        let spill_files =
+            crate::worker::spill::SpillWriter::new(store.shard_dir().join("spill")).count_files();
+
         Ok(Self {
             windows,
             resources,
@@ -134,6 +140,7 @@ impl RecoveredState {
             ledger,
             tickets,
             known_partitions,
+            spill_files,
         })
     }
 

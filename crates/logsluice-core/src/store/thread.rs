@@ -11,6 +11,7 @@ use std::thread::JoinHandle;
 use futures_channel::mpsc::UnboundedReceiver;
 
 use crate::codec::ticket::{EmitReason, Ticket};
+use crate::emission::SliceRecord;
 use crate::error::{AggError, AggResult};
 use crate::key::StorageKey24;
 use crate::l1::L1Buffer;
@@ -56,6 +57,20 @@ pub enum StoreCommand<F> {
         /// Resource IDs to release if no longer referenced.
         release_resources: Vec<u32>,
     },
+    /// Atomically spill unacknowledged slice records for a ticket to disk.
+    Spill {
+        /// Delivery ticket ID being spilled.
+        ticket_id: u64,
+        /// Slice records to persist to the spill file.
+        records: Vec<SliceRecord>,
+    },
+    /// Read all pending spilled ticket files from disk for replay.
+    ReplaySpill,
+    /// Remove a previously spilled ticket file from disk after delivery acknowledgment.
+    RemoveSpill {
+        /// Delivery ticket ID whose spill file should be removed.
+        ticket_id: u64,
+    },
     /// Pauses the storage thread for synchronization testing.
     #[doc(hidden)]
     TestPause(std::sync::Arc<std::sync::Barrier>),
@@ -68,6 +83,9 @@ pub enum StoreCommand<F> {
     /// Injects a simulated row read failure on the next `Rows` command.
     #[doc(hidden)]
     FailNextRows,
+    /// Injects a simulated spill write failure on the next `Spill` command.
+    #[doc(hidden)]
+    FailNextSpill,
     /// Cleanly terminate the storage thread command loop.
     Shutdown,
 }
@@ -146,6 +164,27 @@ pub enum StoreEvent<F> {
     },
     /// Window keyspaces successfully dropped.
     WindowDropped(u64),
+    /// Disk spill operation (write or removal) completed.
+    SpillDone {
+        /// Ticket ID whose spill file was written or removed.
+        ticket_id: u64,
+        /// Updated count of pending `.ndjson` spill files on disk.
+        spill_files: usize,
+    },
+    /// Pending disk spill files loaded for replay.
+    SpillReplay {
+        /// Pending `(ticket_id, records)` pairs sorted by ticket ID.
+        entries: Vec<(u64, Vec<SliceRecord>)>,
+        /// Current count of pending `.ndjson` spill files on disk.
+        spill_files: usize,
+    },
+    /// Disk spill operation failed.
+    SpillFailed {
+        /// Ticket ID associated with the failed spill operation, if applicable.
+        ticket_id: Option<u64>,
+        /// Error encountered during the spill operation.
+        error: AggError,
+    },
     /// Storage operation encountered an error.
     Failed(AggError),
 }
@@ -270,10 +309,13 @@ impl StoreThread {
         let join_handle = std::thread::Builder::new()
             .name("shard-store-worker".to_string())
             .spawn(move || {
+                let mut spill_writer =
+                    crate::worker::spill::SpillWriter::new(store.shard_dir().join("spill"));
                 let mut fail_next_flush = false;
                 let mut fail_next_persist = false;
                 let mut fail_next_rows = false;
                 let mut last_disk_bytes = store.disk_bytes().unwrap_or(0);
+                let mut fail_next_spill = false;
                 while let Ok(cmd) = rx_cmd.recv() {
                     thread_queued.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                     match cmd {
@@ -455,6 +497,63 @@ impl StoreThread {
                                 }
                             }
                         }
+                        StoreCommand::Spill { ticket_id, records } => {
+                            if fail_next_spill {
+                                fail_next_spill = false;
+                                let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
+                                    ticket_id: Some(ticket_id),
+                                    error: AggError::Channel("injected Spill failure".into()),
+                                });
+                                continue;
+                            }
+                            match spill_writer.spill(ticket_id, &records) {
+                                Ok(()) => {
+                                    let spill_files = spill_writer.count_files();
+                                    let _ = tx_event.unbounded_send(StoreEvent::SpillDone {
+                                        ticket_id,
+                                        spill_files,
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
+                                        ticket_id: Some(ticket_id),
+                                        error,
+                                    });
+                                }
+                            }
+                        }
+                        StoreCommand::ReplaySpill => match spill_writer.pending() {
+                            Ok(entries) => {
+                                let spill_files = spill_writer.count_files();
+                                let _ = tx_event.unbounded_send(StoreEvent::SpillReplay {
+                                    entries,
+                                    spill_files,
+                                });
+                            }
+                            Err(error) => {
+                                let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
+                                    ticket_id: None,
+                                    error,
+                                });
+                            }
+                        },
+                        StoreCommand::RemoveSpill { ticket_id } => {
+                            match spill_writer.remove(ticket_id) {
+                                Ok(()) => {
+                                    let spill_files = spill_writer.count_files();
+                                    let _ = tx_event.unbounded_send(StoreEvent::SpillDone {
+                                        ticket_id,
+                                        spill_files,
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
+                                        ticket_id: Some(ticket_id),
+                                        error,
+                                    });
+                                }
+                            }
+                        }
                         StoreCommand::TestPause(barrier) => {
                             barrier.wait();
                             barrier.wait();
@@ -467,6 +566,9 @@ impl StoreThread {
                         }
                         StoreCommand::FailNextRows => {
                             fail_next_rows = true;
+                        }
+                        StoreCommand::FailNextSpill => {
+                            fail_next_spill = true;
                         }
                         StoreCommand::Shutdown => {
                             break;

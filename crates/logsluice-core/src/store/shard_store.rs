@@ -744,6 +744,12 @@ impl ShardStore {
         Ok(())
     }
 
+    /// Returns the filesystem directory path for this shard store.
+    #[must_use]
+    pub fn shard_dir(&self) -> &Path {
+        &self.opts.shard_dir
+    }
+
     /// Calculates total physical storage size in bytes by walking `shard_dir`.
     ///
     /// # Errors

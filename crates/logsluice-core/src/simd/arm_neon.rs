@@ -41,8 +41,7 @@ unsafe fn diff_counter_banks_neon_inner(
     dst: &mut [[u64; 4]],
 ) -> bool {
     let len = a.len().min(b.len()).min(dst.len());
-    // SAFETY: Zeroing vector registers.
-    let (mut acc_or0, mut acc_or1) = unsafe { (vdupq_n_u64(0), vdupq_n_u64(0)) };
+    let (mut acc_or0, mut acc_or1) = (vdupq_n_u64(0), vdupq_n_u64(0));
     for i in 0..len {
         // SAFETY: `a`, `b`, and `dst` have length at least `len`, so index `i` is in bounds.
         // `vld1q_u64` loads 2 u64s. `vsubq_u64` executes wrapping subtraction. `vst1q_u64` writes 2 u64s.
@@ -65,13 +64,10 @@ unsafe fn diff_counter_banks_neon_inner(
             acc_or1 = vorrq_u64(acc_or1, diff1);
         }
     }
-    // SAFETY: Bitwise OR the two accumulators and check if any lane is non-zero.
-    unsafe {
-        let combined = vorrq_u64(acc_or0, acc_or1);
-        let low = vgetq_lane_u64::<0>(combined);
-        let high = vgetq_lane_u64::<1>(combined);
-        (low | high) != 0
-    }
+    let combined = vorrq_u64(acc_or0, acc_or1);
+    let low = vgetq_lane_u64::<0>(combined);
+    let high = vgetq_lane_u64::<1>(combined);
+    (low | high) != 0
 }
 
 /// Subtracts `b` from `a` element-wise into `dst`, returning `true` if any lane is non-zero.

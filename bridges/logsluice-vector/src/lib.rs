@@ -53,12 +53,9 @@ pub trait VectorEventAdapter: Send + 'static {
     /// flushes (`Delivered`) or fails (`Errored`/`Rejected`) the ingested event.
     fn into_sluice_parts(self) -> (ObjectMap, Box<dyn FnOnce(VectorBatchStatus) + Send>);
 
-    /// Constructs a host event from an emitted `logsluice` object map and attaches a
-    /// downstream acknowledgment receiver that resolves when the host sink finishes delivery.
-    fn from_sluice_parts(
-        fields: ObjectMap,
-        downstream_ack_rx: Box<dyn FnOnce(oneshot::Sender<VectorBatchStatus>) + Send>,
-    ) -> Self;
+    /// Constructs a host event from an emitted `logsluice` object map and attaches an
+    /// [`EmittedAckBridge`] that resolves when the host sink finishes delivery.
+    fn from_sluice_parts(fields: ObjectMap, ack_bridge: EmittedAckBridge) -> Self;
 }
 
 /// Converts a [`VectorEventAdapter`] event into a [`logsluice::event::LogEvent`], spawning
@@ -83,27 +80,13 @@ pub fn into_sluice_event<E: VectorEventAdapter>(host_event: E) -> LogEvent {
 
 /// Converts an emitted [`logsluice::event::LogEvent`] into a host [`VectorEventAdapter`] event,
 /// wiring the host sink's delivery status back into every [`AckFinalizer`] attached to the
-/// emitted summary event.
-pub fn from_sluice_event<E: VectorEventAdapter>(mut sluice_event: LogEvent) -> E {
-    let finalizers = sluice_event.take_finalizers();
-    let (fields, _) = sluice_event.into_parts();
-
-    E::from_sluice_parts(
-        fields,
-        Box::new(move |tx: oneshot::Sender<VectorBatchStatus>| {
-            let (bridge_tx, bridge_rx) = oneshot::channel::<VectorBatchStatus>();
-            // Give the caller a sender by forwarding bridge_rx into finalizers on completion.
-            let _ = tx;
-            drop(bridge_tx);
-            drop(bridge_rx);
-            // If the host uses `attach_downstream_finalizer`, `finalizers` stays alive until
-            // the host drops or updates it.
-            drop(finalizers);
-        }),
-    )
+/// emitted summary event via [`EmittedAckBridge::complete`].
+pub fn from_sluice_event<E: VectorEventAdapter>(sluice_event: LogEvent) -> E {
+    let (fields, ack_bridge) = split_emitted_event(sluice_event);
+    E::from_sluice_parts(fields, ack_bridge)
 }
 
-/// Bridges an emitted [`logsluice::event::LogEvent`] into an `(ObjectMap, AckFinalizerGuard)`
+/// Bridges an emitted [`logsluice::event::LogEvent`] into an `(ObjectMap, EmittedAckBridge)`
 /// pair so a Vector `BatchNotifier` receiver can update and drop the `logsluice` finalizers
 /// when downstream sink delivery completes.
 #[must_use]
@@ -128,7 +111,7 @@ impl EmittedAckBridge {
         drop(self.finalizers);
     }
 
-    /// Borrows a single [`AckFinalizer`] if needed for cloning across split sub-events.
+    /// Returns `true` if no [`AckFinalizer`] instances are attached to this bridge.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.finalizers.is_empty()
@@ -152,7 +135,7 @@ where
     event
 }
 
-/// Creates a paired `(AckFinalizer, oneshot::Receiver<VectorBatchStatus>)` for direct Vector
+/// Creates a paired `(AckFinalizer, oneshot::Receiver<AckStatus>)` for direct Vector
 /// `EventFinalizer` bridging.
 #[must_use]
 pub fn new_vector_ack_pair() -> (AckFinalizer, oneshot::Receiver<AckStatus>) {
@@ -201,5 +184,79 @@ impl VectorSluiceTransform {
         });
         let out_stream = Box::new(self.pipeline).transform_stream(Box::pin(mapped_in));
         Box::pin(out_stream.map(split_emitted_event))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    struct MockVectorEvent {
+        fields: ObjectMap,
+        upstream_ack: Option<Box<dyn FnOnce(VectorBatchStatus) + Send>>,
+        downstream_bridge: Option<EmittedAckBridge>,
+    }
+
+    impl VectorEventAdapter for MockVectorEvent {
+        fn into_sluice_parts(self) -> (ObjectMap, Box<dyn FnOnce(VectorBatchStatus) + Send>) {
+            let cb = self.upstream_ack.unwrap_or_else(|| Box::new(|_| {}));
+            (self.fields, cb)
+        }
+
+        fn from_sluice_parts(fields: ObjectMap, ack_bridge: EmittedAckBridge) -> Self {
+            Self {
+                fields,
+                upstream_ack: None,
+                downstream_bridge: Some(ack_bridge),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn from_sluice_event_forwards_status_via_emitted_ack_bridge()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fields = ObjectMap::new();
+        fields.insert("service".to_owned(), json!("payments"));
+        let ev = LogEvent::from_map(fields);
+        let (ev, mut rx) = ev.with_ack_notifier();
+
+        let host_ev: MockVectorEvent = from_sluice_event(ev);
+        // Before completion, the finalizer must still be alive (not dropped prematurely).
+        assert!(rx.try_recv().is_err());
+
+        let bridge = host_ev
+            .downstream_bridge
+            .ok_or("missing downstream_bridge")?;
+        assert!(!bridge.is_empty());
+        bridge.complete(VectorBatchStatus::Errored);
+
+        let status = rx.await?;
+        assert_eq!(status, AckStatus::Errored);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn into_sluice_event_forwards_upstream_ack() -> Result<(), Box<dyn std::error::Error>> {
+        let (tx, rx) = oneshot::channel();
+        let mut fields = ObjectMap::new();
+        fields.insert("msg".to_owned(), json!("hello"));
+
+        let mock = MockVectorEvent {
+            fields,
+            upstream_ack: Some(Box::new(move |status| {
+                let _ = tx.send(status);
+            })),
+            downstream_bridge: None,
+        };
+
+        let mut sluice_ev = into_sluice_event(mock);
+        let finalizers = sluice_ev.take_finalizers();
+        finalizers.update_status(AckStatus::Delivered);
+        drop(finalizers);
+
+        let resolved = rx.await?;
+        assert_eq!(resolved, VectorBatchStatus::Delivered);
+        Ok(())
     }
 }

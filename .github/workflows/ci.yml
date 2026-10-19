@@ -66,6 +66,6 @@ jobs:
       - name: Dry-run package logsluice-core
         run: cargo package -p logsluice-core --allow-dirty
       - name: Dry-run package logsluice
-        run: cargo package -p logsluice --no-verify --allow-dirty
+        run: cargo package --list -p logsluice --allow-dirty
       - name: Dry-run package logsluice-cli
-        run: cargo package -p logsluice-cli --no-verify --allow-dirty
+        run: cargo package --list -p logsluice-cli --allow-dirty

@@ -66,8 +66,11 @@ impl SpillWriter {
 
     /// Reads all pending spill files, returning them sorted by ticket ID.
     ///
+    /// Corrupt or unreadable `.ndjson` files are quarantined by renaming them to
+    /// `<id>.ndjson.corrupt` and skipped so valid spill files can still be replayed.
+    ///
     /// # Errors
-    /// Returns [`AggError::Io`] or [`AggError::Codec`] if reading or deserializing fails.
+    /// Returns [`AggError::Io`] if reading the spill directory fails.
     pub fn pending(&self) -> AggResult<Vec<(u64, Vec<SliceRecord>)>> {
         if !self.spill_dir.exists() {
             return Ok(Vec::new());
@@ -102,25 +105,35 @@ impl SpillWriter {
                 Err(_) => continue,
             };
 
-            let file = File::open(&path).map_err(AggError::Io)?;
-            let reader = BufReader::new(file);
-            let mut records = Vec::new();
-
-            for line in reader.lines() {
-                let line = line.map_err(AggError::Io)?;
-                if line.trim().is_empty() {
-                    continue;
+            match Self::read_spill_file(&path) {
+                Ok(records) => results.push((ticket_id, records)),
+                Err(_) => {
+                    let corrupt_path = path.with_extension("ndjson.corrupt");
+                    let _ = fs::rename(&path, corrupt_path);
                 }
-                let record: SliceRecord =
-                    serde_json::from_str(&line).map_err(|e| AggError::Codec(e.to_string()))?;
-                records.push(record);
             }
-
-            results.push((ticket_id, records));
         }
 
         results.sort_by_key(|(id, _)| *id);
         Ok(results)
+    }
+
+    fn read_spill_file(path: &Path) -> AggResult<Vec<SliceRecord>> {
+        let file = File::open(path).map_err(AggError::Io)?;
+        let reader = BufReader::new(file);
+        let mut records = Vec::new();
+
+        for line in reader.lines() {
+            let line = line.map_err(AggError::Io)?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: SliceRecord =
+                serde_json::from_str(&line).map_err(|e| AggError::Codec(e.to_string()))?;
+            records.push(record);
+        }
+
+        Ok(records)
     }
 
     /// Deletes the spill file for `ticket_id` if it exists.
@@ -228,5 +241,39 @@ mod tests {
         assert_eq!(writer.count_files(), 0);
         let pending = writer.pending().expect("pending");
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn pending_skips_and_quarantines_corrupt_file() {
+        let tmp = tempdir().expect("tempdir");
+        let mut writer = SpillWriter::new(tmp.path().to_path_buf());
+
+        let valid_record = sample_record(20, 100);
+        writer
+            .spill(20, std::slice::from_ref(&valid_record))
+            .expect("spill valid");
+
+        let corrupt_orig = writer.spill_dir().join(format!("{:020}.ndjson", 10));
+        let corrupt_quarantined = writer
+            .spill_dir()
+            .join(format!("{:020}.ndjson.corrupt", 10));
+        fs::write(&corrupt_orig, b"{broken json\n").expect("write corrupt file");
+
+        assert_eq!(writer.count_files(), 2);
+
+        let first = writer
+            .pending()
+            .expect("pending should skip corrupt file instead of failing");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, 20);
+        assert_eq!(first[0].1, vec![valid_record]);
+
+        assert!(!corrupt_orig.exists());
+        assert!(corrupt_quarantined.exists());
+        assert_eq!(writer.count_files(), 1);
+
+        let second = writer.pending().expect("second pending call");
+        assert_eq!(second, first);
+        assert_eq!(writer.count_files(), 1);
     }
 }

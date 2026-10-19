@@ -189,6 +189,43 @@ fn render_native_contract_fields() {
 }
 
 #[test]
+fn render_native_matches_golden_json() {
+    let rec = fixture_record(0xabc, 2, EmitReason::Close);
+    let e = render_native(&rec, &cfg(), &plan());
+    let actual = serde_json::Value::Object(e.as_map().clone());
+    let expected = serde_json::json!({
+        "_wa_route": "summary",
+        "body": "login success",
+        "destination": {
+            "ip": "443"
+        },
+        "event_count": 3,
+        "resource": {
+            "service": {
+                "name": "auth"
+            }
+        },
+        "scope": {
+            "name": "test-scope",
+            "version": "1.0"
+        },
+        "source": {
+            "ip": "192.168.1.1"
+        },
+        "window": {
+            "emit_reason": "close",
+            "emitter_id": "pod-1",
+            "end": "2023-11-15T22:13:20.000Z",
+            "key_digest": "00000000000000000000000000000abc",
+            "slice_id": "pod-1:1700000000000:00000000000000000000000000000abc:2",
+            "slice_seq": 2,
+            "start": "2023-11-14T22:13:20.000Z"
+        }
+    });
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn test_render_omits_missing_dims() {
     let rec = fixture_record_with_dims(vec![None, Some("443".into())]);
     let e = render_native(&rec, &cfg(), &plan());

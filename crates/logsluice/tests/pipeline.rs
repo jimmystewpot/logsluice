@@ -215,3 +215,95 @@ async fn auto_envelope_mode_emits_otlp_when_input_is_otlp() {
     assert_eq!(meta.window_duration_ms, 10_000);
     assert_eq!(meta.window_offset_ms, 0);
 }
+
+#[tokio::test]
+async fn closed_output_receiver_does_not_commit_ticket() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let yaml = format!(
+        r#"
+storage:
+  data_dir: {:?}
+  l1_flush_interval: 20ms
+  sync_wal: false
+shards: 1
+window:
+  type: tumbling
+  duration: 1d
+  allowed_skew: 30s
+  allowed_lateness: 0s
+  late_emit_interval: 20ms
+  max_close_delay: 1000d
+  max_future_drift: 2d
+  emit:
+    close_jitter_max: 0s
+group_by:
+  - source.ip
+aggregations:
+  event_count: count
+shutdown:
+  drain_timeout: 400ms
+"#,
+        dir.path()
+    );
+
+    let cfg: SluiceConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+    let pipeline = SluicePipeline::new(cfg.clone()).unwrap();
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    let out = Box::new(pipeline).transform_stream(rx);
+
+    // Send an aggregatable event and wait for its L1->L2 flush ack so the window is persisted.
+    let mut agg_event = LogEvent::default();
+    let rfc = chrono::DateTime::from_timestamp_millis(T0)
+        .unwrap()
+        .to_rfc3339();
+    agg_event.insert_path("@timestamp", Value::from(rfc));
+    agg_event.insert_path("source.ip", Value::from("10.0.0.1"));
+    let (agg_event_with_ack, flush_ack_rx) = agg_event.with_ack_notifier();
+    tx.unbounded_send(agg_event_with_ack).unwrap();
+    assert_eq!(flush_ack_rx.await.unwrap(), AckStatus::Delivered);
+
+    // Drop the output receiver before emission occurs.
+    drop(out);
+
+    let mut untransmitted = LogEvent::default();
+    untransmitted.insert_path("source.ip", Value::from("10.0.0.98"));
+    let (untransmitted_with_ack, ack_rx) = untransmitted.with_ack_notifier();
+    tx.unbounded_send(untransmitted_with_ack).unwrap();
+
+    // Closing input triggers drain ticket emission while the output receiver is closed.
+    drop(tx);
+
+    let upstream_status = ack_rx.await.unwrap();
+    assert_ne!(upstream_status, AckStatus::Delivered);
+
+    // Wait for drain_timeout to elapse and the shard store thread to shut down.
+    tokio::time::sleep(Duration::from_millis(550)).await;
+
+    let meta_bytes = std::fs::read(dir.path().join("pod_meta.json")).unwrap();
+    let meta: logsluice_core::store::meta::PodMeta = serde_json::from_slice(&meta_bytes).unwrap();
+    let (_engine, plan) = cfg.into_engine_and_plan().unwrap();
+    let store_opts = logsluice_core::store::shard_store::StoreOptions {
+        shard_dir: dir.path().join("shard_0"),
+        cache_bytes: 1024 * 1024,
+        hdr_memtable_bytes: 1024 * 1024,
+        tail_memtable_bytes: 1024 * 1024,
+        sync_wal: false,
+        layout: plan.layout(),
+    };
+
+    let mut store = None;
+    for _ in 0..40 {
+        if let Ok(opened) =
+            logsluice_core::store::shard_store::ShardStore::open(store_opts.clone(), &meta)
+        {
+            store = Some(opened);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let store = store.expect("shard store should open after pipeline shutdown");
+    assert!(
+        !store.tickets().unwrap().is_empty(),
+        "ticket must remain unacked when output channel is closed"
+    );
+}

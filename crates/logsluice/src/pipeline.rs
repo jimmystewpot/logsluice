@@ -152,7 +152,10 @@ async fn emit_worker_output(
 
         for mut log in rendered_logs {
             log.merge_finalizers(AckFinalizers::from_single(finalizer.clone()));
-            let _ = output_tx.send(log).await;
+            if output_tx.send(log).await.is_err() {
+                finalizer.update_status(AckStatus::Errored);
+                break;
+            }
         }
         drop(finalizer);
 
@@ -494,7 +497,10 @@ async fn run_pipeline(
                         // Forward passthrough events with original finalizers preserved
                         for mut pt in router_out.passthrough {
                             pt.merge_finalizers(finalizers.clone());
-                            let _ = output_tx.send(pt).await;
+                            if output_tx.send(pt).await.is_err() {
+                                finalizers.update_status(AckStatus::Errored);
+                                break;
+                            }
                         }
 
                         // Buffer items per shard

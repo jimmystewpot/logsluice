@@ -885,7 +885,7 @@ impl<F> ShardWorker<F> {
                     output.commands.push(StoreCommand::Rows {
                         epoch_ms: window.epoch_ms,
                         reason: EmitReason::Close,
-                        after: None,
+                        after: closing.scan_cursor,
                         keys: None,
                         limit: self.ctx.cfg.output.max_records_per_ticket,
                     });
@@ -985,7 +985,7 @@ impl<F> ShardWorker<F> {
                                 output.commands.push(StoreCommand::Rows {
                                     epoch_ms: window.epoch_ms,
                                     reason: EmitReason::Close,
-                                    after: None,
+                                    after: closing.scan_cursor,
                                     keys: None,
                                     limit: self.ctx.cfg.output.max_records_per_ticket,
                                 });
@@ -1304,6 +1304,46 @@ impl<F> ShardWorker<F> {
                     }
                 }
                 output.failed_release.extend(finalizers);
+            }
+            StoreEvent::PersistTicketsFailed {
+                ticket_ids,
+                error: _,
+            } => {
+                self.persist_tickets_inflight = self.persist_tickets_inflight.saturating_sub(1);
+                for ticket_id in ticket_ids {
+                    self.pending_rows.remove(&ticket_id);
+                    if let Some(ticket) = self.ledger.resolve(ticket_id)
+                        && ticket.reason == EmitReason::Close
+                        && let Some(window) = self.windows.get_mut(&ticket.window_epoch_ms)
+                        && let WindowPhase::Closing(ref mut closing) = window.phase
+                    {
+                        closing.scan_started = false;
+                        closing.scan_complete = false;
+                        closing.scan_cursor = None;
+                    }
+                }
+            }
+            StoreEvent::RowsFailed {
+                epoch_ms,
+                reason,
+                error: _,
+            } => {
+                self.store_queries_inflight = self.store_queries_inflight.saturating_sub(1);
+                let _ = self.recovery_ticket_queue.pop_front();
+                if let Some(window) = self.windows.get_mut(&epoch_ms) {
+                    match reason {
+                        EmitReason::Close => {
+                            if let WindowPhase::Closing(ref mut closing) = window.phase {
+                                closing.scan_started = false;
+                            }
+                        }
+                        EmitReason::Evict => {
+                            window.evict_in_progress = false;
+                            window.evict_collected_rows.clear();
+                        }
+                        EmitReason::Periodic | EmitReason::LateRevision | EmitReason::Drain => {}
+                    }
+                }
             }
             StoreEvent::Failed(_) => {
                 self.store_queries_inflight = 0;

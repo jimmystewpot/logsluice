@@ -63,6 +63,9 @@ pub enum StoreCommand<F> {
     /// Injects a simulated flush failure on the next `Flush` command.
     #[doc(hidden)]
     FailNextFlush,
+    /// Injects a simulated row read failure on the next `Rows` command.
+    #[doc(hidden)]
+    FailNextRows,
     /// Cleanly terminate the storage thread command loop.
     Shutdown,
 }
@@ -101,6 +104,22 @@ pub enum StoreEvent<F> {
     },
     /// Tickets successfully persisted with `SyncAll` durability.
     TicketsPersisted(Vec<u64>),
+    /// Ticket persistence failed; returns the unpersisted ticket IDs and storage error.
+    PersistTicketsFailed {
+        /// Ticket IDs that failed to persist.
+        ticket_ids: Vec<u64>,
+        /// Storage error encountered during ticket persistence.
+        error: AggError,
+    },
+    /// Row scan or key lookup failed; returns the window epoch, emission reason, and error.
+    RowsFailed {
+        /// Target window epoch in milliseconds.
+        epoch_ms: u64,
+        /// Reason that triggered the row read.
+        reason: EmitReason,
+        /// Storage error encountered during the row read.
+        error: AggError,
+    },
     /// Ticket successfully acknowledged and applied to header state.
     AckApplied {
         /// Acknowledged ticket ID.
@@ -208,6 +227,7 @@ impl StoreThread {
             .spawn(move || {
                 let mut fail_next_flush = false;
                 let mut fail_next_persist = false;
+                let mut fail_next_rows = false;
                 let mut last_disk_bytes = store.disk_bytes().unwrap_or(0);
                 while let Ok(cmd) = rx_cmd.recv() {
                     match cmd {
@@ -244,21 +264,28 @@ impl StoreThread {
                             }
                         }
                         StoreCommand::PersistTickets(tickets) => {
+                            let ticket_ids: Vec<u64> = tickets.iter().map(|t| t.id).collect();
                             if fail_next_persist {
                                 fail_next_persist = false;
-                                let _ = tx_event.unbounded_send(StoreEvent::Failed(
-                                    AggError::Channel("injected PersistTickets failure".into()),
-                                ));
+                                let _ = tx_event.unbounded_send(StoreEvent::PersistTicketsFailed {
+                                    ticket_ids,
+                                    error: AggError::Channel(
+                                        "injected PersistTickets failure".into(),
+                                    ),
+                                });
                                 continue;
                             }
-                            let ticket_ids = tickets.iter().map(|t| t.id).collect();
                             match store.put_tickets(&tickets) {
                                 Ok(()) => {
                                     let _ = tx_event
                                         .unbounded_send(StoreEvent::TicketsPersisted(ticket_ids));
                                 }
-                                Err(e) => {
-                                    let _ = tx_event.unbounded_send(StoreEvent::Failed(e));
+                                Err(error) => {
+                                    let _ =
+                                        tx_event.unbounded_send(StoreEvent::PersistTicketsFailed {
+                                            ticket_ids,
+                                            error,
+                                        });
                                 }
                             }
                         }
@@ -283,6 +310,15 @@ impl StoreThread {
                             keys,
                             limit,
                         } => {
+                            if fail_next_rows {
+                                fail_next_rows = false;
+                                let _ = tx_event.unbounded_send(StoreEvent::RowsFailed {
+                                    epoch_ms,
+                                    reason,
+                                    error: AggError::Channel("injected Rows failure".into()),
+                                });
+                                continue;
+                            }
                             if let Some(ref ks) = keys {
                                 match store.rows_for(ks) {
                                     Ok(rows) => {
@@ -293,8 +329,12 @@ impl StoreThread {
                                             next_after: None,
                                         });
                                     }
-                                    Err(e) => {
-                                        let _ = tx_event.unbounded_send(StoreEvent::Failed(e));
+                                    Err(error) => {
+                                        let _ = tx_event.unbounded_send(StoreEvent::RowsFailed {
+                                            epoch_ms,
+                                            reason,
+                                            error,
+                                        });
                                     }
                                 }
                             } else {
@@ -312,8 +352,12 @@ impl StoreThread {
                                             next_after,
                                         });
                                     }
-                                    Err(e) => {
-                                        let _ = tx_event.unbounded_send(StoreEvent::Failed(e));
+                                    Err(error) => {
+                                        let _ = tx_event.unbounded_send(StoreEvent::RowsFailed {
+                                            epoch_ms,
+                                            reason,
+                                            error,
+                                        });
                                     }
                                 }
                             }
@@ -362,6 +406,9 @@ impl StoreThread {
                         }
                         StoreCommand::FailNextFlush => {
                             fail_next_flush = true;
+                        }
+                        StoreCommand::FailNextRows => {
+                            fail_next_rows = true;
                         }
                         StoreCommand::Shutdown => {
                             break;

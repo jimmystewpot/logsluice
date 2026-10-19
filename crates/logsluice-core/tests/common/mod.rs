@@ -441,6 +441,20 @@ impl Harness {
         self.store_handle.fail_next_flush();
     }
 
+    /// Injects a simulated failure on the next `PersistTickets` command processed by the store thread.
+    pub fn fail_next_persist(&mut self) {
+        self.store_handle
+            .send(StoreCommand::FailNextPersist)
+            .expect("failed to send FailNextPersist command");
+    }
+
+    /// Injects a simulated failure on the next `Rows` command processed by the store thread.
+    pub fn fail_next_rows(&mut self) {
+        self.store_handle
+            .send(StoreCommand::FailNextRows)
+            .expect("failed to send FailNextRows command");
+    }
+
     /// Advances time by `timeout_ms` and executes a clean shutdown drain.
     pub fn drain(&mut self, timeout_ms: i64) {
         self.now_ms += timeout_ms;

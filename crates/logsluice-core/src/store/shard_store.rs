@@ -1,7 +1,7 @@
 //! Shard-level persistence engine wrapping a single `fjall::Database` instance.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use fjall::{
@@ -750,12 +750,16 @@ impl ShardStore {
         &self.opts.shard_dir
     }
 
-    /// Calculates total physical storage size in bytes by walking `shard_dir`.
+    /// Queries the shard's current LSM database disk usage in bytes via
+    /// [`fjall::Database::disk_space`].
+    ///
+    /// This accounts for the fjall journal and active keyspace SSTables in O(1) without walking
+    /// the filesystem, and excludes external files such as the shard's `spill/` directory.
     ///
     /// # Errors
-    /// Returns [`AggError::Io`] if directory traversal fails.
+    /// Returns [`AggError::Storage`] if querying database disk space fails.
     pub fn disk_bytes(&self) -> AggResult<u64> {
-        dir_size(&self.opts.shard_dir).map_err(AggError::Io)
+        Ok(self.db.disk_space()?)
     }
 
     fn get_or_create_hdr_keyspace(&mut self, epoch_ms: u64) -> AggResult<Keyspace> {
@@ -847,21 +851,4 @@ fn parse_tail_epoch(name: &str) -> Option<u64> {
     } else {
         None
     }
-}
-
-fn dir_size(path: &Path) -> std::io::Result<u64> {
-    let mut total = 0;
-    if !path.exists() {
-        return Ok(0);
-    }
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let meta = entry.metadata()?;
-        if meta.is_dir() {
-            total += dir_size(&entry.path())?;
-        } else {
-            total += meta.len();
-        }
-    }
-    Ok(total)
 }

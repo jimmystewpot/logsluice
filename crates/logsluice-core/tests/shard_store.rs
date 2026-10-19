@@ -278,6 +278,64 @@ fn rows_for_window_keys_resources_and_disk_bytes() {
 }
 
 #[test]
+fn disk_bytes_grows_after_flush_and_shrinks_after_drop_window() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+    let mut store_opts = opts(d.path());
+    store_opts.hdr_memtable_bytes = 1;
+    store_opts.tail_memtable_bytes = 1;
+    let mut s = ShardStore::open(store_opts.clone(), &meta).unwrap();
+
+    let initial = s.disk_bytes().unwrap();
+
+    // Unrelated files in the spill directory must not be counted in ShardStore::disk_bytes().
+    let spill_dir = store_opts.shard_dir.join("spill");
+    std::fs::create_dir_all(&spill_dir).unwrap();
+    std::fs::write(
+        spill_dir.join("00000000000000000001.ndjson"),
+        vec![b's'; 32_768],
+    )
+    .unwrap();
+    assert_eq!(s.disk_bytes().unwrap(), initial);
+
+    // Flush a 64 KiB incompressible exemplar tail so both the journal (~64 KiB) and the
+    // rotated window tail SSTable (~64 KiB) contribute to fjall's disk_space().
+    let incompressible: Vec<u8> = (0..16_384u32)
+        .flat_map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes())
+        .collect();
+    let mut flush_entry = entry(1, true, 1);
+    flush_entry.tail = Some(ExemplarTail {
+        severity: 9,
+        body: Some(bytes::Bytes::from(incompressible)),
+        dims: vec![],
+        attrs: vec![],
+    });
+    s.apply_flush(batch(vec![flush_entry]), &k).unwrap();
+
+    // Wait for fjall's background flush worker to materialize the rotated memtable SSTable.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let after_flush = loop {
+        let current = s.disk_bytes().unwrap();
+        if current > initial || std::time::Instant::now() >= deadline {
+            break current;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(
+        after_flush > initial,
+        "expected disk_bytes after flush ({after_flush}) > initial ({initial})"
+    );
+
+    s.drop_window(0).unwrap();
+    let after_drop = s.disk_bytes().unwrap();
+    assert!(
+        after_drop < after_flush,
+        "expected disk_bytes after drop_window ({after_drop}) < after_flush ({after_flush})"
+    );
+}
+
+#[test]
 fn shard_store_cross_checks_meta_on_reopen() {
     let d = tempfile::tempdir().unwrap();
     let meta = PodMeta::load_or_init(d.path(), "pod-0", 2, b"schema-v1").unwrap();

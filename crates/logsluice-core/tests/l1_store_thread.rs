@@ -316,3 +316,40 @@ fn store_thread_delete_keys_and_drop_window() {
     h.send(StoreCommand::Shutdown).unwrap();
     j.join().unwrap();
 }
+
+#[test]
+fn flush_failure_returns_finalizers() {
+    let (store, k, _d) = common::store_with_layout();
+    let (h, mut ev, j) = StoreThread::spawn::<u32>(store, k).unwrap();
+    let mut buf = L1Buffer::new(4);
+    buf.accumulate(
+        StorageKey24 {
+            epoch_ms: 0,
+            digest: 1,
+        },
+        true,
+        1,
+        &[[1, 0, 0, 0]],
+        &[5, 5],
+        0,
+        Some(common::tail()),
+        &k,
+    );
+    buf.push_finalizer(77);
+    buf.push_finalizer(88);
+
+    h.send(StoreCommand::FailNextFlush).unwrap();
+    h.send(StoreCommand::Flush(buf)).unwrap();
+    match common::recv(&mut ev, Duration::from_secs(5)) {
+        StoreEvent::FlushFailed {
+            error: _,
+            finalizers,
+        } => {
+            assert_eq!(finalizers, vec![77, 88]);
+        }
+        other => panic!("expected StoreEvent::FlushFailed, got {other:?}"),
+    }
+
+    h.send(StoreCommand::Shutdown).unwrap();
+    j.join().unwrap();
+}

@@ -159,6 +159,8 @@ pub struct WorkerOutput<F> {
     pub emit: Vec<EmitBatch>,
     /// Flushed finalizer tokens ready for release.
     pub release: Vec<F>,
+    /// Finalizer tokens from failed flushes that must be marked as errored.
+    pub failed_release: Vec<F>,
 }
 
 impl<F> Default for WorkerOutput<F> {
@@ -167,6 +169,7 @@ impl<F> Default for WorkerOutput<F> {
             commands: Vec::new(),
             emit: Vec::new(),
             release: Vec::new(),
+            failed_release: Vec::new(),
         }
     }
 }
@@ -1262,8 +1265,15 @@ impl<F> ShardWorker<F> {
                     }
                 }
             }
-            StoreEvent::Failed(_) => {
+            StoreEvent::FlushFailed {
+                error: _,
+                finalizers,
+            } => {
                 self.double_buf.flush_completed();
+                self.drain_in_progress = false;
+                output.failed_release.extend(finalizers);
+            }
+            StoreEvent::Failed(_) => {
                 self.store_queries_inflight = 0;
                 self.persist_tickets_inflight = 0;
             }

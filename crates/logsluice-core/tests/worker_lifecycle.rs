@@ -100,3 +100,41 @@ fn poll_purges_out_of_order_windows_keep_max_horizon() {
     assert!(h.live_windows().is_empty());
     assert_eq!(h.horizon(), 2 * DAY);
 }
+
+#[test]
+fn non_flush_failure_does_not_clear_flush_in_flight() {
+    let mut h = Harness::new(|c| c.storage.l1_coalesce_max_keys = 2);
+    h.ingest(&[(1, 1), (2, 2)]);
+    let flush_out = h.worker().flush_l1(0);
+    assert_eq!(flush_out.commands.len(), 1);
+
+    // Fill the swapped active buffer while the first flush remains in flight.
+    assert!(!h.ingest(&[(3, 3), (4, 4)]).backpressure);
+    assert!(!h.worker().can_ingest());
+    assert!(h.ingest(&[(5, 5), (6, 6)]).backpressure);
+
+    // A non-flush store failure must not mark the in-flight flush as completed.
+    let err_out = h.worker().on_event(
+        logsluice_core::store::thread::StoreEvent::Failed(
+            logsluice_core::error::AggError::Channel("non-flush failure".into()),
+        ),
+        0,
+    );
+    assert!(err_out.release.is_empty());
+    assert!(err_out.failed_release.is_empty());
+    assert!(!h.worker().can_ingest());
+    assert!(h.ingest(&[(5, 5), (6, 6)]).backpressure);
+
+    // Completing the flush with FlushFailed clears flush_in_flight and returns failed_release.
+    let fail_out = h.worker().on_event(
+        logsluice_core::store::thread::StoreEvent::FlushFailed {
+            error: logsluice_core::error::AggError::Channel("flush failure".into()),
+            finalizers: vec![99],
+        },
+        0,
+    );
+    assert!(fail_out.release.is_empty());
+    assert_eq!(fail_out.failed_release, vec![99]);
+    assert!(h.worker().can_ingest());
+    assert!(!h.ingest(&[(5, 5), (6, 6)]).backpressure);
+}

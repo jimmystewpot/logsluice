@@ -165,6 +165,10 @@ async fn emit_worker_output(
     for finalizers in out.release {
         finalizers.update_status(AckStatus::Delivered);
     }
+
+    for finalizers in out.failed_release {
+        finalizers.update_status(AckStatus::Errored);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -206,13 +210,7 @@ async fn shard_loop(
 
             Some(store_ev) = store_events.next() => {
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                let is_failed = matches!(store_ev, StoreEvent::Failed(_));
                 let out = worker.on_event(store_ev, now_ms);
-                if is_failed {
-                    for f in &out.release {
-                        f.update_status(AckStatus::Errored);
-                    }
-                }
                 emit_worker_output(out, &store_handle, &mut output_tx, &shard_tx, &cfg, &plan, &detected_otlp).await;
 
                 if let Some((items, finalizer)) = pending_ingest.take()
@@ -557,4 +555,67 @@ async fn run_pipeline(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::event::Value;
+
+    #[tokio::test]
+    async fn pipeline_flush_failure_marks_ack_errored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let yaml = format!(
+            r#"
+storage:
+  data_dir: {:?}
+  l1_flush_interval: 20ms
+  sync_wal: false
+shards: 1
+window:
+  type: tumbling
+  duration: 1d
+  allowed_skew: 30s
+  allowed_lateness: 0s
+  late_emit_interval: 20ms
+  max_close_delay: 1000d
+  max_future_drift: 2d
+  emit:
+    close_jitter_max: 0s
+group_by:
+  - source.ip
+aggregations:
+  event_count: count
+shutdown:
+  drain_timeout: 200ms
+"#,
+            dir.path()
+        );
+
+        let cfg: SluiceConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        let pipeline = SluicePipeline::new(cfg).unwrap();
+        let (tx, rx) = futures_mpsc::unbounded();
+        let _out = Box::new(pipeline).transform_stream(rx);
+
+        StoreThread::fail_next_flush();
+
+        let mut log = LogEvent::default();
+        let rfc = chrono::DateTime::from_timestamp_millis(1_728_000_000_000)
+            .unwrap()
+            .to_rfc3339();
+        log.insert_path("@timestamp", Value::from(rfc));
+        log.insert_path("source.ip", Value::from("10.0.0.1"));
+        let (log_with_ack, ack_rx) = log.with_ack_notifier();
+
+        tx.unbounded_send(log_with_ack).unwrap();
+
+        let status = tokio::time::timeout(Duration::from_secs(2), ack_rx)
+            .await
+            .expect("timed out waiting for flush ack")
+            .expect("ack channel closed");
+        assert_eq!(status, AckStatus::Errored);
+
+        drop(tx);
+    }
 }

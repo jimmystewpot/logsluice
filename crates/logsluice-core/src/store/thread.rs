@@ -58,6 +58,9 @@ pub enum StoreCommand<F> {
     /// Injects a simulated ticket persistence failure on the next `PersistTickets` command.
     #[doc(hidden)]
     FailNextPersist,
+    /// Injects a simulated flush failure on the next `Flush` command.
+    #[doc(hidden)]
+    FailNextFlush,
     /// Cleanly terminate the storage thread command loop.
     Shutdown,
 }
@@ -73,6 +76,13 @@ pub enum StoreEvent<F> {
         stats: FlushStats,
         /// Current shard database directory size in bytes.
         disk_bytes: u64,
+    },
+    /// Flush operation failed; returns the error and unacknowledged finalizers.
+    FlushFailed {
+        /// Storage error encountered during the flush attempt.
+        error: AggError,
+        /// Finalizers attached to the failed L1 buffer so upstream can be notified of error.
+        finalizers: Vec<F>,
     },
     /// Row scan or key lookup completed.
     Rows {
@@ -138,10 +148,18 @@ impl<F> StoreHandle<F> {
     }
 }
 
+static FAIL_NEXT_FLUSH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Controller for spawning and managing a per-shard storage worker thread.
 pub struct StoreThread;
 
 impl StoreThread {
+    /// Arms a one-shot simulated `apply_flush` error on the next `StoreCommand::Flush` processed.
+    #[doc(hidden)]
+    pub fn fail_next_flush() {
+        FAIL_NEXT_FLUSH.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Spawns a dedicated background thread for shard persistence operations.
     ///
     /// Commands are queued across a bounded channel (capacity 64), and events are published
@@ -164,17 +182,30 @@ impl StoreThread {
         let join_handle = std::thread::Builder::new()
             .name("shard-store-worker".to_string())
             .spawn(move || {
+                let mut fail_next_flush = false;
                 let mut fail_next_persist = false;
                 while let Ok(cmd) = rx_cmd.recv() {
                     match cmd {
                         StoreCommand::Flush(buf) => {
                             let (batch, finalizers) = buf.into_flush();
-                            match store.apply_flush(batch, &k) {
+                            let flush_res = if fail_next_flush
+                                || FAIL_NEXT_FLUSH.swap(false, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                fail_next_flush = false;
+                                Err(AggError::Channel("injected Flush failure".into()))
+                            } else {
+                                store.apply_flush(batch, &k)
+                            };
+                            match flush_res {
                                 Ok(stats) => {
                                     let disk_bytes = match store.disk_bytes() {
                                         Ok(b) => b,
                                         Err(e) => {
-                                            let _ = tx_event.unbounded_send(StoreEvent::Failed(e));
+                                            let _ =
+                                                tx_event.unbounded_send(StoreEvent::FlushFailed {
+                                                    error: e,
+                                                    finalizers,
+                                                });
                                             continue;
                                         }
                                     };
@@ -185,7 +216,10 @@ impl StoreThread {
                                     });
                                 }
                                 Err(e) => {
-                                    let _ = tx_event.unbounded_send(StoreEvent::Failed(e));
+                                    let _ = tx_event.unbounded_send(StoreEvent::FlushFailed {
+                                        error: e,
+                                        finalizers,
+                                    });
                                 }
                             }
                         }
@@ -305,6 +339,9 @@ impl StoreThread {
                         }
                         StoreCommand::FailNextPersist => {
                             fail_next_persist = true;
+                        }
+                        StoreCommand::FailNextFlush => {
+                            fail_next_flush = true;
                         }
                         StoreCommand::Shutdown => {
                             break;

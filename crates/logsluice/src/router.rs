@@ -694,18 +694,23 @@ impl Router {
             SourceKey::Default
         };
 
-        let resource_logs = match event
+        if event
             .get(&self.resource_logs_path)
             .and_then(Value::as_array)
+            .is_none()
         {
-            Some(arr) => arr.to_vec(),
-            None => {
-                let _ = event.insert(&self.route_path, Value::from("quarantine"));
-                let _ = event.insert(&self.reason_path, Value::from("missing_timestamp"));
-                self.stats.quarantined_total += 1;
-                out.passthrough.push(event);
-                return;
-            }
+            let _ = event.insert(&self.route_path, Value::from("quarantine"));
+            let _ = event.insert(&self.reason_path, Value::from("missing_timestamp"));
+            self.stats.quarantined_total += 1;
+            out.passthrough.push(event);
+            return;
+        }
+        let Some(resource_logs) = event
+            .get(&self.resource_logs_path)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+        else {
+            return;
         };
 
         let mut routed_shards: BTreeSet<usize> = BTreeSet::new();
@@ -1074,7 +1079,7 @@ impl Router {
         for (reason, grouped) in &quarantine_groups {
             let pt = self.build_filtered_otlp_event(
                 &event,
-                &resource_logs,
+                resource_logs,
                 grouped,
                 "quarantine",
                 reason,
@@ -1085,7 +1090,7 @@ impl Router {
         if !late_records.is_empty() {
             let pt = self.build_filtered_otlp_event(
                 &event,
-                &resource_logs,
+                resource_logs,
                 &late_records,
                 "late",
                 "late",

@@ -655,3 +655,110 @@ fn otlp_mixed_batch_isolates_multiple_quarantine_reasons_and_late_records() {
     assert_eq!(r.stats().late_total, 1);
     assert_eq!(out.passthrough.len(), 4);
 }
+
+#[test]
+fn otlp_late_and_quarantine_passthrough_unchanged() {
+    use logsluice::config::EnvelopeMode;
+
+    let mut base_cfg = cfg();
+    base_cfg.envelope_mode = EnvelopeMode::Otlp;
+    let mut r = test_router_with_watermark(base_cfg, DAY_MS + 3_600_000);
+    let mut out = RouterOutput::new(4);
+
+    // 1. Envelope without resourceLogs array -> whole event quarantined as missing_timestamp
+    let non_array_env = ev(&[("topic", "otlp-raw".into()), ("resourceLogs", "bad".into())]);
+    r.route(non_array_env, NOW, &mut out);
+    assert_eq!(out.passthrough.len(), 1);
+    assert_eq!(
+        out.passthrough[0].get_path("_wa_route"),
+        Some(&Value::from("quarantine"))
+    );
+    assert_eq!(
+        out.passthrough[0].get_path("_wa_reason"),
+        Some(&Value::from("missing_timestamp"))
+    );
+    assert_eq!(
+        out.passthrough[0].get_path("topic"),
+        Some(&Value::from("otlp-raw"))
+    );
+
+    // 2. Mixed OTLP envelope with resource & scope metadata, valid, quarantined, and late records
+    let mut out2 = RouterOutput::new(4);
+    let valid_ns = ((NOW - 1_000) * 1_000_000).to_string();
+    let late_ns = (1_000 * 1_000_000).to_string();
+
+    let make_lr = |id: &str, ts_opt: Option<&str>| -> Value {
+        let mut m = ObjectMap::new();
+        if let Some(ts) = ts_opt {
+            m.insert("timeUnixNano".into(), Value::from(ts));
+        }
+        let mut body = ObjectMap::new();
+        body.insert("stringValue".into(), Value::from(id));
+        m.insert("body".into(), Value::Object(body));
+        Value::Object(m)
+    };
+
+    let lr_valid = make_lr("valid-1", Some(&valid_ns));
+    let lr_missing = make_lr("missing-1", None);
+    let lr_invalid = make_lr("invalid-1", Some("bad-ts"));
+    let lr_late = make_lr("late-1", Some(&late_ns));
+
+    let mut scope_meta = ObjectMap::new();
+    scope_meta.insert("name".into(), Value::from("my-scope"));
+    scope_meta.insert("version".into(), Value::from("2.0"));
+
+    let mut scope_log = ObjectMap::new();
+    scope_log.insert("scope".into(), Value::Object(scope_meta.clone()));
+    scope_log.insert(
+        "logRecords".into(),
+        Value::Array(vec![
+            lr_valid,
+            lr_missing.clone(),
+            lr_invalid.clone(),
+            lr_late.clone(),
+        ]),
+    );
+
+    let mut res_meta = ObjectMap::new();
+    res_meta.insert("service.name".into(), Value::from("checkout"));
+
+    let mut res_log = ObjectMap::new();
+    res_log.insert("resource".into(), Value::Object(res_meta.clone()));
+    res_log.insert(
+        "scopeLogs".into(),
+        Value::Array(vec![Value::Object(scope_log)]),
+    );
+
+    let mut root = ObjectMap::new();
+    root.insert("topic".into(), Value::from("otlp-logs"));
+    root.insert(
+        "resourceLogs".into(),
+        Value::Array(vec![Value::Object(res_log)]),
+    );
+
+    r.route(LogEvent::from_map(root), NOW, &mut out2);
+
+    let make_expected_passthrough = |route: &str, reason: &str, rec: Value| -> LogEvent {
+        let mut sl = ObjectMap::new();
+        sl.insert("scope".into(), Value::Object(scope_meta.clone()));
+        sl.insert("logRecords".into(), Value::Array(vec![rec]));
+        let mut rl = ObjectMap::new();
+        rl.insert("resource".into(), Value::Object(res_meta.clone()));
+        rl.insert("scopeLogs".into(), Value::Array(vec![Value::Object(sl)]));
+        let mut map = ObjectMap::new();
+        map.insert("topic".into(), Value::from("otlp-logs"));
+        map.insert("resourceLogs".into(), Value::Array(vec![Value::Object(rl)]));
+        map.insert("_wa_route".into(), Value::from(route));
+        map.insert("_wa_reason".into(), Value::from(reason));
+        LogEvent::from_map(map)
+    };
+
+    assert_eq!(
+        out2.passthrough,
+        vec![
+            make_expected_passthrough("quarantine", "invalid_timestamp", lr_invalid),
+            make_expected_passthrough("quarantine", "missing_timestamp", lr_missing),
+            make_expected_passthrough("late", "late", lr_late),
+        ]
+    );
+}

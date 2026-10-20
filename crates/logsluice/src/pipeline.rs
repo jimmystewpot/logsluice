@@ -80,7 +80,6 @@ impl SluicePipeline {
 
     /// Transforms an asynchronous input stream of [`LogEvent`]s into an output stream of summary,
     /// late, and quarantine [`LogEvent`]s.
-    #[must_use]
     pub fn transform_stream<S>(
         self: Box<Self>,
         input_rx: S,
@@ -100,7 +99,6 @@ impl SluicePipeline {
     }
 
     /// Convenience wrapper around [`SluicePipeline::transform_stream`] taking `self` by value.
-    #[must_use]
     pub fn transform<S>(self, input_rx: S) -> Pin<Box<dyn Stream<Item = LogEvent> + Send>>
     where
         S: Stream<Item = LogEvent> + Send + 'static,

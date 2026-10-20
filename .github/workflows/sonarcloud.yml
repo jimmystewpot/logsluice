@@ -5,6 +5,11 @@ on:
       - main
   pull_request:
     types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   sonarqube:
     name: SonarQube
@@ -13,6 +18,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+      - name: Install C linker and build tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential curl unzip
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

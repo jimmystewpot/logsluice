@@ -78,7 +78,7 @@ fn bench_key_digest(c: &mut Criterion) {
 
     group.bench_function("multi_dimension", |b| {
         b.iter(|| {
-            criterion::black_box(kb.digest(resource_scope_hash, severity, body, &dims));
+            std::hint::black_box(kb.digest(resource_scope_hash, severity, body, &dims));
         });
     });
 

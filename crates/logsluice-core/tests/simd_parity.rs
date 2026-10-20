@@ -116,3 +116,22 @@ proptest! {
         prop_assert_eq!((f.hash_key_128)(&text, seed), (s.hash_key_128)(&text, seed));
     }
 }
+
+#[test]
+fn diff_detects_single_upper_lane_difference() {
+    let auto = SimdKernelTable::detect(SimdMode::Auto);
+    let scalar = SimdKernelTable::detect(SimdMode::Scalar);
+
+    for lane in 0..4 {
+        let mut a = [[0u64; 4]; 2];
+        let b = [[0u64; 4]; 2];
+        a[1][lane] = 1;
+
+        let mut dst_auto = [[0u64; 4]; 2];
+        let mut dst_scalar = [[0u64; 4]; 2];
+        assert!((auto.diff_counter_banks)(&a, &b, &mut dst_auto));
+        assert!((scalar.diff_counter_banks)(&a, &b, &mut dst_scalar));
+        assert_eq!(dst_auto, dst_scalar);
+        assert_eq!(dst_auto[1][lane], 1);
+    }
+}

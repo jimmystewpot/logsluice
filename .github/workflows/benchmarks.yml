@@ -6,6 +6,10 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   benchmark-smoke:
     name: Criterion Hot-Path Smoke (PR)
@@ -13,6 +17,11 @@ jobs:
     runs-on: arc-runner-logsluice
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install C linker and build tools
+        run: |
+          if ! command -v cc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
+          fi
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust dependencies
@@ -28,6 +37,11 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install C linker and build tools
+        run: |
+          if ! command -v cc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
+          fi
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust dependencies

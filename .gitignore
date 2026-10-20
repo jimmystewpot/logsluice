@@ -5,3 +5,5 @@ bridges/**/Cargo.lock
 /lcov.info
 /clippy-report.json
 /bench-output.txt
+.worktrees/
+.superpowers/

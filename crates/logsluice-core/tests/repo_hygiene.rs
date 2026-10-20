@@ -48,11 +48,27 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
     assert!(sonar_props.contains("sonar.organization=jimmystewpot"));
 
     let sonar_wf = fs::read_to_string(root.join(".github/workflows/sonarcloud.yml")).unwrap();
-    assert!(sonar_wf.contains("actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"));
-    assert!(sonar_wf.contains("actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830"));
+    assert!(sonar_wf.contains("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"));
+    assert!(sonar_wf.contains("actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"));
     assert!(
         sonar_wf
             .contains("SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9")
+    );
+
+    let ci_wf = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    assert!(
+        ci_wf.contains("taiki-e/install-action@cargo-deny"),
+        "ci.yml must use host taiki-e/install-action@cargo-deny instead of DinD container action"
+    );
+    assert!(
+        !ci_wf.contains("EmbarkStudios/cargo-deny-action"),
+        "ci.yml must not use DinD EmbarkStudios/cargo-deny-action on arc-runner-logsluice"
+    );
+
+    let release_wf = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+    assert!(
+        release_wf.contains("gcc-aarch64-linux-gnu") && release_wf.contains("build-essential"),
+        "release.yml must install both build-essential and gcc-aarch64-linux-gnu"
     );
 
     let dependabot = fs::read_to_string(root.join(".github/dependabot.yml")).unwrap();
@@ -70,6 +86,16 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
             wf.contains("runs-on: arc-runner-logsluice"),
             "{wf_rel} must specify runs-on: arc-runner-logsluice"
         );
+        assert!(
+            wf.contains("build-essential"),
+            "{wf_rel} must install build-essential so linker `cc` is available on arc-runner-logsluice"
+        );
+        if wf_rel != ".github/workflows/release.yml" {
+            assert!(
+                wf.contains("concurrency:") && wf.contains("cancel-in-progress:"),
+                "{wf_rel} must configure concurrency with cancel-in-progress to prevent ARC queue starvation"
+            );
+        }
         for line in wf.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("runs-on:") {

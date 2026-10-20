@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Replaced point `get()` lookups on `_tail` during offline drain and keyed ticket replay with sequential merge-join scans (`ShardStore::rows_for_sorted`), eliminating random I/O bottlenecks when draining large PVC backlogs. Keyed scan reads now route through `ShardStore::counted_get` to enforce zero point lookups via the `scan_point_gets` metric and `drain: scan_point_gets=` CLI diagnostic output.
+
 ## [0.1.0] - 2026-10-20
 
 ### Added

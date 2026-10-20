@@ -40,7 +40,7 @@ This document defines the architecture boundaries, coding standards, core state-
 2. **Emission Ticket Before Output (`TicketLedger`):**
    - Slices are persisted as tickets in `_tickets` **before** leaving the pipeline. `emitted_counters` and `slice_seq` advance only after downstream `AckStatus::Delivered` is received.
 3. **Sequential Merge-Join Close Scan (`ShardStore::rows`):**
-   - Window close/drain scans iterate `w{epoch}_hdr` and `w{epoch}_tail` in lockstep using forward range iterators — never per-key point `get()` lookups on `_tail`.
+   - Window close/drain scans — and keyed ticket replay — read `w{epoch}_hdr`/`w{epoch}_tail` via forward range iterators (`ShardStore::rows`, `ShardStore::rows_for_sorted`). Keyed reads in scan APIs must go through `ShardStore::counted_get` so `scan_point_gets` stays 0; never per-key `Keyspace::get` on `_tail`.
 4. **Conditional Eviction Deletion (`EmitReason::Evict`):**
    - In `ShardStore::apply_ack`, an evicted key is deleted from `_hdr` and `_tail` **if and only if** `stored.total_counters == stored.emitted_counters`, and `ShardWorker` only removes the key from `KnownKeySet` if it is not concurrently buffered in `l1_active`.
 5. **SIMD / Scalar Bit-Parity:**

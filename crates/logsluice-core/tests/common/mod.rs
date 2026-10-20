@@ -305,7 +305,7 @@ impl Harness {
     }
 
     /// Synchronously pumps storage commands to the StoreThread and dispatches resulting events.
-    fn pump(&mut self, mut out: WorkerOutput<u32>) {
+    pub fn pump(&mut self, mut out: WorkerOutput<u32>) {
         loop {
             for batch in out.emit {
                 self.emitted.extend(batch.records.clone());
@@ -441,6 +441,20 @@ impl Harness {
         self.store_handle.fail_next_flush();
     }
 
+    /// Injects a simulated failure on the next `PersistTickets` command processed by the store thread.
+    pub fn fail_next_persist(&mut self) {
+        self.store_handle
+            .send(StoreCommand::FailNextPersist)
+            .expect("failed to send FailNextPersist command");
+    }
+
+    /// Injects a simulated failure on the next `Rows` command processed by the store thread.
+    pub fn fail_next_rows(&mut self) {
+        self.store_handle
+            .send(StoreCommand::FailNextRows)
+            .expect("failed to send FailNextRows command");
+    }
+
     /// Advances time by `timeout_ms` and executes a clean shutdown drain.
     pub fn drain(&mut self, timeout_ms: i64) {
         self.now_ms += timeout_ms;
@@ -448,9 +462,8 @@ impl Harness {
         self.pump(out);
     }
 
-    /// Restarts the harness: shuts down worker and store thread, closes DB,
-    /// reopens DB, loads RecoveredState, creates new worker, and runs recovery output.
-    pub fn restart(mut self) -> Self {
+    /// Restarts the harness without calling `recovery_output()`.
+    pub fn restart_unpumped(mut self) -> Self {
         if let Some(barrier) = self.store_barrier.take() {
             barrier.wait();
         }
@@ -494,10 +507,9 @@ impl Harness {
         let (store_handle, rx_event, join_handle) =
             StoreThread::spawn(store, kernels).expect("failed to spawn store thread");
 
-        let mut worker = ShardWorker::new(ctx, recovered, self.horizon.clone());
-        let recovery_out = worker.recovery_output();
+        let worker = ShardWorker::new(ctx, recovered, self.horizon.clone());
 
-        let mut new_h = Self {
+        Self {
             _dir: Some(dir),
             worker,
             store_handle,
@@ -514,8 +526,14 @@ impl Harness {
             released: Vec::new(),
             store_barrier: None,
             _cfg: self._cfg.clone(),
-        };
+        }
+    }
 
+    /// Restarts the harness: shuts down worker and store thread, closes DB,
+    /// reopens DB, loads RecoveredState, creates new worker, and runs recovery output.
+    pub fn restart(self) -> Self {
+        let mut new_h = self.restart_unpumped();
+        let recovery_out = new_h.worker.recovery_output();
         new_h.pump(recovery_out);
         new_h
     }

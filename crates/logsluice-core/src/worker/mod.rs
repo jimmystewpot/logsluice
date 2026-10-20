@@ -397,9 +397,7 @@ impl<F> ShardWorker<F> {
         }
     }
 
-    /// Re-issues row read requests for all restored unacknowledged tickets.
-    pub fn recovery_output(&mut self) -> WorkerOutput<F> {
-        let mut output = WorkerOutput::default();
+    fn drain_restored_tickets(&mut self, output: &mut WorkerOutput<F>) {
         let tickets = std::mem::take(&mut self.restored_tickets);
         for ticket in tickets {
             let keys: Vec<StorageKey24> = ticket
@@ -425,6 +423,12 @@ impl<F> ShardWorker<F> {
                 limit: self.ctx.cfg.output.max_records_per_ticket,
             });
         }
+    }
+
+    /// Re-issues row read requests for all restored unacknowledged tickets.
+    pub fn recovery_output(&mut self) -> WorkerOutput<F> {
+        let mut output = WorkerOutput::default();
+        self.drain_restored_tickets(&mut output);
         output
     }
 
@@ -660,6 +664,9 @@ impl<F> ShardWorker<F> {
 
         self.check_disk_threshold();
         self.drain_paced_queue(now_ms, &mut output);
+        if !self.restored_tickets.is_empty() {
+            self.drain_restored_tickets(&mut output);
+        }
 
         // 0a. Check unacknowledged tickets for max_closing_duration spill
         let max_closing_duration_ms = self.ctx.cfg.window.max_closing_duration.as_millis() as i64;
@@ -885,7 +892,7 @@ impl<F> ShardWorker<F> {
                     output.commands.push(StoreCommand::Rows {
                         epoch_ms: window.epoch_ms,
                         reason: EmitReason::Close,
-                        after: None,
+                        after: closing.scan_cursor,
                         keys: None,
                         limit: self.ctx.cfg.output.max_records_per_ticket,
                     });
@@ -985,7 +992,7 @@ impl<F> ShardWorker<F> {
                                 output.commands.push(StoreCommand::Rows {
                                     epoch_ms: window.epoch_ms,
                                     reason: EmitReason::Close,
-                                    after: None,
+                                    after: closing.scan_cursor,
                                     keys: None,
                                     limit: self.ctx.cfg.output.max_records_per_ticket,
                                 });
@@ -1172,8 +1179,9 @@ impl<F> ShardWorker<F> {
                         &self.ctx.kernels,
                         self.ctx.cfg.output.max_records_per_ticket,
                     );
+                    let has_tickets = !tickets.is_empty();
 
-                    if !tickets.is_empty() {
+                    if has_tickets {
                         for ticket in &tickets {
                             self.pending_rows.insert(ticket.id, rows.clone());
                         }
@@ -1192,10 +1200,13 @@ impl<F> ShardWorker<F> {
                                 limit: self.ctx.cfg.output.max_records_per_ticket,
                             });
                         }
-                    } else if let Some(window) = self.windows.get_mut(&epoch_ms)
+                    } else if reason == EmitReason::Close
+                        && let Some(window) = self.windows.get_mut(&epoch_ms)
                         && let WindowPhase::Closing(ref mut closing) = window.phase
                     {
-                        if let Some(next) = next_after {
+                        if has_tickets {
+                            closing.pending_next_cursor = next_after;
+                        } else if let Some(next) = next_after {
                             closing.scan_cursor = Some(next);
                             self.store_queries_inflight += 1;
                             output.commands.push(StoreCommand::Rows {
@@ -1217,34 +1228,64 @@ impl<F> ShardWorker<F> {
             StoreEvent::TicketsPersisted(ticket_ids) => {
                 self.persist_tickets_inflight = self.persist_tickets_inflight.saturating_sub(1);
 
+                let mut close_epochs = Vec::new();
                 for ticket_id in ticket_ids {
-                    if let Some(ticket) = self.ledger.get(ticket_id).cloned()
-                        && let Some(rows) = self.pending_rows.get(&ticket_id)
-                        && let Ok(records) = records_for(
-                            &ticket,
-                            rows,
-                            &self.resources,
-                            &self.ctx.emitter_id,
-                            &self.ctx.clock,
-                            self.ctx.cfg.emit_mode,
-                        )
-                    {
-                        self.pending_rows.remove(&ticket_id);
-                        self.unacked_tickets.insert(
-                            ticket_id,
-                            UnackedTicket {
+                    if let Some(ticket) = self.ledger.get(ticket_id).cloned() {
+                        if ticket.reason == EmitReason::Close
+                            && !close_epochs.contains(&ticket.window_epoch_ms)
+                        {
+                            close_epochs.push(ticket.window_epoch_ms);
+                        }
+                        if let Some(rows) = self.pending_rows.get(&ticket_id)
+                            && let Ok(records) = records_for(
+                                &ticket,
+                                rows,
+                                &self.resources,
+                                &self.ctx.emitter_id,
+                                &self.ctx.clock,
+                                self.ctx.cfg.emit_mode,
+                            )
+                        {
+                            self.pending_rows.remove(&ticket_id);
+                            self.unacked_tickets.insert(
                                 ticket_id,
-                                first_emitted_ms: now_ms,
-                                records: records.clone(),
-                                backoff_ms: 5_000,
-                                next_retry_ms: None,
-                            },
-                        );
-                        self.enqueue_or_emit_paced(
-                            EmitBatch { ticket_id, records },
-                            now_ms,
-                            &mut output,
-                        );
+                                UnackedTicket {
+                                    ticket_id,
+                                    first_emitted_ms: now_ms,
+                                    records: records.clone(),
+                                    backoff_ms: 5_000,
+                                    next_retry_ms: None,
+                                },
+                            );
+                            self.enqueue_or_emit_paced(
+                                EmitBatch { ticket_id, records },
+                                now_ms,
+                                &mut output,
+                            );
+                        }
+                    }
+                }
+
+                for epoch_ms in close_epochs {
+                    if let Some(window) = self.windows.get_mut(&epoch_ms)
+                        && let WindowPhase::Closing(ref mut closing) = window.phase
+                    {
+                        if let Some(next) = closing.pending_next_cursor.take() {
+                            closing.scan_cursor = Some(next);
+                            self.store_queries_inflight += 1;
+                            output.commands.push(StoreCommand::Rows {
+                                epoch_ms,
+                                reason: EmitReason::Close,
+                                after: Some(next),
+                                keys: None,
+                                limit: self.ctx.cfg.output.max_records_per_ticket,
+                            });
+                        } else if !closing.scan_complete {
+                            closing.scan_complete = true;
+                            if !self.ledger.has_inflight_for_window(epoch_ms) {
+                                window.transition_to_closed(now_ms);
+                            }
+                        }
                     }
                 }
             }
@@ -1304,6 +1345,128 @@ impl<F> ShardWorker<F> {
                     }
                 }
                 output.failed_release.extend(finalizers);
+            }
+            StoreEvent::PersistTicketsFailed {
+                ticket_ids,
+                error: _,
+            } => {
+                self.persist_tickets_inflight = self.persist_tickets_inflight.saturating_sub(1);
+                for ticket_id in ticket_ids {
+                    self.pending_rows.remove(&ticket_id);
+                    if let Some(ticket) = self.ledger.resolve(ticket_id) {
+                        match ticket.reason {
+                            EmitReason::Close => {
+                                if let Some(window) = self.windows.get_mut(&ticket.window_epoch_ms)
+                                    && let WindowPhase::Closing(ref mut closing) = window.phase
+                                {
+                                    closing.pending_next_cursor = None;
+                                    closing.scan_started = false;
+                                    closing.scan_complete = false;
+                                }
+                            }
+                            EmitReason::Periodic => {
+                                if let Some(window) = self.windows.get_mut(&ticket.window_epoch_ms)
+                                {
+                                    for entry in &ticket.entries {
+                                        window.dirty_keys.insert(StorageKey24 {
+                                            epoch_ms: ticket.window_epoch_ms,
+                                            digest: entry.digest,
+                                        });
+                                    }
+                                    window.last_periodic_emit_ms = 0;
+                                }
+                            }
+                            EmitReason::LateRevision => {
+                                if let Some(window) = self.windows.get_mut(&ticket.window_epoch_ms)
+                                {
+                                    for entry in &ticket.entries {
+                                        window.late_dirty_keys.insert(StorageKey24 {
+                                            epoch_ms: ticket.window_epoch_ms,
+                                            digest: entry.digest,
+                                        });
+                                    }
+                                    window.last_late_emit_ms = 0;
+                                }
+                            }
+                            EmitReason::Evict => {
+                                if let Some(window) = self.windows.get_mut(&ticket.window_epoch_ms)
+                                {
+                                    window.evict_in_progress = false;
+                                    window.last_evict_ms = 0;
+                                }
+                            }
+                            EmitReason::Drain => {
+                                let keys: Vec<StorageKey24> = ticket
+                                    .entries
+                                    .iter()
+                                    .map(|e| StorageKey24 {
+                                        epoch_ms: ticket.window_epoch_ms,
+                                        digest: e.digest,
+                                    })
+                                    .collect();
+                                if !keys.is_empty() {
+                                    self.store_queries_inflight += 1;
+                                    output.commands.push(StoreCommand::Rows {
+                                        epoch_ms: ticket.window_epoch_ms,
+                                        reason: EmitReason::Drain,
+                                        after: None,
+                                        keys: Some(keys),
+                                        limit: self.ctx.cfg.output.max_records_per_ticket,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            StoreEvent::RowsFailed {
+                epoch_ms,
+                reason,
+                after,
+                keys,
+                error: _,
+            } => {
+                self.store_queries_inflight = self.store_queries_inflight.saturating_sub(1);
+                if let Some(ticket_id) = self.recovery_ticket_queue.pop_front() {
+                    if let Some(ticket) = self.ledger.get(ticket_id).cloned() {
+                        self.restored_tickets.push(ticket);
+                    }
+                } else if reason == EmitReason::Drain {
+                    self.store_queries_inflight += 1;
+                    output.commands.push(StoreCommand::Rows {
+                        epoch_ms,
+                        reason: EmitReason::Drain,
+                        after,
+                        keys,
+                        limit: self.ctx.cfg.output.max_records_per_ticket,
+                    });
+                } else if let Some(window) = self.windows.get_mut(&epoch_ms) {
+                    match reason {
+                        EmitReason::Close => {
+                            if let WindowPhase::Closing(ref mut closing) = window.phase {
+                                closing.scan_started = false;
+                            }
+                        }
+                        EmitReason::Evict => {
+                            window.evict_in_progress = false;
+                            window.evict_collected_rows.clear();
+                            window.last_evict_ms = 0;
+                        }
+                        EmitReason::Periodic => {
+                            if let Some(k) = keys {
+                                window.dirty_keys.extend(k);
+                                window.last_periodic_emit_ms = 0;
+                            }
+                        }
+                        EmitReason::LateRevision => {
+                            if let Some(k) = keys {
+                                window.late_dirty_keys.extend(k);
+                                window.last_late_emit_ms = 0;
+                            }
+                        }
+                        EmitReason::Drain => {}
+                    }
+                }
             }
             StoreEvent::Failed(_) => {
                 self.store_queries_inflight = 0;

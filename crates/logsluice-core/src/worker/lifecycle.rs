@@ -39,6 +39,8 @@ pub struct ClosingState {
     pub flush_done: bool,
     /// Storage scan resumption cursor. `None` if scan has not started or completed.
     pub scan_cursor: Option<StorageKey24>,
+    /// Next page cursor awaiting ticket persistence before continuation scan is dispatched.
+    pub pending_next_cursor: Option<StorageKey24>,
     /// Whether initial row scan request has been dispatched.
     pub scan_started: bool,
     /// Whether all rows pages have been completely scanned.
@@ -142,6 +144,7 @@ impl WindowState {
                 forced,
                 flush_done: false,
                 scan_cursor: None,
+                pending_next_cursor: None,
                 scan_started: false,
                 scan_complete: false,
             });

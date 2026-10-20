@@ -235,3 +235,250 @@ fn flush_failure_allows_retry_and_preserves_resources_and_unwedges_pending_flags
         Some(b"hello".as_slice())
     );
 }
+
+#[test]
+fn persist_failure_releases_ledger_and_allows_window_close() {
+    let mut h = Harness::new(|c| {
+        c.window.emit.close_jitter_max = std::time::Duration::ZERO;
+    });
+    h.ingest(&[(1, 1_000), (2, 2_000)]);
+
+    // Arm failure for the PersistTickets command triggered by the close scan.
+    h.fail_next_persist();
+    h.advance(DAY + 31_000, Some(DAY));
+
+    // Persist failed: nothing emitted, and ledger in-flight entries must be rolled back to 0.
+    assert!(h.drain_emitted().is_empty());
+    assert_eq!(h.stats().tickets_inflight, 0);
+    assert!(!h.worker().has_inflight_tickets());
+
+    // Subsequent poll retries the close scan, persists tickets without advancing emitted counters prematurely,
+    // and allows the window to close and purge.
+    h.advance(DAY + 32_000, Some(DAY));
+    let out = h.drain_emitted();
+    assert_eq!(out.len(), 2);
+    assert_eq!(h.count_for(&out, 1), 1);
+    assert_eq!(h.count_for(&out, 2), 1);
+
+    h.ack_all();
+    h.advance(DAY + 3_700_000, Some(DAY + 3_600_001));
+    assert!(h.live_windows().is_empty());
+    assert_eq!(h.horizon(), DAY);
+}
+
+#[test]
+fn rows_failure_retries_close_scan() {
+    let mut h = Harness::new(|c| {
+        c.window.emit.close_jitter_max = std::time::Duration::ZERO;
+    });
+    h.ingest(&[(1, 1_000), (2, 2_000)]);
+
+    // Arm failure for the Rows command triggered by the close scan.
+    h.fail_next_rows();
+    h.advance(DAY + 31_000, Some(DAY));
+    assert!(h.drain_emitted().is_empty());
+
+    // Because scan_started was reset on RowsFailed, the next poll retries the close scan and succeeds.
+    h.advance(DAY + 32_000, Some(DAY));
+    let out = h.drain_emitted();
+    assert_eq!(out.len(), 2);
+    assert!(out.iter().all(|r| r.emit_reason == EmitReason::Close));
+
+    h.ack_all();
+    h.advance(DAY + 3_700_000, Some(DAY + 3_600_001));
+    assert!(h.live_windows().is_empty());
+}
+
+#[test]
+fn rows_failure_clears_evict_in_progress() {
+    let mut h = Harness::new(|c| {
+        c.cardinality.max_keys_per_window = 10;
+        c.cardinality.max_resource_share = 1.0;
+        c.cardinality.on_cap = logsluice_core::config::OnCap::EvictCold;
+        c.cardinality.evict_high_water = 0.8;
+        c.cardinality.evict_interval = std::time::Duration::from_secs(10);
+        c.window.emit.close_jitter_max = std::time::Duration::ZERO;
+    });
+
+    // Ingest 8 keys to reach high water (8 / 10 >= 0.8).
+    let batch: Vec<(u128, i64)> = (0..8).map(|i| ((i + 1) as u128, 1_000 + i * 10)).collect();
+    h.ingest(&batch);
+
+    // Arm failure for the Evict Rows scan at t = 12_000ms.
+    h.fail_next_rows();
+    h.advance(12_000, None);
+    assert!(h.drain_emitted().is_empty());
+
+    // Because evict_in_progress was cleared on RowsFailed, the next eviction interval at t = 23_000ms succeeds.
+    h.advance(23_000, None);
+    let evict_records = h.drain_emitted();
+    assert_eq!(evict_records.len(), 1);
+    assert_eq!(evict_records[0].emit_reason, EmitReason::Evict);
+    h.ack_all();
+    assert_eq!(h.stats().keys_evicted_total, 1);
+}
+
+#[test]
+fn persist_failure_restores_periodic_and_late_dirty_keys() {
+    use logsluice_core::config::EmitStrategy;
+    use std::time::Duration;
+
+    let mut h = Harness::new(|c| {
+        c.window.emit.strategy = EmitStrategy::Periodic;
+        c.window.emit.interval = Some(Duration::from_secs(10));
+        c.window.late_emit_interval = Duration::from_secs(10);
+        c.window.emit.close_jitter_max = Duration::ZERO;
+    });
+
+    h.ingest(&[(1, 1_000)]);
+    let flush_out = h.worker().flush_l1(1_000);
+    h.pump(flush_out);
+
+    // Trigger periodic Rows and fail PersistTickets.
+    h.fail_next_persist();
+    h.advance(10_000, None);
+    assert!(h.drain_emitted().is_empty());
+
+    // Next poll must re-read the restored dirty_keys and emit the periodic slice without new ingest.
+    h.advance(11_000, None);
+    let periodic_out = h.drain_emitted();
+    assert_eq!(periodic_out.len(), 1);
+    assert_eq!(periodic_out[0].emit_reason, EmitReason::Periodic);
+    assert_eq!(h.count_for(&periodic_out, 1), 1);
+    h.ack_all();
+
+    // Close the window so subsequent events trigger LateRevision.
+    h.advance(DAY + 31_000, Some(DAY));
+    let _ = h.drain_emitted();
+    h.ack_all();
+
+    // Ingest a late event for window 0, flush, and fail PersistTickets on the LateRevision emission.
+    h.ingest(&[(1, 2_000)]);
+    let late_flush_out = h.worker().flush_l1(DAY + 31_000);
+    h.pump(late_flush_out);
+
+    h.fail_next_persist();
+    h.advance(DAY + 42_000, Some(DAY));
+    assert!(h.drain_emitted().is_empty());
+
+    // Next poll must re-read restored late_dirty_keys and emit the LateRevision slice without new ingest.
+    h.advance(DAY + 43_000, Some(DAY));
+    let late_out = h.drain_emitted();
+    assert_eq!(late_out.len(), 1);
+    assert_eq!(late_out[0].emit_reason, EmitReason::LateRevision);
+    assert_eq!(h.count_for(&late_out, 1), 1);
+    h.ack_all();
+}
+
+#[test]
+fn paginated_close_scan_persist_failure_resumes_failed_page() {
+    use std::time::Duration;
+
+    let mut h = Harness::new(|c| {
+        c.output.max_records_per_ticket = 2;
+        c.window.emit.close_jitter_max = Duration::ZERO;
+    });
+
+    h.ingest(&[(1, 1_000), (2, 2_000), (3, 3_000), (4, 4_000)]);
+
+    // Fail PersistTickets on page 1 of the close scan.
+    h.fail_next_persist();
+    h.advance(DAY + 31_000, Some(DAY));
+    assert!(h.drain_emitted().is_empty());
+
+    // Next poll retries from page 1 and emits all 4 keys across both pages before closing.
+    h.advance(DAY + 32_000, Some(DAY));
+    let out = h.drain_emitted();
+    assert_eq!(out.len(), 4);
+    assert_eq!(h.count_for(&out, 1), 1);
+    assert_eq!(h.count_for(&out, 2), 1);
+    assert_eq!(h.count_for(&out, 3), 1);
+    assert_eq!(h.count_for(&out, 4), 1);
+
+    h.ack_all();
+    h.advance(DAY + 3_700_000, Some(DAY + 3_600_001));
+    assert!(h.live_windows().is_empty());
+}
+
+#[test]
+fn rows_failure_restores_periodic_and_late_dirty_keys() {
+    use logsluice_core::config::EmitStrategy;
+    use std::time::Duration;
+
+    let mut h = Harness::new(|c| {
+        c.window.emit.strategy = EmitStrategy::Periodic;
+        c.window.emit.interval = Some(Duration::from_secs(10));
+        c.window.late_emit_interval = Duration::from_secs(10);
+        c.window.emit.close_jitter_max = Duration::ZERO;
+    });
+
+    h.ingest(&[(1, 1_000)]);
+    let flush_out = h.worker().flush_l1(1_000);
+    h.pump(flush_out);
+
+    // Fail Rows on Periodic read.
+    h.fail_next_rows();
+    h.advance(10_000, None);
+    assert!(h.drain_emitted().is_empty());
+
+    // Next poll re-issues Periodic Rows with restored dirty_keys and emits.
+    h.advance(11_000, None);
+    let periodic_out = h.drain_emitted();
+    assert_eq!(periodic_out.len(), 1);
+    assert_eq!(periodic_out[0].emit_reason, EmitReason::Periodic);
+    assert_eq!(h.count_for(&periodic_out, 1), 1);
+    h.ack_all();
+
+    // Close the window so subsequent events trigger LateRevision.
+    h.advance(DAY + 31_000, Some(DAY));
+    let _ = h.drain_emitted();
+    h.ack_all();
+
+    // Ingest a late event for window 0, flush, and fail Rows on the LateRevision read.
+    h.ingest(&[(1, 2_000)]);
+    let late_flush_out = h.worker().flush_l1(DAY + 31_000);
+    h.pump(late_flush_out);
+
+    h.fail_next_rows();
+    h.advance(DAY + 42_000, Some(DAY));
+    assert!(h.drain_emitted().is_empty());
+
+    // Next poll re-issues LateRevision Rows with restored late_dirty_keys and emits.
+    h.advance(DAY + 43_000, Some(DAY));
+    let late_out = h.drain_emitted();
+    assert_eq!(late_out.len(), 1);
+    assert_eq!(late_out[0].emit_reason, EmitReason::LateRevision);
+    assert_eq!(h.count_for(&late_out, 1), 1);
+    h.ack_all();
+}
+
+#[test]
+fn recovery_rows_failure_retries_on_next_poll() {
+    use std::time::Duration;
+
+    let mut h = Harness::new(|c| {
+        c.window.emit.close_jitter_max = Duration::ZERO;
+    });
+
+    h.ingest(&[(1, 1_000)]);
+    h.advance(DAY + 31_000, Some(DAY));
+    let initial = h.drain_emitted();
+    assert_eq!(initial.len(), 1);
+
+    // Restart without acking so the ticket is restored from `_tickets`.
+    let mut h = h.restart_unpumped();
+    let recovery_out = h.worker().recovery_output();
+    h.fail_next_rows();
+    h.pump(recovery_out);
+    assert!(h.drain_emitted().is_empty());
+
+    // Calling poll() re-issues the recovery Rows command and emits the recovered slice.
+    h.advance(DAY + 32_000, Some(DAY));
+    let recovered = h.drain_emitted();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].slice_id, initial[0].slice_id);
+
+    h.ack_all();
+    h.advance(DAY + 3_700_000, Some(DAY + 3_600_001));
+    assert!(h.live_windows().is_empty());
+}

@@ -1,5 +1,7 @@
 //! Slice record rendering to native [`LogEvent`] and OpenTelemetry Logs envelopes.
 
+use std::sync::LazyLock;
+
 use chrono::SecondsFormat;
 use logsluice_core::codec::plan::AggregationPlan;
 use logsluice_core::codec::ticket::EmitReason;
@@ -8,6 +10,26 @@ use logsluice_core::emission::SliceRecord;
 
 use crate::config::{BodyPolicy, NormalizerConfig, SluiceConfig};
 use crate::event::{FieldPath, LogEvent, ObjectMap, Value, value_to_string_lossy};
+
+struct RenderPaths {
+    window_emit_reason: FieldPath,
+    window_slice_seq: FieldPath,
+    window_key_digest: FieldPath,
+    window_slice_id: FieldPath,
+    window_emitter_id: FieldPath,
+    window_start: FieldPath,
+    window_end: FieldPath,
+}
+
+static RENDER_PATHS: LazyLock<RenderPaths> = LazyLock::new(|| RenderPaths {
+    window_emit_reason: FieldPath::parse_or_literal("window.emit_reason"),
+    window_slice_seq: FieldPath::parse_or_literal("window.slice_seq"),
+    window_key_digest: FieldPath::parse_or_literal("window.key_digest"),
+    window_slice_id: FieldPath::parse_or_literal("window.slice_id"),
+    window_emitter_id: FieldPath::parse_or_literal("window.emitter_id"),
+    window_start: FieldPath::parse_or_literal("window.start"),
+    window_end: FieldPath::parse_or_literal("window.end"),
+});
 
 fn severity_text(sev: u8) -> Option<&'static str> {
     match sev {
@@ -101,38 +123,30 @@ pub fn render_native(rec: &SliceRecord, cfg: &SluiceConfig, plan: &AggregationPl
     );
 
     // 2. Window metadata fields
+    let paths = &*RENDER_PATHS;
     let _ = event.insert(
-        &FieldPath::parse_or_literal("window.emit_reason"),
+        &paths.window_emit_reason,
         Value::from(emit_reason_str(rec.emit_reason)),
     );
     let _ = event.insert(
-        &FieldPath::parse_or_literal("window.slice_seq"),
+        &paths.window_slice_seq,
         Value::from(i64::from(rec.slice_seq)),
     );
     let _ = event.insert(
-        &FieldPath::parse_or_literal("window.key_digest"),
+        &paths.window_key_digest,
         Value::from(format!("{:032x}", rec.digest)),
     );
+    let _ = event.insert(&paths.window_slice_id, Value::from(rec.slice_id.clone()));
     let _ = event.insert(
-        &FieldPath::parse_or_literal("window.slice_id"),
-        Value::from(rec.slice_id.clone()),
-    );
-    let _ = event.insert(
-        &FieldPath::parse_or_literal("window.emitter_id"),
+        &paths.window_emitter_id,
         Value::from(rec.emitter_id.clone()),
     );
 
     let start_str = format_rfc3339_millis(rec.window_start_ms);
-    let _ = event.insert(
-        &FieldPath::parse_or_literal("window.start"),
-        Value::from(start_str),
-    );
+    let _ = event.insert(&paths.window_start, Value::from(start_str));
 
     let end_str = format_rfc3339_millis(rec.window_end_ms);
-    let _ = event.insert(
-        &FieldPath::parse_or_literal("window.end"),
-        Value::from(end_str),
-    );
+    let _ = event.insert(&paths.window_end, Value::from(end_str));
 
     // 3. Resource and scope fields (only when preserve_resource_and_scope is true)
     if cfg.attributes_policy.preserve_resource_and_scope {

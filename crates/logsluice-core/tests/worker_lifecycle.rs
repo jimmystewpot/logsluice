@@ -100,3 +100,138 @@ fn poll_purges_out_of_order_windows_keep_max_horizon() {
     assert!(h.live_windows().is_empty());
     assert_eq!(h.horizon(), 2 * DAY);
 }
+
+#[test]
+fn non_flush_failure_does_not_clear_flush_in_flight() {
+    let mut h = Harness::new(|c| c.storage.l1_coalesce_max_keys = 2);
+    h.ingest(&[(1, 1), (2, 2)]);
+    let flush_out = h.worker().flush_l1(0);
+    assert_eq!(flush_out.commands.len(), 1);
+
+    // Fill the swapped active buffer while the first flush remains in flight.
+    assert!(!h.ingest(&[(3, 3), (4, 4)]).backpressure);
+    assert!(!h.worker().can_ingest());
+    assert!(h.ingest(&[(5, 5), (6, 6)]).backpressure);
+
+    // A non-flush store failure must not mark the in-flight flush as completed.
+    let err_out = h.worker().on_event(
+        logsluice_core::store::thread::StoreEvent::Failed(
+            logsluice_core::error::AggError::Channel("non-flush failure".into()),
+        ),
+        0,
+    );
+    assert!(err_out.release.is_empty());
+    assert!(err_out.failed_release.is_empty());
+    assert!(!h.worker().can_ingest());
+    assert!(h.ingest(&[(5, 5), (6, 6)]).backpressure);
+
+    // Completing the flush with FlushFailed clears flush_in_flight and returns failed_release.
+    let fail_out = h.worker().on_event(
+        logsluice_core::store::thread::StoreEvent::FlushFailed {
+            error: logsluice_core::error::AggError::Channel("flush failure".into()),
+            batch: logsluice_core::store::shard_store::FlushBatch {
+                entries: Vec::new(),
+                offsets: Vec::new(),
+                new_resources: Vec::new(),
+                resource_refs: Vec::new(),
+            },
+            finalizers: vec![99],
+        },
+        0,
+    );
+    assert!(fail_out.release.is_empty());
+    assert_eq!(fail_out.failed_release, vec![99]);
+    assert!(h.worker().can_ingest());
+    assert!(!h.ingest(&[(5, 5), (6, 6)]).backpressure);
+}
+
+#[test]
+fn flush_failure_allows_retry_and_preserves_resources_and_unwedges_pending_flags() {
+    use bytes::Bytes;
+    use logsluice_core::{
+        config::EmitStrategy,
+        key::StorageKey24,
+        position::SourcePosition,
+        resource::ResourceScopePayload,
+        worker::{ExemplarSource, IngestItem},
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let mut h = Harness::new(|c| {
+        c.window.emit.strategy = EmitStrategy::Periodic;
+        c.window.emit.interval = Some(Duration::from_secs(10));
+        c.window.emit.close_jitter_max = Duration::ZERO;
+        c.storage.l1_flush_interval = Duration::from_secs(60);
+    });
+
+    let auth_resource = Arc::new(ResourceScopePayload {
+        resource: [("service.name".to_string(), serde_json::json!("auth"))].into(),
+        scope_name: "auth-scope".to_string(),
+        scope_version: "1.0.0".to_string(),
+        scope_attrs: Default::default(),
+    });
+    let auth_resource_hash = auth_resource.canonical_hash();
+
+    let make_item = || IngestItem {
+        key: StorageKey24 {
+            epoch_ms: 0,
+            digest: 42,
+        },
+        resource: Arc::clone(&auth_resource),
+        resource_hash: auth_resource_hash,
+        position: Some(SourcePosition {
+            topic: Arc::from("t"),
+            partition: 0,
+            offset: 1,
+        }),
+        event_ms: 1_000,
+        counters: vec![[1, 0, 0, 0]],
+        minmax_values: vec![1_000, 1_000],
+        exemplar: ExemplarSource {
+            severity: 9,
+            body: Some(Bytes::from_static(b"hello")),
+            dims: vec![],
+            attrs: vec![],
+        },
+    };
+
+    let r1 = h.worker().ingest(vec![make_item()], 10, 1_000);
+    assert_eq!(r1.accepted, 1);
+    assert_eq!(r1.replayed, 0);
+
+    // Trigger periodic flush at t=10s, which fails.
+    h.fail_next_flush();
+    h.advance(10_000, None);
+    assert!(h.drain_emitted().is_empty());
+
+    // Re-ingesting the exact same item after FlushFailed must be accepted (not dropped as replay)
+    // and must re-capture the exemplar tail.
+    let r2 = h.worker().ingest(vec![make_item()], 11, 10_000);
+    assert_eq!(r2.accepted, 1);
+    assert_eq!(r2.replayed, 0);
+
+    // Next periodic cadence at t=20s must flush and emit (not wedged by periodic_flush_pending).
+    h.advance(20_000, None);
+    let emitted = h.drain_emitted();
+    assert_eq!(emitted.len(), 1);
+    assert_eq!(emitted[0].emit_reason, EmitReason::Periodic);
+    assert_eq!(
+        emitted[0].resource.resource.get("service.name"),
+        Some(&serde_json::json!("auth"))
+    );
+    assert_eq!(emitted[0].tail.body.as_deref(), Some(b"hello".as_slice()));
+
+    // Restart before acking to verify the resource and offset were durably persisted to ShardStore.
+    let mut h = h.restart();
+    let recovered_emitted = h.drain_emitted();
+    assert_eq!(recovered_emitted.len(), 1);
+    assert_eq!(
+        recovered_emitted[0].resource.resource.get("service.name"),
+        Some(&serde_json::json!("auth"))
+    );
+    assert_eq!(
+        recovered_emitted[0].tail.body.as_deref(),
+        Some(b"hello".as_slice())
+    );
+}

@@ -159,6 +159,8 @@ pub struct WorkerOutput<F> {
     pub emit: Vec<EmitBatch>,
     /// Flushed finalizer tokens ready for release.
     pub release: Vec<F>,
+    /// Finalizer tokens from failed flushes that must be marked as errored.
+    pub failed_release: Vec<F>,
 }
 
 impl<F> Default for WorkerOutput<F> {
@@ -167,6 +169,7 @@ impl<F> Default for WorkerOutput<F> {
             commands: Vec::new(),
             emit: Vec::new(),
             release: Vec::new(),
+            failed_release: Vec::new(),
         }
     }
 }
@@ -936,6 +939,7 @@ impl<F> ShardWorker<F> {
                 disk_bytes,
             } => {
                 self.double_buf.flush_completed();
+                self.offset_tracker.commit_flush();
                 output.release.extend(finalizers);
                 self.set_disk_bytes(disk_bytes);
 
@@ -1262,8 +1266,46 @@ impl<F> ShardWorker<F> {
                     }
                 }
             }
-            StoreEvent::Failed(_) => {
+            StoreEvent::FlushFailed {
+                error: _,
+                batch,
+                finalizers,
+            } => {
                 self.double_buf.flush_completed();
+                self.drain_in_progress = false;
+                self.double_buf
+                    .active_mut()
+                    .restage_resources(batch.new_resources, batch.resource_refs);
+                self.offset_tracker.rollback_flush(&batch.offsets);
+                for entry in &batch.entries {
+                    if entry.is_new
+                        && !self.double_buf.active().contains_key(&entry.key)
+                        && let Some(window) = self.windows.get_mut(&entry.key.epoch_ms)
+                    {
+                        window.dirty_keys.remove(&entry.key);
+                        window.late_dirty_keys.remove(&entry.key);
+                        if entry.key.is_overflow() {
+                            window.overflow_scopes.remove(&entry.resource_scope_id);
+                        } else {
+                            window.guard.forget(
+                                &mut window.known,
+                                entry.key.digest,
+                                entry.resource_scope_id,
+                            );
+                        }
+                    }
+                }
+                for window in self.windows.values_mut() {
+                    window.periodic_flush_pending = false;
+                    window.late_flush_pending = false;
+                    if window.evict_flush_pending {
+                        window.evict_flush_pending = false;
+                        window.evict_in_progress = false;
+                    }
+                }
+                output.failed_release.extend(finalizers);
+            }
+            StoreEvent::Failed(_) => {
                 self.store_queries_inflight = 0;
                 self.persist_tickets_inflight = 0;
             }

@@ -316,3 +316,96 @@ fn store_thread_delete_keys_and_drop_window() {
     h.send(StoreCommand::Shutdown).unwrap();
     j.join().unwrap();
 }
+
+#[test]
+fn flush_failure_returns_finalizers() {
+    let (store, k, _d) = common::store_with_layout();
+    let (h, mut ev, j) = StoreThread::spawn::<u32>(store, k).unwrap();
+    let mut buf = L1Buffer::new(4);
+    buf.accumulate(
+        StorageKey24 {
+            epoch_ms: 0,
+            digest: 1,
+        },
+        true,
+        1,
+        &[[1, 0, 0, 0]],
+        &[5, 5],
+        0,
+        Some(common::tail()),
+        &k,
+    );
+    buf.push_finalizer(77);
+    buf.push_finalizer(88);
+
+    h.fail_next_flush();
+    h.send(StoreCommand::Flush(buf)).unwrap();
+    match common::recv(&mut ev, Duration::from_secs(5)) {
+        StoreEvent::FlushFailed {
+            error: _,
+            batch,
+            finalizers,
+        } => {
+            assert_eq!(finalizers, vec![77, 88]);
+            assert_eq!(batch.entries.len(), 1);
+            assert_eq!(batch.entries[0].key.digest, 1);
+        }
+        other => panic!("expected StoreEvent::FlushFailed, got {other:?}"),
+    }
+
+    h.send(StoreCommand::Shutdown).unwrap();
+    j.join().unwrap();
+}
+
+#[test]
+fn disk_bytes_failure_after_committed_flush_still_reports_flush_done() {
+    let (store, k, _d) = common::store_with_layout();
+    let (h, mut ev, j) = StoreThread::spawn::<u32>(store, k).unwrap();
+    let mut buf = L1Buffer::new(4);
+    buf.accumulate(
+        StorageKey24 {
+            epoch_ms: 0,
+            digest: 1,
+        },
+        true,
+        1,
+        &[[1, 0, 0, 0]],
+        &[5, 5],
+        0,
+        Some(common::tail()),
+        &k,
+    );
+    buf.push_finalizer(77);
+
+    h.fail_next_disk_bytes();
+    h.send(StoreCommand::Flush(buf)).unwrap();
+    match common::recv(&mut ev, Duration::from_secs(5)) {
+        StoreEvent::FlushDone {
+            finalizers, stats, ..
+        } => {
+            assert_eq!(finalizers, vec![77]);
+            assert_eq!(stats.hdr_writes, 1);
+            assert_eq!(stats.tail_writes, 1);
+        }
+        other => panic!("expected StoreEvent::FlushDone, got {other:?}"),
+    }
+
+    h.send(StoreCommand::Rows {
+        epoch_ms: 0,
+        reason: EmitReason::Close,
+        after: None,
+        keys: None,
+        limit: 10,
+    })
+    .unwrap();
+    match common::recv(&mut ev, Duration::from_secs(5)) {
+        StoreEvent::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].key.digest, 1);
+        }
+        other => panic!("expected StoreEvent::Rows, got {other:?}"),
+    }
+
+    h.send(StoreCommand::Shutdown).unwrap();
+    j.join().unwrap();
+}

@@ -114,6 +114,18 @@ impl<F> L1Buffer<F> {
         self.resource_refs.push((id, window));
     }
 
+    /// Restages uncommitted resource definitions and window references from a failed flush back into this buffer.
+    pub fn restage_resources(
+        &mut self,
+        new_resources: Vec<(u32, Arc<ResourceScopePayload>)>,
+        resource_refs: Vec<(u32, u64)>,
+    ) {
+        for (id, payload) in new_resources {
+            self.new_resources.entry(id).or_insert(payload);
+        }
+        self.resource_refs.extend(resource_refs);
+    }
+
     /// Returns the number of distinct aggregation keys currently in the buffer.
     #[must_use]
     pub fn len(&self) -> usize {

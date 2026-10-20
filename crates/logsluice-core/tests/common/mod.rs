@@ -448,11 +448,23 @@ impl Harness {
             .expect("failed to send FailNextPersist command");
     }
 
+    /// Returns the path to the temporary data directory.
+    pub fn data_dir(&self) -> &std::path::Path {
+        self._dir.as_ref().expect("tempdir").path()
+    }
+
     /// Injects a simulated failure on the next `Rows` command processed by the store thread.
     pub fn fail_next_rows(&mut self) {
         self.store_handle
             .send(StoreCommand::FailNextRows)
             .expect("failed to send FailNextRows command");
+    }
+
+    /// Injects a simulated failure on the next `Spill` command processed by the store thread.
+    pub fn fail_next_spill(&mut self) {
+        self.store_handle
+            .send(StoreCommand::FailNextSpill)
+            .expect("failed to send FailNextSpill command");
     }
 
     /// Advances time by `timeout_ms` and executes a clean shutdown drain.

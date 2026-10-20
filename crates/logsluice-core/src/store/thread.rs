@@ -11,6 +11,7 @@ use std::thread::JoinHandle;
 use futures_channel::mpsc::UnboundedReceiver;
 
 use crate::codec::ticket::{EmitReason, Ticket};
+use crate::emission::SliceRecord;
 use crate::error::{AggError, AggResult};
 use crate::key::StorageKey24;
 use crate::l1::L1Buffer;
@@ -56,6 +57,20 @@ pub enum StoreCommand<F> {
         /// Resource IDs to release if no longer referenced.
         release_resources: Vec<u32>,
     },
+    /// Atomically spill unacknowledged slice records for a ticket to disk.
+    Spill {
+        /// Delivery ticket ID being spilled.
+        ticket_id: u64,
+        /// Slice records to persist to the spill file.
+        records: Vec<SliceRecord>,
+    },
+    /// Read all pending spilled ticket files from disk for replay.
+    ReplaySpill,
+    /// Remove a previously spilled ticket file from disk after delivery acknowledgment.
+    RemoveSpill {
+        /// Delivery ticket ID whose spill file should be removed.
+        ticket_id: u64,
+    },
     /// Pauses the storage thread for synchronization testing.
     #[doc(hidden)]
     TestPause(std::sync::Arc<std::sync::Barrier>),
@@ -68,6 +83,9 @@ pub enum StoreCommand<F> {
     /// Injects a simulated row read failure on the next `Rows` command.
     #[doc(hidden)]
     FailNextRows,
+    /// Injects a simulated spill write failure on the next `Spill` command.
+    #[doc(hidden)]
+    FailNextSpill,
     /// Cleanly terminate the storage thread command loop.
     Shutdown,
 }
@@ -146,6 +164,27 @@ pub enum StoreEvent<F> {
     },
     /// Window keyspaces successfully dropped.
     WindowDropped(u64),
+    /// Disk spill operation (write or removal) completed.
+    SpillDone {
+        /// Ticket ID whose spill file was written or removed.
+        ticket_id: u64,
+        /// Updated count of pending `.ndjson` spill files on disk.
+        spill_files: usize,
+    },
+    /// Pending disk spill files loaded for replay.
+    SpillReplay {
+        /// Pending `(ticket_id, records)` pairs sorted by ticket ID.
+        entries: Vec<(u64, Vec<SliceRecord>)>,
+        /// Current count of pending `.ndjson` spill files on disk.
+        spill_files: usize,
+    },
+    /// Disk spill operation failed.
+    SpillFailed {
+        /// Ticket ID associated with the failed spill operation, if applicable.
+        ticket_id: Option<u64>,
+        /// Error encountered during the spill operation.
+        error: AggError,
+    },
     /// Storage operation encountered an error.
     Failed(AggError),
 }
@@ -155,6 +194,7 @@ pub struct StoreHandle<F> {
     tx: SyncSender<StoreCommand<F>>,
     fail_next_flush: Arc<AtomicBool>,
     fail_next_disk_bytes: Arc<AtomicBool>,
+    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<F> Clone for StoreHandle<F> {
@@ -163,6 +203,7 @@ impl<F> Clone for StoreHandle<F> {
             tx: self.tx.clone(),
             fail_next_flush: Arc::clone(&self.fail_next_flush),
             fail_next_disk_bytes: Arc::clone(&self.fail_next_disk_bytes),
+            queued: std::sync::Arc::clone(&self.queued),
         }
     }
 }
@@ -179,9 +220,40 @@ impl<F> StoreHandle<F> {
     /// # Errors
     /// Returns [`AggError::Channel`] if the worker thread receiver has disconnected.
     pub fn send(&self, cmd: StoreCommand<F>) -> AggResult<()> {
-        self.tx
-            .send(cmd)
-            .map_err(|e| AggError::Channel(e.to_string()))
+        self.queued
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.tx.send(cmd).map_err(|e| {
+            self.queued
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            AggError::Channel(e.to_string())
+        })
+    }
+
+    /// Attempts to send a storage command without blocking the calling thread.
+    ///
+    /// # Errors
+    /// Returns `Err(cmd)` with the original command if the bounded queue is full or disconnected.
+    #[allow(clippy::result_large_err)]
+    pub fn try_send(&self, cmd: StoreCommand<F>) -> Result<(), StoreCommand<F>> {
+        self.queued
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        match self.tx.try_send(cmd) {
+            Ok(()) => Ok(()),
+            Err(
+                std::sync::mpsc::TrySendError::Full(cmd)
+                | std::sync::mpsc::TrySendError::Disconnected(cmd),
+            ) => {
+                self.queued
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                Err(cmd)
+            }
+        }
+    }
+
+    /// Returns the number of commands currently buffered in the storage command queue.
+    #[must_use]
+    pub fn queue_depth(&self) -> usize {
+        self.queued.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Arms a one-shot simulated `apply_flush` error on the next `StoreCommand::Flush` processed by this shard.
@@ -231,15 +303,21 @@ impl StoreThread {
         let shared_fail_next_disk_bytes = Arc::new(AtomicBool::new(false));
         let thread_fail_next_flush = Arc::clone(&shared_fail_next_flush);
         let thread_fail_next_disk_bytes = Arc::clone(&shared_fail_next_disk_bytes);
+        let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let thread_queued = std::sync::Arc::clone(&queued);
 
         let join_handle = std::thread::Builder::new()
             .name("shard-store-worker".to_string())
             .spawn(move || {
+                let mut spill_writer =
+                    crate::worker::spill::SpillWriter::new(store.shard_dir().join("spill"));
                 let mut fail_next_flush = false;
                 let mut fail_next_persist = false;
                 let mut fail_next_rows = false;
                 let mut last_disk_bytes = store.disk_bytes().unwrap_or(0);
+                let mut fail_next_spill = false;
                 while let Ok(cmd) = rx_cmd.recv() {
+                    thread_queued.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                     match cmd {
                         StoreCommand::Flush(buf) => {
                             let (batch, finalizers) = buf.into_flush();
@@ -419,6 +497,63 @@ impl StoreThread {
                                 }
                             }
                         }
+                        StoreCommand::Spill { ticket_id, records } => {
+                            if fail_next_spill {
+                                fail_next_spill = false;
+                                let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
+                                    ticket_id: Some(ticket_id),
+                                    error: AggError::Channel("injected Spill failure".into()),
+                                });
+                                continue;
+                            }
+                            match spill_writer.spill(ticket_id, &records) {
+                                Ok(()) => {
+                                    let spill_files = spill_writer.count_files();
+                                    let _ = tx_event.unbounded_send(StoreEvent::SpillDone {
+                                        ticket_id,
+                                        spill_files,
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
+                                        ticket_id: Some(ticket_id),
+                                        error,
+                                    });
+                                }
+                            }
+                        }
+                        StoreCommand::ReplaySpill => match spill_writer.pending() {
+                            Ok(entries) => {
+                                let spill_files = spill_writer.count_files();
+                                let _ = tx_event.unbounded_send(StoreEvent::SpillReplay {
+                                    entries,
+                                    spill_files,
+                                });
+                            }
+                            Err(error) => {
+                                let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
+                                    ticket_id: None,
+                                    error,
+                                });
+                            }
+                        },
+                        StoreCommand::RemoveSpill { ticket_id } => {
+                            match spill_writer.remove(ticket_id) {
+                                Ok(()) => {
+                                    let spill_files = spill_writer.count_files();
+                                    let _ = tx_event.unbounded_send(StoreEvent::SpillDone {
+                                        ticket_id,
+                                        spill_files,
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
+                                        ticket_id: Some(ticket_id),
+                                        error,
+                                    });
+                                }
+                            }
+                        }
                         StoreCommand::TestPause(barrier) => {
                             barrier.wait();
                             barrier.wait();
@@ -431,6 +566,9 @@ impl StoreThread {
                         }
                         StoreCommand::FailNextRows => {
                             fail_next_rows = true;
+                        }
+                        StoreCommand::FailNextSpill => {
+                            fail_next_spill = true;
                         }
                         StoreCommand::Shutdown => {
                             break;
@@ -445,6 +583,7 @@ impl StoreThread {
                 tx: tx_cmd,
                 fail_next_flush: shared_fail_next_flush,
                 fail_next_disk_bytes: shared_fail_next_disk_bytes,
+                queued,
             },
             rx_event,
             join_handle,

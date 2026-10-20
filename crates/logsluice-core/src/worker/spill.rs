@@ -1,4 +1,7 @@
 //! Disk spill writer managing unacknowledged aggregate records during sink outages.
+//!
+//! Owned and executed on [`crate::store::thread::StoreThread`] (and by offline CLI drain)
+//! so [`crate::worker::ShardWorker`] never performs filesystem I/O on the caller thread.
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -146,10 +149,11 @@ impl SpillWriter {
     pub fn remove(&mut self, ticket_id: u64) -> AggResult<()> {
         let filename = format!("{ticket_id:020}.ndjson");
         let target_path = self.spill_dir.join(&filename);
-        if target_path.exists() {
-            fs::remove_file(&target_path).map_err(AggError::Io)?;
+        match fs::remove_file(&target_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(AggError::Io(e)),
         }
-        Ok(())
     }
 
     /// Counts pending `.ndjson` spill files in the spill directory without opening or deserializing them.

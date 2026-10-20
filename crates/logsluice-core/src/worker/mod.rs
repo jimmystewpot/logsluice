@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use bytes::Bytes;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 use crate::cardinality::Admission;
 use crate::codec::plan::AggregationPlan;
@@ -42,6 +42,7 @@ struct UnackedTicket {
     records: Vec<SliceRecord>,
     backoff_ms: i64,
     next_retry_ms: Option<i64>,
+    spill_in_flight: bool,
 }
 
 /// Input item descriptor ingested by a shard worker.
@@ -212,6 +213,8 @@ pub struct WorkerStats {
     pub dropped_events_total: u64,
     /// Number of disk spill files currently stored.
     pub spill_files: usize,
+    /// Number of storage commands currently queued or deferred awaiting dispatch.
+    pub store_cmd_queue_depth: usize,
 }
 
 /// Shard aggregation worker managing in-memory buffering, state machines, and lifecycle transitions.
@@ -227,11 +230,13 @@ pub struct ShardWorker<F> {
     windows: HashMap<u64, WindowState>,
     last_flush_ms: i64,
     stats: WorkerStats,
-    pending_commands: Vec<StoreCommand<F>>,
+    pending_commands: VecDeque<StoreCommand<F>>,
     pending_rows: HashMap<u64, Vec<JoinedRow>>,
     disk_override: Option<u64>,
     disk_full: bool,
-    spill_writer: SpillWriter,
+    cached_spill_files: usize,
+    spilled_tickets: HashSet<u64>,
+    replay_spill_in_flight: bool,
     unacked_tickets: HashMap<u64, UnackedTicket>,
     last_spill_replay_ms: i64,
     drain_in_progress: bool,
@@ -248,16 +253,6 @@ impl<F> ShardWorker<F> {
     pub fn new(ctx: WorkerContext, recovered: RecoveredState, horizon: PurgeHorizon) -> Self {
         let l1_cap = ctx.cfg.storage.l1_coalesce_max_keys;
         let rate_limit = ctx.cfg.output.max_emit_rate_per_sec as u32;
-        let shard_base_dir = if ctx.shard == 0 && !ctx.cfg.storage.data_dir.join("shard_0").exists()
-        {
-            ctx.cfg.storage.data_dir.clone()
-        } else {
-            ctx.cfg
-                .storage
-                .data_dir
-                .join(format!("shard_{}", ctx.shard))
-        };
-        let spill_writer = SpillWriter::new(shard_base_dir);
 
         Self {
             ctx,
@@ -271,11 +266,13 @@ impl<F> ShardWorker<F> {
             windows: recovered.windows,
             last_flush_ms: 0,
             stats: WorkerStats::default(),
-            pending_commands: Vec::new(),
+            pending_commands: VecDeque::new(),
             pending_rows: HashMap::new(),
             disk_override: None,
             disk_full: false,
-            spill_writer,
+            cached_spill_files: recovered.spill_files,
+            spilled_tickets: HashSet::new(),
+            replay_spill_in_flight: false,
             unacked_tickets: HashMap::new(),
             last_spill_replay_ms: 0,
             drain_in_progress: false,
@@ -285,6 +282,22 @@ impl<F> ShardWorker<F> {
             persist_tickets_inflight: 0,
             evict_ack_epochs: HashMap::new(),
         }
+    }
+
+    /// Defers a storage command to be retried on the next worker output pass.
+    pub fn defer_command(&mut self, cmd: StoreCommand<F>) {
+        self.pending_commands.push_back(cmd);
+    }
+
+    /// Requeues multiple unsent storage commands in FIFO order to be retried on the next worker output pass.
+    pub fn requeue_commands(&mut self, cmds: impl IntoIterator<Item = StoreCommand<F>>) {
+        self.pending_commands.extend(cmds);
+    }
+
+    /// Returns the number of storage commands currently deferred in the worker retry queue.
+    #[must_use]
+    pub fn pending_commands_len(&self) -> usize {
+        self.pending_commands.len()
     }
 
     /// Returns the effective database disk usage in bytes, respecting any test override.
@@ -343,10 +356,10 @@ impl<F> ShardWorker<F> {
         }
     }
 
-    /// Returns the number of disk spill files currently stored.
+    /// Returns the cached number of disk spill files currently stored.
     #[must_use]
     pub fn spill_files(&self) -> usize {
-        self.spill_writer.count_files()
+        self.cached_spill_files
     }
 
     /// Returns `true` if there are any in-flight tickets or paced emission batches queued.
@@ -362,9 +375,11 @@ impl<F> ShardWorker<F> {
     pub fn is_drain_idle(&self) -> bool {
         if self.double_buf.flush_in_flight()
             || !self.double_buf.active().is_empty()
+            || !self.pending_commands.is_empty()
             || self.drain_in_progress
             || self.store_queries_inflight > 0
             || self.persist_tickets_inflight > 0
+            || self.replay_spill_in_flight
             || !self.paced_emit_queue.is_empty()
         {
             return false;
@@ -441,6 +456,7 @@ impl<F> ShardWorker<F> {
     /// Re-issues row read requests for all restored unacknowledged tickets.
     pub fn recovery_output(&mut self) -> WorkerOutput<F> {
         let mut output = WorkerOutput::default();
+        output.commands.extend(self.pending_commands.drain(..));
         self.drain_restored_tickets(&mut output);
         output
     }
@@ -448,7 +464,7 @@ impl<F> ShardWorker<F> {
     /// Initiates a clean shutdown drain of all buffered in-memory records and active windows.
     pub fn begin_drain(&mut self, deadline_ms: i64) -> WorkerOutput<F> {
         let mut output = WorkerOutput::default();
-        output.commands.append(&mut self.pending_commands);
+        output.commands.extend(self.pending_commands.drain(..));
         self.drain_deadline_ms = Some(deadline_ms);
 
         if !self.double_buf.active().is_empty() {
@@ -480,6 +496,7 @@ impl<F> ShardWorker<F> {
     /// Explicitly flushes the active L1 buffer to storage if not empty.
     pub fn flush_l1(&mut self, now_ms: i64) -> WorkerOutput<F> {
         let mut output = WorkerOutput::default();
+        output.commands.extend(self.pending_commands.drain(..));
         if !self.double_buf.active().is_empty()
             && let Some(swapped) = self.double_buf.try_swap()
         {
@@ -520,7 +537,8 @@ impl<F> ShardWorker<F> {
         if self.double_buf.active().len() >= self.ctx.cfg.storage.l1_coalesce_max_keys {
             if let Some(swapped) = self.double_buf.try_swap() {
                 self.last_flush_ms = now_ms;
-                self.pending_commands.push(StoreCommand::Flush(swapped));
+                self.pending_commands
+                    .push_back(StoreCommand::Flush(swapped));
             } else {
                 return Err((items, finalizer));
             }
@@ -674,7 +692,7 @@ impl<F> ShardWorker<F> {
     /// Advances the worker clock and triggers periodic flush, closing transitions, and purging.
     pub fn poll(&mut self, watermark: Option<i64>, now_ms: i64) -> WorkerOutput<F> {
         let mut output = WorkerOutput::default();
-        output.commands.append(&mut self.pending_commands);
+        output.commands.extend(self.pending_commands.drain(..));
 
         self.check_disk_threshold();
         self.drain_paced_queue(now_ms, &mut output);
@@ -686,41 +704,28 @@ impl<F> ShardWorker<F> {
         let max_closing_duration_ms = self.ctx.cfg.window.max_closing_duration.as_millis() as i64;
         let mut to_spill = Vec::new();
         for (&ticket_id, unacked) in &self.unacked_tickets {
-            if now_ms.saturating_sub(unacked.first_emitted_ms) >= max_closing_duration_ms {
+            if !unacked.spill_in_flight
+                && now_ms.saturating_sub(unacked.first_emitted_ms) >= max_closing_duration_ms
+            {
                 to_spill.push(ticket_id);
             }
         }
+        to_spill.sort_unstable();
 
         for ticket_id in to_spill {
-            let spill_ok = if let Some(unacked) = self.unacked_tickets.get(&ticket_id) {
-                self.spill_writer.spill(ticket_id, &unacked.records).is_ok()
-            } else {
-                false
-            };
-            if spill_ok {
-                self.unacked_tickets.remove(&ticket_id);
-                self.pending_rows.remove(&ticket_id);
-                self.last_spill_replay_ms = now_ms;
-                if let Some(ticket) = self.ledger.resolve(ticket_id) {
-                    let epoch_ms = ticket.window_epoch_ms;
-                    if ticket.reason == EmitReason::Evict {
-                        self.evict_ack_epochs.insert(ticket.id, epoch_ms);
-                    }
-                    output.commands.push(StoreCommand::Ack(ticket));
-                    if let Some(window) = self.windows.get_mut(&epoch_ms)
-                        && let WindowPhase::Closing(ref closing) = window.phase
-                        && closing.scan_complete
-                        && !self.ledger.has_inflight_for_window(epoch_ms)
-                    {
-                        window.transition_to_closed(now_ms);
-                    }
-                }
+            if let Some(unacked) = self.unacked_tickets.get_mut(&ticket_id) {
+                unacked.spill_in_flight = true;
+                output.commands.push(StoreCommand::Spill {
+                    ticket_id,
+                    records: unacked.records.clone(),
+                });
             }
         }
 
         // 0b. Retry backoff for unacknowledged tickets
         for unacked in self.unacked_tickets.values_mut() {
-            if let Some(retry_ms) = unacked.next_retry_ms
+            if !unacked.spill_in_flight
+                && let Some(retry_ms) = unacked.next_retry_ms
                 && now_ms >= retry_ms
             {
                 unacked.next_retry_ms = None;
@@ -739,10 +744,9 @@ impl<F> ShardWorker<F> {
         };
         if spill_replay_due {
             self.last_spill_replay_ms = now_ms;
-            if let Ok(pending) = self.spill_writer.pending() {
-                for (ticket_id, records) in pending {
-                    output.emit.push(EmitBatch { ticket_id, records });
-                }
+            if self.cached_spill_files > 0 && !self.replay_spill_in_flight {
+                self.replay_spill_in_flight = true;
+                output.commands.push(StoreCommand::ReplaySpill);
             }
         }
 
@@ -955,7 +959,7 @@ impl<F> ShardWorker<F> {
     /// Handles an asynchronous event emitted by the shard storage thread.
     pub fn on_event(&mut self, ev: StoreEvent<F>, now_ms: i64) -> WorkerOutput<F> {
         let mut output = WorkerOutput::default();
-        output.commands.append(&mut self.pending_commands);
+        output.commands.extend(self.pending_commands.drain(..));
 
         match ev {
             StoreEvent::FlushDone {
@@ -1119,6 +1123,7 @@ impl<F> ShardWorker<F> {
                                         records: records.clone(),
                                         backoff_ms: 5_000,
                                         next_retry_ms: None,
+                                        spill_in_flight: false,
                                     },
                                 );
                                 self.enqueue_or_emit_paced(
@@ -1289,6 +1294,7 @@ impl<F> ShardWorker<F> {
                                     records: records.clone(),
                                     backoff_ms: 5_000,
                                     next_retry_ms: None,
+                                    spill_in_flight: false,
                                 },
                             );
                             self.enqueue_or_emit_paced(
@@ -1507,9 +1513,58 @@ impl<F> ShardWorker<F> {
                     }
                 }
             }
+            StoreEvent::SpillDone {
+                ticket_id,
+                spill_files,
+            } => {
+                self.cached_spill_files = spill_files;
+                if self.unacked_tickets.remove(&ticket_id).is_some() {
+                    self.spilled_tickets.insert(ticket_id);
+                    self.pending_rows.remove(&ticket_id);
+                    self.last_spill_replay_ms = now_ms;
+                    if let Some(ticket) = self.ledger.resolve(ticket_id) {
+                        let epoch_ms = ticket.window_epoch_ms;
+                        if ticket.reason == EmitReason::Evict {
+                            self.evict_ack_epochs.insert(ticket.id, epoch_ms);
+                        }
+                        output.commands.push(StoreCommand::Ack(ticket));
+                        if let Some(window) = self.windows.get_mut(&epoch_ms)
+                            && let WindowPhase::Closing(ref closing) = window.phase
+                            && closing.scan_complete
+                            && !self.ledger.has_inflight_for_window(epoch_ms)
+                        {
+                            window.transition_to_closed(now_ms);
+                        }
+                    }
+                }
+            }
+            StoreEvent::SpillReplay {
+                entries,
+                spill_files,
+            } => {
+                self.replay_spill_in_flight = false;
+                self.cached_spill_files = spill_files;
+                for (ticket_id, records) in entries {
+                    self.spilled_tickets.insert(ticket_id);
+                    output.emit.push(EmitBatch { ticket_id, records });
+                }
+            }
+            StoreEvent::SpillFailed {
+                ticket_id,
+                error: _,
+            } => {
+                if let Some(id) = ticket_id {
+                    if let Some(unacked) = self.unacked_tickets.get_mut(&id) {
+                        unacked.spill_in_flight = false;
+                    }
+                } else {
+                    self.replay_spill_in_flight = false;
+                }
+            }
             StoreEvent::Failed(_) => {
                 self.store_queries_inflight = 0;
                 self.persist_tickets_inflight = 0;
+                self.replay_spill_in_flight = false;
             }
             StoreEvent::KeysDeleted { .. } | StoreEvent::WindowDropped(_) => {}
         }
@@ -1520,11 +1575,19 @@ impl<F> ShardWorker<F> {
     /// Handles acknowledgment of an emitted aggregate ticket from downstream delivery.
     pub fn on_ack(&mut self, ticket_id: u64, delivered: bool, now_ms: i64) -> WorkerOutput<F> {
         let mut output = WorkerOutput::default();
-        output.commands.append(&mut self.pending_commands);
+        output.commands.extend(self.pending_commands.drain(..));
 
         if delivered {
-            self.unacked_tickets.remove(&ticket_id);
-            let _ = self.spill_writer.remove(ticket_id);
+            let was_unacked = self.unacked_tickets.remove(&ticket_id);
+            let was_spilled = self.spilled_tickets.remove(&ticket_id)
+                || was_unacked.as_ref().is_some_and(|u| u.spill_in_flight)
+                || (self.cached_spill_files > 0 && self.ledger.get(ticket_id).is_none());
+            if was_spilled {
+                self.cached_spill_files = self.cached_spill_files.saturating_sub(1);
+                output
+                    .commands
+                    .push(StoreCommand::RemoveSpill { ticket_id });
+            }
 
             if let Some(ticket) = self.ledger.resolve(ticket_id) {
                 let epoch_ms = ticket.window_epoch_ms;
@@ -1571,6 +1634,7 @@ impl<F> ShardWorker<F> {
             resources_table_entries,
             dropped_events_total: self.stats.dropped_events_total,
             spill_files: self.spill_files(),
+            store_cmd_queue_depth: self.pending_commands.len(),
         }
     }
 

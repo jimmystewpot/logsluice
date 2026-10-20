@@ -18,7 +18,7 @@ use crate::codec::ticket::Ticket;
 use crate::config::{EmitStrategy, EngineConfig, OnCap, OnDiskFull, OnShutdown};
 use crate::emission::{EmitReason, Pacer, SliceRecord, TicketLedger, records_for};
 use crate::key::StorageKey24;
-use crate::l1::{DoubleBuffer, L1Buffer};
+use crate::l1::DoubleBuffer;
 use crate::position::OffsetTracker;
 pub use crate::position::SourcePosition;
 pub use crate::resource::ResourceScopePayload;
@@ -247,7 +247,6 @@ pub struct ShardWorker<F> {
     store_queries_inflight: usize,
     persist_tickets_inflight: usize,
     evict_ack_epochs: HashMap<u64, u64>,
-    in_flight_flush_keys: HashSet<StorageKey24>,
 }
 
 impl<F> ShardWorker<F> {
@@ -284,21 +283,7 @@ impl<F> ShardWorker<F> {
             store_queries_inflight: 0,
             persist_tickets_inflight: 0,
             evict_ack_epochs: HashMap::new(),
-            in_flight_flush_keys: HashSet::new(),
         }
-    }
-
-    fn try_swap_buf(
-        double_buf: &mut DoubleBuffer<F>,
-        in_flight_flush_keys: &mut HashSet<StorageKey24>,
-    ) -> Option<L1Buffer<F>> {
-        let swapped = double_buf.try_swap()?;
-        in_flight_flush_keys.extend(swapped.keys().copied());
-        Some(swapped)
-    }
-
-    fn try_swap_active(&mut self) -> Option<L1Buffer<F>> {
-        Self::try_swap_buf(&mut self.double_buf, &mut self.in_flight_flush_keys)
     }
 
     /// Defers a storage command to be retried on the next worker output pass.
@@ -485,7 +470,7 @@ impl<F> ShardWorker<F> {
         self.drain_deadline_ms = Some(deadline_ms);
 
         if !self.double_buf.active().is_empty() {
-            if let Some(swapped) = self.try_swap_active() {
+            if let Some(swapped) = self.double_buf.try_swap() {
                 self.drain_in_progress = true;
                 output.commands.push(StoreCommand::Flush(swapped));
             } else {
@@ -515,7 +500,7 @@ impl<F> ShardWorker<F> {
         let mut output = WorkerOutput::default();
         output.commands.extend(self.pending_commands.drain(..));
         if !self.double_buf.active().is_empty()
-            && let Some(swapped) = self.try_swap_active()
+            && let Some(swapped) = self.double_buf.try_swap()
         {
             self.last_flush_ms = now_ms;
             output.commands.push(StoreCommand::Flush(swapped));
@@ -552,7 +537,7 @@ impl<F> ShardWorker<F> {
     ) -> Result<IngestReport, (Vec<IngestItem>, F)> {
         // Check L1 capacity and backpressure before consuming items
         if self.double_buf.active().len() >= self.ctx.cfg.storage.l1_coalesce_max_keys {
-            if let Some(swapped) = self.try_swap_active() {
+            if let Some(swapped) = self.double_buf.try_swap() {
                 self.last_flush_ms = now_ms;
                 self.pending_commands
                     .push_back(StoreCommand::Flush(swapped));
@@ -771,7 +756,7 @@ impl<F> ShardWorker<F> {
         let flush_interval_ms = self.ctx.cfg.storage.l1_flush_interval.as_millis() as i64;
         if now_ms.saturating_sub(self.last_flush_ms) >= flush_interval_ms
             && !self.double_buf.active().is_empty()
-            && let Some(swapped) = self.try_swap_active()
+            && let Some(swapped) = self.double_buf.try_swap()
         {
             self.last_flush_ms = now_ms;
             output.commands.push(StoreCommand::Flush(swapped));
@@ -790,9 +775,7 @@ impl<F> ShardWorker<F> {
                 {
                     window.last_periodic_emit_ms = now_ms;
                     if !self.double_buf.active().is_empty() {
-                        if let Some(swapped) =
-                            Self::try_swap_buf(&mut self.double_buf, &mut self.in_flight_flush_keys)
-                        {
+                        if let Some(swapped) = self.double_buf.try_swap() {
                             self.last_flush_ms = now_ms;
                             output.commands.push(StoreCommand::Flush(swapped));
                             window.periodic_flush_pending = true;
@@ -826,9 +809,7 @@ impl<F> ShardWorker<F> {
             {
                 window.last_late_emit_ms = now_ms;
                 if !self.double_buf.active().is_empty() {
-                    if let Some(swapped) =
-                        Self::try_swap_buf(&mut self.double_buf, &mut self.in_flight_flush_keys)
-                    {
+                    if let Some(swapped) = self.double_buf.try_swap() {
                         self.last_flush_ms = now_ms;
                         output.commands.push(StoreCommand::Flush(swapped));
                         window.late_flush_pending = true;
@@ -868,9 +849,7 @@ impl<F> ShardWorker<F> {
                     window.evict_collected_rows.clear();
 
                     if !self.double_buf.active().is_empty() {
-                        if let Some(swapped) =
-                            Self::try_swap_buf(&mut self.double_buf, &mut self.in_flight_flush_keys)
-                        {
+                        if let Some(swapped) = self.double_buf.try_swap() {
                             self.last_flush_ms = now_ms;
                             output.commands.push(StoreCommand::Flush(swapped));
                             window.evict_flush_pending = true;
@@ -921,9 +900,7 @@ impl<F> ShardWorker<F> {
             {
                 if !closing.flush_done {
                     if !self.double_buf.active().is_empty() {
-                        if let Some(swapped) =
-                            Self::try_swap_buf(&mut self.double_buf, &mut self.in_flight_flush_keys)
-                        {
+                        if let Some(swapped) = self.double_buf.try_swap() {
                             self.last_flush_ms = now_ms;
                             output.commands.push(StoreCommand::Flush(swapped));
                         }
@@ -993,14 +970,13 @@ impl<F> ShardWorker<F> {
                 disk_bytes,
             } => {
                 self.double_buf.flush_completed();
-                self.in_flight_flush_keys.clear();
                 self.offset_tracker.commit_flush();
                 output.release.extend(finalizers);
                 self.set_disk_bytes(disk_bytes);
 
                 if self.drain_in_progress {
                     if !self.double_buf.active().is_empty() {
-                        if let Some(swapped) = self.try_swap_active() {
+                        if let Some(swapped) = self.double_buf.try_swap() {
                             self.last_flush_ms = now_ms;
                             output.commands.push(StoreCommand::Flush(swapped));
                         }
@@ -1029,10 +1005,7 @@ impl<F> ShardWorker<F> {
                         && !closing.flush_done
                     {
                         if !self.double_buf.active().is_empty() {
-                            if let Some(swapped) = Self::try_swap_buf(
-                                &mut self.double_buf,
-                                &mut self.in_flight_flush_keys,
-                            ) {
+                            if let Some(swapped) = self.double_buf.try_swap() {
                                 self.last_flush_ms = now_ms;
                                 output.commands.push(StoreCommand::Flush(swapped));
                             }
@@ -1055,10 +1028,7 @@ impl<F> ShardWorker<F> {
 
                     if window.periodic_flush_pending {
                         if !self.double_buf.active().is_empty() {
-                            if let Some(swapped) = Self::try_swap_buf(
-                                &mut self.double_buf,
-                                &mut self.in_flight_flush_keys,
-                            ) {
+                            if let Some(swapped) = self.double_buf.try_swap() {
                                 self.last_flush_ms = now_ms;
                                 output.commands.push(StoreCommand::Flush(swapped));
                             }
@@ -1082,10 +1052,7 @@ impl<F> ShardWorker<F> {
 
                     if window.late_flush_pending {
                         if !self.double_buf.active().is_empty() {
-                            if let Some(swapped) = Self::try_swap_buf(
-                                &mut self.double_buf,
-                                &mut self.in_flight_flush_keys,
-                            ) {
+                            if let Some(swapped) = self.double_buf.try_swap() {
                                 self.last_flush_ms = now_ms;
                                 output.commands.push(StoreCommand::Flush(swapped));
                             }
@@ -1110,10 +1077,7 @@ impl<F> ShardWorker<F> {
 
                     if window.evict_flush_pending {
                         if !self.double_buf.active().is_empty() {
-                            if let Some(swapped) = Self::try_swap_buf(
-                                &mut self.double_buf,
-                                &mut self.in_flight_flush_keys,
-                            ) {
+                            if let Some(swapped) = self.double_buf.try_swap() {
                                 self.last_flush_ms = now_ms;
                                 output.commands.push(StoreCommand::Flush(swapped));
                             }
@@ -1382,9 +1346,7 @@ impl<F> ShardWorker<F> {
                 {
                     for (digest, scope_id) in evicted_keys {
                         let key = StorageKey24 { epoch_ms, digest };
-                        if !self.double_buf.active().contains_key(&key)
-                            && !self.in_flight_flush_keys.contains(&key)
-                        {
+                        if !self.double_buf.contains_key_active_or_inflight(&key) {
                             window.dirty_keys.remove(&key);
                             window.guard.forget(&mut window.known, digest, scope_id);
                             self.stats.keys_evicted_total += 1;
@@ -1398,7 +1360,6 @@ impl<F> ShardWorker<F> {
                 finalizers,
             } => {
                 self.double_buf.flush_completed();
-                self.in_flight_flush_keys.clear();
                 self.drain_in_progress = false;
                 self.double_buf
                     .active_mut()

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 use crate::codec::tail::ExemplarTail;
 use crate::key::StorageKey24;
@@ -180,6 +180,7 @@ pub struct DoubleBuffer<F> {
     active: L1Buffer<F>,
     capacity: usize,
     flush_in_flight: bool,
+    in_flight_keys: HashSet<StorageKey24>,
 }
 
 impl<F> Default for DoubleBuffer<F> {
@@ -196,6 +197,7 @@ impl<F> DoubleBuffer<F> {
             active: L1Buffer::new(capacity),
             capacity,
             flush_in_flight: false,
+            in_flight_keys: HashSet::new(),
         }
     }
 
@@ -219,17 +221,27 @@ impl<F> DoubleBuffer<F> {
         }
         self.flush_in_flight = true;
         let next = L1Buffer::new(self.capacity);
-        Some(std::mem::replace(&mut self.active, next))
+        let swapped = std::mem::replace(&mut self.active, next);
+        self.in_flight_keys.clear();
+        self.in_flight_keys.extend(swapped.keys().copied());
+        Some(swapped)
     }
 
     /// Signals that the in-flight flush operation has completed, allowing subsequent swaps.
     pub fn flush_completed(&mut self) {
         self.flush_in_flight = false;
+        self.in_flight_keys.clear();
     }
 
     /// Returns `true` if a flush operation is currently in flight.
     #[must_use]
     pub fn flush_in_flight(&self) -> bool {
         self.flush_in_flight
+    }
+
+    /// Returns `true` if either the active buffer or the in-flight flush buffer contains `key`.
+    #[must_use]
+    pub fn contains_key_active_or_inflight(&self, key: &StorageKey24) -> bool {
+        self.active.contains_key(key) || self.in_flight_keys.contains(key)
     }
 }

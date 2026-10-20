@@ -456,3 +456,36 @@ fn try_send_returns_command_when_queue_full() {
     h.send(StoreCommand::Shutdown).unwrap();
     j.join().unwrap();
 }
+
+#[test]
+fn double_buffer_tracks_active_and_inflight_keys_across_swap_and_completion() {
+    let mut db: DoubleBuffer<()> = DoubleBuffer::new(16);
+    let k1 = StorageKey24 {
+        epoch_ms: 1_000,
+        digest: 1,
+    };
+    let k2 = StorageKey24 {
+        epoch_ms: 1_000,
+        digest: 2,
+    };
+    let kernels = SimdKernelTable::scalar();
+
+    assert!(!db.contains_key_active_or_inflight(&k1));
+    db.active_mut()
+        .accumulate(k1, true, 0, &[[1, 0, 0, 0]], &[], 1, None, &kernels);
+    assert!(db.contains_key_active_or_inflight(&k1));
+
+    let swapped = db.try_swap().expect("first swap succeeds");
+    assert_eq!(swapped.len(), 1);
+    assert!(db.active().is_empty());
+    assert!(db.contains_key_active_or_inflight(&k1));
+
+    db.active_mut()
+        .accumulate(k2, true, 0, &[[1, 0, 0, 0]], &[], 1, None, &kernels);
+    assert!(db.contains_key_active_or_inflight(&k1));
+    assert!(db.contains_key_active_or_inflight(&k2));
+
+    db.flush_completed();
+    assert!(!db.contains_key_active_or_inflight(&k1));
+    assert!(db.contains_key_active_or_inflight(&k2));
+}

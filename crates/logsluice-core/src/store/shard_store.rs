@@ -214,10 +214,22 @@ impl ShardStore {
     /// # Errors
     /// Returns [`AggError::Storage`] or [`AggError::Codec`] if batch encoding or commit fails.
     pub fn apply_flush(&mut self, batch: FlushBatch, k: &SimdKernelTable) -> AggResult<FlushStats> {
+        self.apply_flush_ref(&batch, k)
+    }
+
+    /// Atomically commits a referenced batch of flush entries, consumer offsets, and resource records.
+    ///
+    /// # Errors
+    /// Returns [`AggError::Storage`] or [`AggError::Codec`] if batch encoding or commit fails.
+    pub fn apply_flush_ref(
+        &mut self,
+        batch: &FlushBatch,
+        k: &SimdKernelTable,
+    ) -> AggResult<FlushStats> {
         let mut write_batch = self.db.batch();
         let mut stats = FlushStats::default();
 
-        for entry in batch.entries {
+        for entry in &batch.entries {
             let hdr_ks = self.get_or_create_hdr_keyspace(entry.key.epoch_ms)?;
             let key_bytes = entry.key.to_bytes();
 
@@ -279,8 +291,8 @@ impl ShardStore {
             }
         }
 
-        for ((topic, partition), offset) in batch.offsets {
-            let key = encode_offset_key(&topic, partition);
+        for ((topic, partition), offset) in &batch.offsets {
+            let key = encode_offset_key(topic, *partition);
             let val = offset.to_le_bytes();
             write_batch.insert(&self.offsets_ks, key, val);
         }
@@ -288,11 +300,11 @@ impl ShardStore {
         let mut pending_resources: HashMap<u32, (ResourceScopePayload, BTreeSet<u64>)> =
             HashMap::new();
 
-        for (id, payload) in batch.new_resources {
-            pending_resources.insert(id, ((*payload).clone(), BTreeSet::new()));
+        for (id, payload) in &batch.new_resources {
+            pending_resources.insert(*id, ((**payload).clone(), BTreeSet::new()));
         }
 
-        for (id, window_epoch) in batch.resource_refs {
+        for &(id, window_epoch) in &batch.resource_refs {
             if let Some((_payload, windows)) = pending_resources.get_mut(&id) {
                 windows.insert(window_epoch);
             } else {

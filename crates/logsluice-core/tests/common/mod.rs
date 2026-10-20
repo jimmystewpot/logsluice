@@ -436,6 +436,11 @@ impl Harness {
         }
     }
 
+    /// Arms a simulated flush failure on the next flush processed by the store thread.
+    pub fn fail_next_flush(&mut self) {
+        self.store_handle.fail_next_flush();
+    }
+
     /// Advances time by `timeout_ms` and executes a clean shutdown drain.
     pub fn drain(&mut self, timeout_ms: i64) {
         self.now_ms += timeout_ms;

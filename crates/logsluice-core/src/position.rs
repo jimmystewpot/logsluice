@@ -19,6 +19,7 @@ pub struct SourcePosition {
 pub struct OffsetTracker {
     hwm: HashMap<(Arc<str>, i32), i64>,
     pending: HashMap<(Arc<str>, i32), i64>,
+    uncommitted_prev: HashMap<(Arc<str>, i32), Option<i64>>,
 }
 
 impl OffsetTracker {
@@ -28,6 +29,7 @@ impl OffsetTracker {
         Self {
             hwm,
             pending: HashMap::new(),
+            uncommitted_prev: HashMap::new(),
         }
     }
 
@@ -42,8 +44,10 @@ impl OffsetTracker {
     /// Observes a source position, advancing the high-water mark and recording it as pending if higher.
     pub fn observe(&mut self, pos: &SourcePosition) {
         let key = (pos.topic.clone(), pos.partition);
-        let is_higher = self.hwm.get(&key).is_none_or(|&h| pos.offset > h);
+        let prev = self.hwm.get(&key).copied();
+        let is_higher = prev.is_none_or(|h| pos.offset > h);
         if is_higher {
+            self.uncommitted_prev.entry(key.clone()).or_insert(prev);
             self.hwm.insert(key.clone(), pos.offset);
             self.pending.insert(key, pos.offset);
         }
@@ -55,6 +59,30 @@ impl OffsetTracker {
             std::mem::take(&mut self.pending).into_iter().collect();
         list.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         list
+    }
+
+    /// Marks all currently tracked high-water mark advancements as durably committed.
+    pub fn commit_flush(&mut self) {
+        self.uncommitted_prev.clear();
+    }
+
+    /// Rolls back uncommitted high-water mark advancements from a failed flush batch.
+    pub fn rollback_flush(&mut self, failed_offsets: &[((Arc<str>, i32), i64)]) {
+        for (key, failed_offset) in failed_offsets {
+            if self.hwm.get(key) == Some(failed_offset) {
+                match self.uncommitted_prev.remove(key).flatten() {
+                    Some(prev) => {
+                        self.hwm.insert(key.clone(), prev);
+                    }
+                    None => {
+                        self.hwm.remove(key);
+                    }
+                }
+                if self.pending.get(key) == Some(failed_offset) {
+                    self.pending.remove(key);
+                }
+            }
+        }
     }
 }
 

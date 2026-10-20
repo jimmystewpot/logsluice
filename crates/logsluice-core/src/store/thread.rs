@@ -3,6 +3,8 @@
 //! Executes asynchronous I/O commands (flushes, ticket persistence, acks, range queries, deletions)
 //! off the hot ingestion path.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::thread::JoinHandle;
 
@@ -13,7 +15,7 @@ use crate::error::{AggError, AggResult};
 use crate::key::StorageKey24;
 use crate::l1::L1Buffer;
 use crate::simd::SimdKernelTable;
-use crate::store::shard_store::{FlushStats, JoinedRow, ShardStore};
+use crate::store::shard_store::{FlushBatch, FlushStats, JoinedRow, ShardStore};
 
 /// Command sent to the shard storage thread.
 #[allow(clippy::manual_non_exhaustive)]
@@ -77,10 +79,12 @@ pub enum StoreEvent<F> {
         /// Current shard database directory size in bytes.
         disk_bytes: u64,
     },
-    /// Flush operation failed; returns the error and unacknowledged finalizers.
+    /// Flush operation failed; returns the error, uncommitted batch, and unacknowledged finalizers.
     FlushFailed {
         /// Storage error encountered during the flush attempt.
         error: AggError,
+        /// Uncommitted flush batch so the worker can roll back in-memory state.
+        batch: FlushBatch,
         /// Finalizers attached to the failed L1 buffer so upstream can be notified of error.
         finalizers: Vec<F>,
     },
@@ -120,12 +124,16 @@ pub enum StoreEvent<F> {
 /// Handle for sending commands to the background shard storage thread.
 pub struct StoreHandle<F> {
     tx: SyncSender<StoreCommand<F>>,
+    fail_next_flush: Arc<AtomicBool>,
+    fail_next_disk_bytes: Arc<AtomicBool>,
 }
 
 impl<F> Clone for StoreHandle<F> {
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
+            fail_next_flush: Arc::clone(&self.fail_next_flush),
+            fail_next_disk_bytes: Arc::clone(&self.fail_next_disk_bytes),
         }
     }
 }
@@ -146,9 +154,21 @@ impl<F> StoreHandle<F> {
             .send(cmd)
             .map_err(|e| AggError::Channel(e.to_string()))
     }
+
+    /// Arms a one-shot simulated `apply_flush` error on the next `StoreCommand::Flush` processed by this shard.
+    #[doc(hidden)]
+    pub fn fail_next_flush(&self) {
+        self.fail_next_flush.store(true, Ordering::SeqCst);
+    }
+
+    /// Arms a one-shot simulated `disk_bytes()` error after the next committed `StoreCommand::Flush` on this shard.
+    #[doc(hidden)]
+    pub fn fail_next_disk_bytes(&self) {
+        self.fail_next_disk_bytes.store(true, Ordering::SeqCst);
+    }
 }
 
-static FAIL_NEXT_FLUSH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FAIL_NEXT_FLUSH: AtomicBool = AtomicBool::new(false);
 
 /// Controller for spawning and managing a per-shard storage worker thread.
 pub struct StoreThread;
@@ -157,7 +177,7 @@ impl StoreThread {
     /// Arms a one-shot simulated `apply_flush` error on the next `StoreCommand::Flush` processed.
     #[doc(hidden)]
     pub fn fail_next_flush() {
-        FAIL_NEXT_FLUSH.store(true, std::sync::atomic::Ordering::SeqCst);
+        FAIL_NEXT_FLUSH.store(true, Ordering::SeqCst);
     }
 
     /// Spawns a dedicated background thread for shard persistence operations.
@@ -178,46 +198,46 @@ impl StoreThread {
     )> {
         let (tx_cmd, rx_cmd) = std::sync::mpsc::sync_channel::<StoreCommand<F>>(64);
         let (tx_event, rx_event) = futures_channel::mpsc::unbounded::<StoreEvent<F>>();
+        let shared_fail_next_flush = Arc::new(AtomicBool::new(false));
+        let shared_fail_next_disk_bytes = Arc::new(AtomicBool::new(false));
+        let thread_fail_next_flush = Arc::clone(&shared_fail_next_flush);
+        let thread_fail_next_disk_bytes = Arc::clone(&shared_fail_next_disk_bytes);
 
         let join_handle = std::thread::Builder::new()
             .name("shard-store-worker".to_string())
             .spawn(move || {
                 let mut fail_next_flush = false;
                 let mut fail_next_persist = false;
+                let mut last_disk_bytes = store.disk_bytes().unwrap_or(0);
                 while let Ok(cmd) = rx_cmd.recv() {
                     match cmd {
                         StoreCommand::Flush(buf) => {
                             let (batch, finalizers) = buf.into_flush();
-                            let flush_res = if fail_next_flush
-                                || FAIL_NEXT_FLUSH.swap(false, std::sync::atomic::Ordering::SeqCst)
-                            {
-                                fail_next_flush = false;
+                            let local_fail = std::mem::replace(&mut fail_next_flush, false);
+                            let handle_fail = thread_fail_next_flush.swap(false, Ordering::SeqCst);
+                            let global_fail = FAIL_NEXT_FLUSH.swap(false, Ordering::SeqCst);
+                            let flush_res = if local_fail || handle_fail || global_fail {
                                 Err(AggError::Channel("injected Flush failure".into()))
                             } else {
-                                store.apply_flush(batch, &k)
+                                store.apply_flush_ref(&batch, &k)
                             };
                             match flush_res {
                                 Ok(stats) => {
-                                    let disk_bytes = match store.disk_bytes() {
-                                        Ok(b) => b,
-                                        Err(e) => {
-                                            let _ =
-                                                tx_event.unbounded_send(StoreEvent::FlushFailed {
-                                                    error: e,
-                                                    finalizers,
-                                                });
-                                            continue;
-                                        }
-                                    };
+                                    let fail_disk =
+                                        thread_fail_next_disk_bytes.swap(false, Ordering::SeqCst);
+                                    if !fail_disk && let Ok(b) = store.disk_bytes() {
+                                        last_disk_bytes = b;
+                                    }
                                     let _ = tx_event.unbounded_send(StoreEvent::FlushDone {
                                         finalizers,
                                         stats,
-                                        disk_bytes,
+                                        disk_bytes: last_disk_bytes,
                                     });
                                 }
                                 Err(e) => {
                                     let _ = tx_event.unbounded_send(StoreEvent::FlushFailed {
                                         error: e,
+                                        batch,
                                         finalizers,
                                     });
                                 }
@@ -351,6 +371,14 @@ impl StoreThread {
             })
             .map_err(AggError::Io)?;
 
-        Ok((StoreHandle { tx: tx_cmd }, rx_event, join_handle))
+        Ok((
+            StoreHandle {
+                tx: tx_cmd,
+                fail_next_flush: shared_fail_next_flush,
+                fail_next_disk_bytes: shared_fail_next_disk_bytes,
+            },
+            rx_event,
+            join_handle,
+        ))
     }
 }

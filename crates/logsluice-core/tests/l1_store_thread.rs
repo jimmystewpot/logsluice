@@ -489,3 +489,47 @@ fn double_buffer_tracks_active_and_inflight_keys_across_swap_and_completion() {
     assert!(!db.contains_key_active_or_inflight(&k1));
     assert!(db.contains_key_active_or_inflight(&k2));
 }
+
+#[test]
+fn store_thread_emits_spill_failed_on_io_errors() {
+    let (store, k, _d) = common::store_with_layout();
+    let shard_dir = store.shard_dir().to_path_buf();
+    let (h, mut ev, j) = StoreThread::spawn::<u32>(store, k).unwrap();
+
+    let spill_dir = shard_dir.join("spill");
+    std::fs::create_dir_all(spill_dir.join(format!("{:020}.ndjson", 1u64))).unwrap();
+
+    h.send(StoreCommand::RemoveSpill { ticket_id: 1 }).unwrap();
+    match common::recv(&mut ev, Duration::from_secs(5)) {
+        StoreEvent::SpillFailed {
+            ticket_id: Some(1), ..
+        } => {}
+        other => panic!("expected StoreEvent::SpillFailed for RemoveSpill, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&spill_dir).unwrap();
+    std::fs::write(&spill_dir, b"not-a-dir").unwrap();
+
+    h.send(StoreCommand::ReplaySpill).unwrap();
+    match common::recv(&mut ev, Duration::from_secs(5)) {
+        StoreEvent::SpillFailed {
+            ticket_id: None, ..
+        } => {}
+        other => panic!("expected StoreEvent::SpillFailed for ReplaySpill, got {other:?}"),
+    }
+
+    h.send(StoreCommand::Spill {
+        ticket_id: 2,
+        records: Vec::new(),
+    })
+    .unwrap();
+    match common::recv(&mut ev, Duration::from_secs(5)) {
+        StoreEvent::SpillFailed {
+            ticket_id: Some(2), ..
+        } => {}
+        other => panic!("expected StoreEvent::SpillFailed for Spill, got {other:?}"),
+    }
+
+    h.send(StoreCommand::Shutdown).unwrap();
+    j.join().unwrap();
+}

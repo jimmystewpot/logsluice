@@ -170,6 +170,8 @@ pub enum StoreEvent<F> {
         ticket_id: u64,
         /// Updated count of pending `.ndjson` spill files on disk.
         spill_files: usize,
+        /// Updated physical disk usage in bytes including the spill directory.
+        disk_bytes: u64,
     },
     /// Pending disk spill files loaded for replay.
     SpillReplay {
@@ -509,9 +511,13 @@ impl StoreThread {
                             match spill_writer.spill(ticket_id, &records) {
                                 Ok(()) => {
                                     let spill_files = spill_writer.count_files();
+                                    if let Ok(bytes) = store.disk_bytes() {
+                                        last_disk_bytes = bytes;
+                                    }
                                     let _ = tx_event.unbounded_send(StoreEvent::SpillDone {
                                         ticket_id,
                                         spill_files,
+                                        disk_bytes: last_disk_bytes,
                                     });
                                 }
                                 Err(error) => {
@@ -541,9 +547,13 @@ impl StoreThread {
                             match spill_writer.remove(ticket_id) {
                                 Ok(()) => {
                                     let spill_files = spill_writer.count_files();
+                                    if let Ok(bytes) = store.disk_bytes() {
+                                        last_disk_bytes = bytes;
+                                    }
                                     let _ = tx_event.unbounded_send(StoreEvent::SpillDone {
                                         ticket_id,
                                         spill_files,
+                                        disk_bytes: last_disk_bytes,
                                     });
                                 }
                                 Err(error) => {

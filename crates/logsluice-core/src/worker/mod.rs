@@ -1516,8 +1516,10 @@ impl<F> ShardWorker<F> {
             StoreEvent::SpillDone {
                 ticket_id,
                 spill_files,
+                disk_bytes,
             } => {
                 self.cached_spill_files = spill_files;
+                self.set_disk_bytes(disk_bytes);
                 if self.unacked_tickets.remove(&ticket_id).is_some() {
                     self.spilled_tickets.insert(ticket_id);
                     self.pending_rows.remove(&ticket_id);

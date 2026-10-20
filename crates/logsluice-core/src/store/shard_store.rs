@@ -1,7 +1,7 @@
 //! Shard-level persistence engine wrapping a single `fjall::Database` instance.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fjall::{
@@ -750,16 +750,21 @@ impl ShardStore {
         &self.opts.shard_dir
     }
 
-    /// Queries the shard's current LSM database disk usage in bytes via
-    /// [`fjall::Database::disk_space`].
+    /// Queries the shard's current disk usage in bytes, combining the LSM database usage via
+    /// [`fjall::Database::disk_space`] with any pending spill files in `shard_dir/spill`.
     ///
     /// This accounts for the fjall journal and active keyspace SSTables in O(1) without walking
-    /// the filesystem, and excludes external files such as the shard's `spill/` directory.
+    /// the LSM directory tree, plus a flat scan of `spill/` if present.
     ///
     /// # Errors
     /// Returns [`AggError::Storage`] if querying database disk space fails.
     pub fn disk_bytes(&self) -> AggResult<u64> {
-        Ok(self.db.disk_space()?)
+        Ok(self
+            .db
+            .disk_space()?
+            .saturating_add(crate::worker::spill::spill_dir_bytes(
+                &self.opts.shard_dir.join("spill"),
+            )))
     }
 
     fn get_or_create_hdr_keyspace(&mut self, epoch_ms: u64) -> AggResult<Keyspace> {

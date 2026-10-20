@@ -289,16 +289,6 @@ fn disk_bytes_grows_after_flush_and_shrinks_after_drop_window() {
 
     let initial = s.disk_bytes().unwrap();
 
-    // Unrelated files in the spill directory must not be counted in ShardStore::disk_bytes().
-    let spill_dir = store_opts.shard_dir.join("spill");
-    std::fs::create_dir_all(&spill_dir).unwrap();
-    std::fs::write(
-        spill_dir.join("00000000000000000001.ndjson"),
-        vec![b's'; 32_768],
-    )
-    .unwrap();
-    assert_eq!(s.disk_bytes().unwrap(), initial);
-
     // Flush a 64 KiB incompressible exemplar tail so both the journal (~64 KiB) and the
     // rotated window tail SSTable (~64 KiB) contribute to fjall's disk_space().
     let incompressible: Vec<u8> = (0..16_384u32)
@@ -333,6 +323,55 @@ fn disk_bytes_grows_after_flush_and_shrinks_after_drop_window() {
         after_drop < after_flush,
         "expected disk_bytes after drop_window ({after_drop}) < after_flush ({after_flush})"
     );
+}
+
+#[test]
+fn disk_bytes_includes_spill_files() {
+    use logsluice_core::emission::SliceRecord;
+    use logsluice_core::worker::spill::SpillWriter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(dir.path(), "pod-0", 1, b"s").unwrap();
+    let mut store_opts = opts(dir.path());
+    store_opts.shard_dir = dir.path().to_path_buf();
+    let store = ShardStore::open(store_opts, &meta).unwrap();
+
+    let initial = store.disk_bytes().unwrap();
+
+    let mut spill_writer = SpillWriter::new(dir.path().to_path_buf());
+    let record = SliceRecord {
+        window_start_ms: 0,
+        window_end_ms: 60_000,
+        emit_reason: EmitReason::Close,
+        emitter_id: "pod-0".to_string(),
+        digest: 123,
+        slice_seq: 0,
+        slice_id: "pod-0:0:0000000000000000000000000000007b:0".to_string(),
+        resource: Arc::new(ResourceScopePayload {
+            resource: std::collections::BTreeMap::new(),
+            scope_name: "test".to_string(),
+            scope_version: "1.0".to_string(),
+            scope_attrs: std::collections::BTreeMap::new(),
+        }),
+        tail: ExemplarTail {
+            severity: 9,
+            body: Some(bytes::Bytes::from_static(b"spill-payload-body")),
+            dims: Vec::new(),
+            attrs: Vec::new(),
+        },
+        counters: vec![[1, 0, 0, 0]],
+        minmax: vec![(10, 20)],
+    };
+
+    spill_writer.spill(42, &[record]).unwrap();
+    let spill_file = spill_writer.spill_dir().join(format!("{:020}.ndjson", 42));
+    let spill_len = std::fs::metadata(&spill_file).unwrap().len();
+    assert!(spill_len > 0);
+
+    assert_eq!(store.disk_bytes().unwrap(), initial + spill_len);
+
+    spill_writer.remove(42).unwrap();
+    assert_eq!(store.disk_bytes().unwrap(), initial);
 }
 
 #[test]

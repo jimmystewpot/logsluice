@@ -177,6 +177,31 @@ impl SpillWriter {
         }
         count
     }
+
+    /// Returns the total byte size of all regular files currently in the spill directory.
+    #[must_use]
+    pub fn total_bytes(&self) -> u64 {
+        spill_dir_bytes(&self.spill_dir)
+    }
+}
+
+/// Sums the byte lengths of all regular files in `spill_dir`.
+///
+/// Returns `0` immediately if `spill_dir` does not exist or cannot be read.
+#[must_use]
+pub fn spill_dir_bytes(spill_dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(spill_dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            entry
+                .metadata()
+                .map(|m| if m.is_file() { m.len() } else { 0 })
+                .unwrap_or(0)
+        })
+        .fold(0u64, u64::saturating_add)
 }
 
 #[cfg(test)]

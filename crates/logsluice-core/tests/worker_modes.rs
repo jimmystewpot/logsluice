@@ -1,9 +1,20 @@
 #![allow(missing_docs, clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
+use bytes::Bytes;
 use common::Harness;
-use logsluice_core::{codec::ticket::EmitReason, config::*};
-use std::time::Duration;
+use logsluice_core::{
+    codec::{plan::AggregationPlan, ticket::EmitReason},
+    config::*,
+    key::StorageKey24,
+    resource::ResourceScopePayload,
+    store::{StoreCommand, StoreEvent},
+    window::WindowClock,
+    worker::{
+        ExemplarSource, IngestItem, PurgeHorizon, RecoveredState, ShardWorker, WorkerContext,
+    },
+};
+use std::{sync::Arc, time::Duration};
 
 const DAY: i64 = 86_400_000;
 const M15: i64 = 900_000;
@@ -212,4 +223,226 @@ fn retry_poll_with_known_watermark_is_not_forced_close() {
     // When watermark is None and now >= window_end + max_close_delay, poll(None, now) forces closure.
     h2.advance(now_past_max_close_delay, None);
     assert_eq!(h2.stats().forced_closes_total, 1);
+}
+
+#[test]
+fn evicted_key_with_inflight_flush_keeps_exemplar() {
+    let (mut store, kernels, _dir) = common::store_with_layout();
+    let mut cfg = EngineConfig::default();
+    cfg.cardinality.max_keys_per_window = 1;
+    cfg.cardinality.on_cap = OnCap::EvictCold;
+    cfg.cardinality.evict_high_water = 1.0;
+    cfg.cardinality.evict_interval = Duration::from_secs(10);
+    cfg.window.emit.close_jitter_max = Duration::ZERO;
+    let cfg = Arc::new(cfg);
+
+    let clock = WindowClock::new(cfg.window.duration, cfg.window.offset).unwrap();
+    let plan = Arc::new(AggregationPlan::new(&common::spec_example()).unwrap());
+    let ctx = WorkerContext {
+        cfg: Arc::clone(&cfg),
+        shard: 0,
+        emitter_id: Arc::from("pod-0"),
+        kernels,
+        plan,
+        clock,
+    };
+    let mut worker: ShardWorker<u32> =
+        ShardWorker::new(ctx, RecoveredState::empty(), PurgeHorizon::new(0));
+
+    let res = Arc::new(ResourceScopePayload {
+        resource: [(
+            "service.name".to_string(),
+            serde_json::json!("test-service"),
+        )]
+        .into(),
+        scope_name: "test-scope".to_string(),
+        scope_version: "1.0.0".to_string(),
+        scope_attrs: Default::default(),
+    });
+    let res_hash = res.canonical_hash();
+    let key = StorageKey24 {
+        epoch_ms: 0,
+        digest: 1,
+    };
+
+    // 1. Ingest key K with exemplar-1 and flush to ShardStore.
+    let item1 = IngestItem {
+        key,
+        resource: Arc::clone(&res),
+        resource_hash: res_hash,
+        position: None,
+        event_ms: 1_000,
+        counters: vec![[1, 0, 0, 0]],
+        minmax_values: vec![1_000, 1_000],
+        exemplar: ExemplarSource {
+            severity: 1,
+            body: Some(Bytes::from_static(b"exemplar-1")),
+            dims: Vec::new(),
+            attrs: Vec::new(),
+        },
+    };
+    worker.ingest(vec![item1], 0, 1_000);
+    let out = worker.flush_l1(1_000);
+    assert_eq!(out.commands.len(), 1);
+    let StoreCommand::Flush(buf) = out.commands.into_iter().next().unwrap() else {
+        panic!("expected flush command");
+    };
+    let (batch, finalizers) = buf.into_flush();
+    let stats = store.apply_flush(batch, &kernels).unwrap();
+    worker.on_event(
+        StoreEvent::FlushDone {
+            disk_bytes: 0,
+            stats,
+            finalizers,
+        },
+        1_000,
+    );
+
+    let rows = store.rows(0, None, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].header.total[0][0], 1);
+    assert_eq!(
+        rows[0].tail.as_ref().and_then(|t| t.body.clone()),
+        Some(Bytes::from_static(b"exemplar-1"))
+    );
+
+    // 2. Evict K (total equals emitted).
+    let out = worker.poll(None, 12_000);
+    assert_eq!(out.commands.len(), 1);
+    let StoreCommand::Rows {
+        epoch_ms,
+        reason,
+        after,
+        limit,
+        ..
+    } = out.commands.into_iter().next().unwrap()
+    else {
+        panic!("expected rows command");
+    };
+    assert_eq!(reason, EmitReason::Evict);
+    let rows = store.rows(epoch_ms, after, limit).unwrap();
+    let out = worker.on_event(
+        StoreEvent::Rows {
+            epoch_ms,
+            reason,
+            rows,
+            next_after: None,
+            recovery_ticket: None,
+        },
+        12_000,
+    );
+    assert_eq!(out.commands.len(), 1);
+    let StoreCommand::PersistTickets(tickets) = out.commands.into_iter().next().unwrap() else {
+        panic!("expected persist tickets");
+    };
+    store.put_tickets(&tickets).unwrap();
+    let ticket_id = tickets[0].id;
+    let out = worker.on_event(StoreEvent::TicketsPersisted(vec![ticket_id]), 12_000);
+    assert_eq!(out.emit.len(), 1);
+    assert_eq!(out.emit[0].ticket_id, ticket_id);
+
+    // 3. Ingest K again with exemplar-2 so it lands in a batch that is swapped and in flight.
+    let item2 = IngestItem {
+        key,
+        resource: Arc::clone(&res),
+        resource_hash: res_hash,
+        position: None,
+        event_ms: 12_500,
+        counters: vec![[1, 0, 0, 0]],
+        minmax_values: vec![12_500, 12_500],
+        exemplar: ExemplarSource {
+            severity: 2,
+            body: Some(Bytes::from_static(b"exemplar-2")),
+            dims: Vec::new(),
+            attrs: Vec::new(),
+        },
+    };
+    worker.ingest(vec![item2], 1, 12_500);
+    let out = worker.flush_l1(12_500);
+    assert_eq!(out.commands.len(), 1);
+    let StoreCommand::Flush(swapped_buf) = out.commands.into_iter().next().unwrap() else {
+        panic!("expected flush command");
+    };
+    let (swapped, swapped_finalizers) = swapped_buf.into_flush();
+
+    // 4. Deliver the evict AckApplied while swapped batch is in flight.
+    let out = worker.on_ack(ticket_id, true, 12_500);
+    assert_eq!(out.commands.len(), 1);
+    let StoreCommand::Ack(ticket) = out.commands.into_iter().next().unwrap() else {
+        panic!("expected ack command");
+    };
+    let evicted_keys = store.apply_ack(&ticket, &kernels).unwrap();
+    assert_eq!(evicted_keys.len(), 1);
+    assert!(store.rows(0, None, 10).unwrap().is_empty());
+
+    worker.on_event(
+        StoreEvent::AckApplied {
+            ticket_id,
+            evicted_keys,
+        },
+        12_500,
+    );
+
+    // 5. Flush the in-flight batch.
+    let stats = store.apply_flush(swapped, &kernels).unwrap();
+    worker.on_event(
+        StoreEvent::FlushDone {
+            disk_bytes: 0,
+            stats,
+            finalizers: swapped_finalizers,
+        },
+        12_500,
+    );
+
+    // 6. Assert the stored tail for K still exists and the counters are correct.
+    let rows = store.rows(0, None, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].header.total[0][0], 1);
+    assert!(rows[0].tail.is_some());
+    assert_eq!(
+        rows[0].tail.as_ref().and_then(|t| t.body.clone()),
+        Some(Bytes::from_static(b"exemplar-2"))
+    );
+    assert_eq!(worker.stats().keys_evicted_total, 0);
+
+    // 7. Verify K was NOT forgotten from worker.known:
+    // A subsequent ingest of K must be treated as known (is_new = false)
+    // and must accumulate onto the stored counters instead of overwriting _hdr.
+    let item3 = IngestItem {
+        key,
+        resource: Arc::clone(&res),
+        resource_hash: res_hash,
+        position: None,
+        event_ms: 13_000,
+        counters: vec![[5, 0, 0, 0]],
+        minmax_values: vec![13_000, 13_000],
+        exemplar: ExemplarSource {
+            severity: 3,
+            body: Some(Bytes::from_static(b"exemplar-3")),
+            dims: Vec::new(),
+            attrs: Vec::new(),
+        },
+    };
+    worker.ingest(vec![item3], 2, 13_000);
+    let out = worker.flush_l1(13_000);
+    assert_eq!(out.commands.len(), 1);
+    let StoreCommand::Flush(batch3_buf) = out.commands.into_iter().next().unwrap() else {
+        panic!("expected flush command");
+    };
+    let (batch3, batch3_finalizers) = batch3_buf.into_flush();
+    let stats = store.apply_flush(batch3, &kernels).unwrap();
+    worker.on_event(
+        StoreEvent::FlushDone {
+            disk_bytes: 0,
+            stats,
+            finalizers: batch3_finalizers,
+        },
+        13_000,
+    );
+
+    let rows = store.rows(0, None, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    // 1 (from swapped batch) + 5 (from third ingest) = 6!
+    assert_eq!(rows[0].header.total[0][0], 6);
+    assert_eq!(worker.stats().keys_evicted_total, 0);
 }

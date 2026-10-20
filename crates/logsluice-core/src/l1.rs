@@ -144,6 +144,11 @@ impl<F> L1Buffer<F> {
         self.entries.contains_key(key)
     }
 
+    /// Returns an iterator over all keys currently present in the buffer.
+    pub fn keys(&self) -> impl Iterator<Item = &StorageKey24> {
+        self.entries.keys()
+    }
+
     /// Converts the buffer into an atomic `FlushBatch` and associated finalizers.
     #[must_use]
     pub fn into_flush(self) -> (FlushBatch, Vec<F>) {

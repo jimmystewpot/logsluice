@@ -117,7 +117,7 @@ async fn emit_worker_output(
     cfg: &SluiceConfig,
     plan: &AggregationPlan,
     detected_otlp: &AtomicBool,
-) {
+) -> bool {
     let mut cmds = out.commands.into_iter();
     while let Some(cmd) = cmds.next() {
         if let Err(unsent) = store_handle.try_send(cmd) {
@@ -127,13 +127,22 @@ async fn emit_worker_output(
         }
     }
 
+    for finalizers in out.release {
+        finalizers.update_status(AckStatus::Delivered);
+    }
+
+    for finalizers in out.failed_release {
+        finalizers.update_status(AckStatus::Errored);
+    }
+
     let use_otlp = match cfg.envelope_mode {
         EnvelopeMode::Otlp => true,
         EnvelopeMode::VectorNative => false,
         EnvelopeMode::Auto => detected_otlp.load(Ordering::Relaxed),
     };
 
-    for emit_batch in out.emit {
+    let mut batches_iter = out.emit.into_iter();
+    while let Some(emit_batch) = batches_iter.next() {
         let (finalizer, receiver) = AckNotifier::new_with_receiver();
         let rendered_logs = if use_otlp {
             render_otlp(
@@ -154,7 +163,22 @@ async fn emit_worker_output(
             log.merge_finalizers(AckFinalizers::from_single(finalizer.clone()));
             if output_tx.send(log).await.is_err() {
                 finalizer.update_status(AckStatus::Errored);
-                break;
+                drop(finalizer);
+                let _ = ack_tx
+                    .send(ShardMessage::Ack {
+                        ticket_id: emit_batch.ticket_id,
+                        delivered: false,
+                    })
+                    .await;
+                for rem in batches_iter {
+                    let _ = ack_tx
+                        .send(ShardMessage::Ack {
+                            ticket_id: rem.ticket_id,
+                            delivered: false,
+                        })
+                        .await;
+                }
+                return false;
             }
         }
         drop(finalizer);
@@ -172,13 +196,7 @@ async fn emit_worker_output(
         });
     }
 
-    for finalizers in out.release {
-        finalizers.update_status(AckStatus::Delivered);
-    }
-
-    for finalizers in out.failed_release {
-        finalizers.update_status(AckStatus::Errored);
-    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -198,7 +216,7 @@ async fn shard_loop(
 ) {
     // 1. Initial recovery output
     let rec_out = worker.recovery_output();
-    emit_worker_output(
+    if !emit_worker_output(
         rec_out,
         &mut worker,
         &store_handle,
@@ -208,7 +226,17 @@ async fn shard_loop(
         &plan,
         &detected_otlp,
     )
-    .await;
+    .await
+    {
+        while let Ok(msg) = shard_rx.try_recv() {
+            if let ShardMessage::Ingest { finalizer, .. } = msg {
+                finalizer.update_status(AckStatus::Errored);
+            }
+        }
+        let _ = store_handle.send(StoreCommand::Shutdown);
+        let _ = store_thread.join();
+        return;
+    }
 
     let mut draining = false;
     let mut drain_deadline: Option<i64> = None;
@@ -222,7 +250,9 @@ async fn shard_loop(
             Some(store_ev) = store_events.next() => {
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 let out = worker.on_event(store_ev, now_ms);
-                emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &shard_tx, &cfg, &plan, &detected_otlp).await;
+                if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &shard_tx, &cfg, &plan, &detected_otlp).await {
+                    break;
+                }
 
                 if let Some((items, finalizer)) = pending_ingest.take()
                     && let Err(batch) = worker.try_ingest(items, finalizer, now_ms)
@@ -245,7 +275,9 @@ async fn shard_loop(
                     }
                     ShardMessage::Ack { ticket_id, delivered } => {
                         let out = worker.on_ack(ticket_id, delivered, now_ms);
-                        emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &shard_tx, &cfg, &plan, &detected_otlp).await;
+                        if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &shard_tx, &cfg, &plan, &detected_otlp).await {
+                            break;
+                        }
 
                         if draining && pending_ingest.is_none() && is_drain_complete(&worker, drain_deadline, now_ms) {
                             break;
@@ -253,7 +285,9 @@ async fn shard_loop(
                     }
                     ShardMessage::Poll { watermark, now_ms } => {
                         let out = worker.poll(watermark, now_ms);
-                        emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &shard_tx, &cfg, &plan, &detected_otlp).await;
+                        if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &shard_tx, &cfg, &plan, &detected_otlp).await {
+                            break;
+                        }
                         let r_stats = {
                             router_stats.lock().map_or_else(|_| RouterStats::default(), |guard| *guard)
                         };
@@ -271,7 +305,9 @@ async fn shard_loop(
                         draining = true;
                         drain_deadline = Some(deadline_ms);
                         let out = worker.begin_drain(deadline_ms);
-                        emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &shard_tx, &cfg, &plan, &detected_otlp).await;
+                        if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &shard_tx, &cfg, &plan, &detected_otlp).await {
+                            break;
+                        }
 
                         if pending_ingest.is_none() && is_drain_complete(&worker, Some(deadline_ms), now_ms) {
                             break;
@@ -288,12 +324,23 @@ async fn shard_loop(
                     pending_ingest = Some(batch);
                 }
                 let out = worker.poll(None, now_ms);
-                emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &shard_tx, &cfg, &plan, &detected_otlp).await;
+                if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &shard_tx, &cfg, &plan, &detected_otlp).await {
+                    break;
+                }
 
                 if draining && pending_ingest.is_none() && is_drain_complete(&worker, drain_deadline, now_ms) {
                     break;
                 }
             }
+        }
+    }
+
+    if let Some((_, finalizer)) = pending_ingest.take() {
+        finalizer.update_status(AckStatus::Errored);
+    }
+    while let Ok(msg) = shard_rx.try_recv() {
+        if let ShardMessage::Ingest { finalizer, .. } = msg {
+            finalizer.update_status(AckStatus::Errored);
         }
     }
 
@@ -483,7 +530,7 @@ async fn run_pipeline(
         .min(Duration::from_secs(1));
     let mut poll_interval = tokio::time::interval(poll_duration);
 
-    loop {
+    'pipeline_loop: loop {
         tokio::select! {
             item = input.next() => {
                 match item {
@@ -499,7 +546,13 @@ async fn run_pipeline(
                             pt.merge_finalizers(finalizers.clone());
                             if output_tx.send(pt).await.is_err() {
                                 finalizers.update_status(AckStatus::Errored);
-                                break;
+                                for batch in &mut micro_batches {
+                                    if !batch.items.is_empty() {
+                                        batch.finalizer.update_status(AckStatus::Errored);
+                                        batch.items.clear();
+                                    }
+                                }
+                                break 'pipeline_loop;
                             }
                         }
 
@@ -548,6 +601,8 @@ async fn run_pipeline(
         }
     }
 
+    drop(input);
+
     // Flush remaining items across all micro-batches
     for s_idx in 0..shards_count {
         flush_micro_batch(s_idx, &mut micro_batches, &shard_txs).await;
@@ -580,6 +635,11 @@ async fn run_pipeline(
 mod tests {
     use super::*;
     use crate::event::Value;
+    use logsluice_core::codec::tail::ExemplarTail;
+    use logsluice_core::emission::{EmitReason, SliceRecord};
+    use logsluice_core::key::StorageKey24;
+    use logsluice_core::resource::ResourceScopePayload;
+    use logsluice_core::worker::{EmitBatch, ExemplarSource};
 
     static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -643,9 +703,6 @@ shutdown:
     #[tokio::test(flavor = "current_thread")]
     async fn pipeline_shard_loop_does_not_block_when_store_queue_full() {
         let _serial = TEST_SERIAL.lock().await;
-        use logsluice_core::key::StorageKey24;
-        use logsluice_core::resource::ResourceScopePayload;
-        use logsluice_core::worker::ExemplarSource;
         use std::collections::BTreeMap;
 
         let dir = tempfile::TempDir::new().unwrap();
@@ -854,5 +911,269 @@ shutdown:
             .await
             .unwrap();
         shard_handle.await.unwrap();
+    }
+
+    fn test_config(dir: &std::path::Path) -> SluiceConfig {
+        let yaml = format!(
+            r#"
+storage:
+  data_dir: {:?}
+  l1_flush_interval: 10ms
+  sync_wal: false
+shards: 1
+window:
+  type: tumbling
+  duration: 10s
+  allowed_skew: 0s
+  allowed_lateness: 0s
+  late_emit_interval: 10ms
+  max_close_delay: 10ms
+  max_future_drift: 1d
+  emit:
+    close_jitter_max: 0s
+group_by:
+  - service
+aggregations:
+  event_count: count
+shutdown:
+  drain_timeout: 100ms
+"#,
+            dir
+        );
+        serde_yaml_ng::from_str(&yaml).expect("valid config")
+    }
+
+    fn empty_resource() -> Arc<ResourceScopePayload> {
+        Arc::new(ResourceScopePayload {
+            resource: std::collections::BTreeMap::new(),
+            scope_name: String::new(),
+            scope_version: String::new(),
+            scope_attrs: std::collections::BTreeMap::new(),
+        })
+    }
+
+    fn sample_slice_record(ticket_seq: u32) -> SliceRecord {
+        SliceRecord {
+            window_start_ms: 1_700_000_000_000,
+            window_end_ms: 1_700_000_010_000,
+            emit_reason: EmitReason::Close,
+            emitter_id: "test-emitter".to_string(),
+            digest: u128::from(ticket_seq),
+            slice_seq: ticket_seq,
+            slice_id: format!("test-emitter:1700000000000:{ticket_seq:032x}:{ticket_seq}"),
+            resource: empty_resource(),
+            tail: ExemplarTail {
+                severity: 9,
+                body: None,
+                dims: vec![Some(bytes::Bytes::from_static(b"api"))],
+                attrs: Vec::new(),
+            },
+            counters: vec![[1, 0, 0, 0]],
+            minmax: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn passthrough_closed_output_channel_marks_finalizer_errored_and_stops_pipeline() {
+        let _serial = TEST_SERIAL.lock().await;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cfg = test_config(dir.path());
+        let pipeline = SluicePipeline::new(cfg).expect("pipeline");
+        let (tx, rx) = futures_mpsc::unbounded();
+        let out_stream = Box::new(pipeline).transform_stream(rx);
+
+        // Immediately close the downstream output channel.
+        drop(out_stream);
+
+        // Send an event without @timestamp so it routes to passthrough (quarantine).
+        let mut quarantine_event = LogEvent::default();
+        quarantine_event.insert_path("service", Value::from("auth"));
+        let (quarantine_with_ack, ack_rx) = quarantine_event.with_ack_notifier();
+        tx.unbounded_send(quarantine_with_ack).expect("send event");
+
+        let status = tokio::time::timeout(Duration::from_secs(2), ack_rx)
+            .await
+            .expect("ack should resolve within timeout")
+            .expect("ack oneshot should not drop");
+        assert_eq!(status, AckStatus::Errored);
+
+        // Keep `tx` alive and verify `run_pipeline` exits its loop and drops `rx`.
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !tx.is_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("run_pipeline should stop and drop input stream when output_tx is closed");
+    }
+
+    #[tokio::test]
+    async fn closed_output_channel_nacks_remaining_batches_and_stops_shard_loop() {
+        let _serial = TEST_SERIAL.lock().await;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cfg = test_config(dir.path());
+        let codec_schema = cfg.codec_schema();
+        let pod_meta = PodMeta::load_or_init_with_window(
+            dir.path(),
+            1,
+            &codec_schema,
+            Some("test-emitter"),
+            10_000,
+            0,
+        )
+        .expect("pod meta");
+        let (engine, plan) = cfg.clone().into_engine_and_plan().expect("engine and plan");
+        let shard_dir = dir.path().join("shard_0");
+        std::fs::create_dir_all(&shard_dir).expect("shard dir");
+        let store = ShardStore::open(
+            StoreOptions {
+                shard_dir,
+                cache_bytes: 1024 * 1024,
+                hdr_memtable_bytes: 1024 * 1024,
+                tail_memtable_bytes: 1024 * 1024,
+                sync_wal: false,
+                layout: plan.layout(),
+                worker_threads: 1,
+            },
+            &pod_meta,
+        )
+        .expect("open shard store");
+        let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+        let worker_ctx = WorkerContext {
+            cfg: Arc::new(engine),
+            shard: 0,
+            emitter_id: Arc::from("test-emitter"),
+            kernels,
+            plan: Arc::new(plan.clone()),
+            clock: WindowClock::new(cfg.window.duration, cfg.window.offset).expect("clock"),
+        };
+        let recovered = RecoveredState::load(&store, &worker_ctx).expect("recovered");
+        let (store_handle, store_events, store_thread) =
+            StoreThread::spawn::<AckFinalizers>(store, kernels).expect("store thread");
+        let mut worker = ShardWorker::new(worker_ctx, recovered, PurgeHorizon::new(0));
+
+        let (mut output_tx, output_rx) = futures_mpsc::channel::<LogEvent>(16);
+        drop(output_rx);
+
+        let (ack_tx, mut ack_rx) = tokio_mpsc::channel::<ShardMessage>(16);
+        let detected_otlp = AtomicBool::new(false);
+        let out = WorkerOutput {
+            commands: Vec::new(),
+            emit: vec![
+                EmitBatch {
+                    ticket_id: 10,
+                    records: vec![sample_slice_record(1)],
+                },
+                EmitBatch {
+                    ticket_id: 20,
+                    records: vec![sample_slice_record(2)],
+                },
+            ],
+            release: Vec::new(),
+            failed_release: Vec::new(),
+        };
+
+        let output_open = emit_worker_output(
+            out,
+            &mut worker,
+            &store_handle,
+            &mut output_tx,
+            &ack_tx,
+            &cfg,
+            &plan,
+            &detected_otlp,
+        )
+        .await;
+        assert!(!output_open);
+
+        let msg1 = ack_rx
+            .try_recv()
+            .expect("first batch should be nacked immediately");
+        assert!(matches!(
+            msg1,
+            ShardMessage::Ack {
+                ticket_id: 10,
+                delivered: false
+            }
+        ));
+        let msg2 = ack_rx
+            .try_recv()
+            .expect("remaining batch should be nacked immediately");
+        assert!(matches!(
+            msg2,
+            ShardMessage::Ack {
+                ticket_id: 20,
+                delivered: false
+            }
+        ));
+
+        // Now verify `shard_loop` terminates when `emit_worker_output` fails on a closed `output_tx`.
+        let (shard_tx, shard_rx) = tokio_mpsc::channel::<ShardMessage>(16);
+        let loop_handle = tokio::spawn(shard_loop(
+            0,
+            worker,
+            store_handle,
+            store_events,
+            store_thread,
+            shard_rx,
+            shard_tx.clone(),
+            output_tx,
+            Arc::new(cfg),
+            Arc::new(plan),
+            Arc::new(std::sync::Mutex::new(RouterStats::default())),
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let item = IngestItem {
+            key: StorageKey24 {
+                epoch_ms: 1_700_000_000_000,
+                digest: 42,
+            },
+            resource: empty_resource(),
+            resource_hash: 0,
+            position: None,
+            event_ms: 1_700_000_000_100,
+            counters: vec![[1, 0, 0, 0]],
+            minmax_values: Vec::new(),
+            exemplar: ExemplarSource {
+                severity: 9,
+                body: None,
+                dims: vec![Some(bytes::Bytes::from_static(b"api"))],
+                attrs: Vec::new(),
+            },
+        };
+        let (ingest_finalizer, ingest_ack_rx) = AckNotifier::new_with_receiver();
+        shard_tx
+            .send(ShardMessage::Ingest {
+                items: vec![item],
+                finalizer: AckFinalizers::from_single(ingest_finalizer),
+            })
+            .await
+            .expect("send ingest");
+        shard_tx
+            .send(ShardMessage::Poll {
+                watermark: Some(1_700_000_020_000),
+                now_ms: 1_700_000_020_000,
+            })
+            .await
+            .expect("send poll to flush and close");
+        assert_eq!(
+            ingest_ack_rx.await.expect("flush ack"),
+            AckStatus::Delivered
+        );
+
+        // Trigger the close scan after L1 flush completes.
+        shard_tx
+            .send(ShardMessage::Poll {
+                watermark: Some(1_700_000_020_000),
+                now_ms: 1_700_000_020_010,
+            })
+            .await
+            .expect("send second poll");
+
+        tokio::time::timeout(Duration::from_millis(500), loop_handle)
+            .await
+            .expect("shard_loop should exit when output_tx is closed")
+            .expect("shard_loop task should not panic");
     }
 }

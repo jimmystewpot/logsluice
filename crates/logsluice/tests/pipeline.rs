@@ -289,6 +289,7 @@ shutdown:
         tail_memtable_bytes: 1024 * 1024,
         sync_wal: false,
         layout: plan.layout(),
+        worker_threads: 1,
     };
 
     let mut store = None;

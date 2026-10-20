@@ -204,7 +204,6 @@ fn decode_never_panics_on_mutations() {
     }
 }
 
-
 #[test]
 fn ticket_roundtrip() {
     let l = HeaderLayout {

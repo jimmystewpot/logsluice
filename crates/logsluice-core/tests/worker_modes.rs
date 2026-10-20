@@ -188,3 +188,28 @@ fn evict_cold_retains_key_in_known_set_when_updated_while_evict_ticket_in_flight
     assert_eq!(k0_close.len(), 1);
     assert_eq!(k0_close[0].counters[0][0], 10);
 }
+
+#[test]
+fn retry_poll_with_known_watermark_is_not_forced_close() {
+    let mut h1 = Harness::new(|c| {
+        c.window.duration = Duration::from_secs(60);
+        c.window.max_close_delay = Duration::from_secs(10);
+        c.window.emit.close_jitter_max = Duration::ZERO;
+    });
+    h1.ingest(&[(1, 1_000)]);
+    let window_end = 60_000;
+    let now_past_max_close_delay = 71_000;
+    // When watermark is at or after window_end, poll(Some(w), now) closes cleanly.
+    h1.advance(now_past_max_close_delay, Some(window_end));
+    assert_eq!(h1.stats().forced_closes_total, 0);
+
+    let mut h2 = Harness::new(|c| {
+        c.window.duration = Duration::from_secs(60);
+        c.window.max_close_delay = Duration::from_secs(10);
+        c.window.emit.close_jitter_max = Duration::ZERO;
+    });
+    h2.ingest(&[(1, 1_000)]);
+    // When watermark is None and now >= window_end + max_close_delay, poll(None, now) forces closure.
+    h2.advance(now_past_max_close_delay, None);
+    assert_eq!(h2.stats().forced_closes_total, 1);
+}

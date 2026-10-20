@@ -242,6 +242,7 @@ async fn shard_loop(
     let mut drain_deadline: Option<i64> = None;
     let mut drain_interval = tokio::time::interval(Duration::from_millis(25));
     let mut pending_ingest: Option<(Vec<IngestItem>, AckFinalizers)> = None;
+    let mut last_watermark: Option<i64> = None;
 
     loop {
         tokio::select! {
@@ -284,6 +285,7 @@ async fn shard_loop(
                         }
                     }
                     ShardMessage::Poll { watermark, now_ms } => {
+                        last_watermark = watermark;
                         let out = worker.poll(watermark, now_ms);
                         if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &shard_tx, &cfg, &plan, &detected_otlp).await {
                             break;
@@ -323,7 +325,7 @@ async fn shard_loop(
                 {
                     pending_ingest = Some(batch);
                 }
-                let out = worker.poll(None, now_ms);
+                let out = worker.poll(last_watermark, now_ms);
                 if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &shard_tx, &cfg, &plan, &detected_otlp).await {
                     break;
                 }
@@ -646,6 +648,90 @@ mod tests {
     use logsluice_core::worker::{EmitBatch, ExemplarSource};
 
     static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    use ::metrics::{
+        Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    };
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    type CounterKey = (String, Vec<(String, String)>);
+    type CounterMap = Arc<std::sync::Mutex<HashMap<CounterKey, u64>>>;
+
+    #[derive(Clone)]
+    struct PipelineTestCounter {
+        name: String,
+        labels: Vec<(String, String)>,
+        values: CounterMap,
+    }
+
+    impl CounterFn for PipelineTestCounter {
+        fn increment(&self, value: u64) {
+            if let Ok(mut guard) = self.values.lock() {
+                *guard
+                    .entry((self.name.clone(), self.labels.clone()))
+                    .or_insert(0) += value;
+            }
+        }
+
+        fn absolute(&self, value: u64) {
+            if let Ok(mut guard) = self.values.lock() {
+                guard.insert((self.name.clone(), self.labels.clone()), value);
+            }
+        }
+    }
+
+    #[derive(Default, Clone)]
+    struct PipelineTestRecorder {
+        counters: CounterMap,
+    }
+
+    impl Recorder for PipelineTestRecorder {
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
+        }
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+        fn describe_histogram(
+            &self,
+            _key: KeyName,
+            _unit: Option<Unit>,
+            _description: SharedString,
+        ) {
+        }
+
+        fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            let labels = key
+                .labels()
+                .map(|l| (l.key().to_string(), l.value().to_string()))
+                .collect();
+            Counter::from_arc(Arc::new(PipelineTestCounter {
+                name: key.name().to_string(),
+                labels,
+                values: Arc::clone(&self.counters),
+            }))
+        }
+
+        fn register_gauge(&self, _key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            Gauge::noop()
+        }
+
+        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
+    fn init_pipeline_test_recorder() -> CounterMap {
+        static COUNTERS: OnceLock<CounterMap> = OnceLock::new();
+        COUNTERS
+            .get_or_init(|| {
+                let map: CounterMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+                let recorder = PipelineTestRecorder {
+                    counters: Arc::clone(&map),
+                };
+                let _ = ::metrics::set_global_recorder(recorder);
+                map
+            })
+            .clone()
+    }
 
     #[tokio::test]
     async fn pipeline_flush_failure_marks_ack_errored() {
@@ -1269,5 +1355,242 @@ shutdown:
             .await
             .expect("shard_loop should exit when output_tx is closed")
             .expect("shard_loop task should not panic");
+    }
+
+    #[tokio::test]
+    async fn retry_ticks_reuse_last_watermark_avoiding_forced_close() {
+        let _serial = TEST_SERIAL.lock().await;
+        let counters = init_pipeline_test_recorder();
+        if let Ok(mut guard) = counters.lock() {
+            guard.insert(
+                (
+                    "logsluice_forced_closes_total".to_string(),
+                    vec![("shard".to_string(), "0".to_string())],
+                ),
+                0,
+            );
+            guard.insert(
+                (
+                    "logsluice_events_ingested_total".to_string(),
+                    vec![("shard".to_string(), "0".to_string())],
+                ),
+                0,
+            );
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let yaml = format!(
+            r#"
+storage:
+  data_dir: {:?}
+  l1_flush_interval: 10ms
+  sync_wal: false
+shards: 1
+window:
+  type: tumbling
+  duration: 10s
+  allowed_skew: 1s
+  allowed_lateness: 2s
+  late_emit_interval: 20ms
+  max_close_delay: 2s
+  max_future_drift: 2d
+  emit:
+    close_jitter_max: 0s
+group_by:
+  - source.ip
+aggregations:
+  event_count: count
+shutdown:
+  drain_timeout: 500ms
+"#,
+            dir.path()
+        );
+
+        let cfg: SluiceConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        std::fs::create_dir_all(&cfg.storage.data_dir).unwrap();
+        let shard_dir = cfg.storage.data_dir.join("shard_0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        let codec_schema = cfg.codec_schema();
+        let pod_meta = PodMeta::load_or_init_with_window(
+            &cfg.storage.data_dir,
+            cfg.shards,
+            &codec_schema,
+            Some(cfg.output.emitter_id.as_str()),
+            cfg.window.duration.as_millis() as i64,
+            cfg.window.offset.as_millis() as i64,
+        )
+        .unwrap();
+
+        let (engine, plan) = cfg.clone().into_engine_and_plan().unwrap();
+        let engine = Arc::new(engine);
+        let plan = Arc::new(plan);
+        let clock = WindowClock::new(cfg.window.duration, cfg.window.offset).unwrap();
+        let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+
+        let store_opts = StoreOptions {
+            shard_dir,
+            cache_bytes: 1024 * 1024,
+            hdr_memtable_bytes: 1024 * 1024,
+            tail_memtable_bytes: 1024 * 1024,
+            sync_wal: false,
+            layout: plan.layout(),
+            worker_threads: 1,
+        };
+        let store = ShardStore::open(store_opts, &pod_meta).unwrap();
+        let worker_ctx = WorkerContext {
+            cfg: engine,
+            shard: 0,
+            emitter_id: Arc::from(pod_meta.emitter_id.as_str()),
+            kernels,
+            plan: Arc::clone(&plan),
+            clock,
+        };
+        let recovered = RecoveredState::load(&store, &worker_ctx).unwrap();
+        let (store_handle, store_events, store_thread) =
+            StoreThread::spawn::<AckFinalizers>(store, kernels).unwrap();
+        let mut worker = ShardWorker::new(worker_ctx, recovered, PurgeHorizon::new(0));
+
+        // Stall store thread and saturate command queue
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        store_handle
+            .try_send(StoreCommand::TestPause(Arc::clone(&barrier)))
+            .expect("enqueue TestPause");
+        barrier.wait();
+
+        for epoch_ms in 0..64 {
+            store_handle
+                .try_send(StoreCommand::DeleteKeys {
+                    epoch_ms,
+                    keys: Vec::new(),
+                })
+                .expect("fill bounded command queue");
+        }
+        worker.defer_command(StoreCommand::DeleteKeys {
+            epoch_ms: 0,
+            keys: Vec::new(),
+        });
+
+        let (shard_tx, shard_rx) = tokio_mpsc::channel::<ShardMessage>(64);
+        let (output_tx, _output_rx) = futures_mpsc::channel::<LogEvent>(64);
+        let router_stats = Arc::new(std::sync::Mutex::new(RouterStats::default()));
+        let detected_otlp = Arc::new(AtomicBool::new(false));
+
+        let shard_handle = tokio::spawn(shard_loop(
+            0,
+            worker,
+            store_handle.clone(),
+            store_events,
+            store_thread,
+            shard_rx,
+            shard_tx.clone(),
+            output_tx,
+            Arc::new(cfg),
+            plan,
+            router_stats,
+            detected_otlp,
+        ));
+
+        let now_wall = chrono::Utc::now().timestamp_millis();
+        let event_ms = now_wall - 20_000;
+        let window_end = clock.end_of(clock.start_of(event_ms));
+
+        // 1. Establish watermark >= window_end before the window is created
+        shard_tx
+            .send(ShardMessage::Poll {
+                watermark: Some(window_end),
+                now_ms: now_wall,
+            })
+            .await
+            .expect("send initial poll");
+
+        // 2. Ingest an item into that window
+        let resource = Arc::new(ResourceScopePayload {
+            resource: std::collections::BTreeMap::new(),
+            scope_name: "test".to_string(),
+            scope_version: "1.0".to_string(),
+            scope_attrs: std::collections::BTreeMap::new(),
+        });
+        let resource_hash = resource.canonical_hash();
+        let (ack_notifier, _ack_rx) = AckNotifier::new_with_receiver();
+        let item = IngestItem {
+            key: StorageKey24 {
+                epoch_ms: clock.start_of(event_ms) as u64,
+                digest: 1,
+            },
+            resource,
+            resource_hash,
+            position: None,
+            event_ms,
+            counters: vec![[1, 0, 0, 0]],
+            minmax_values: Vec::new(),
+            exemplar: ExemplarSource::default(),
+        };
+
+        shard_tx
+            .send(ShardMessage::Ingest {
+                items: vec![item],
+                finalizer: AckFinalizers::from_single(ack_notifier),
+            })
+            .await
+            .expect("send ingest");
+
+        // 3. Wait for drain_interval.tick() (25ms) to fire and execute worker.poll(...)
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // 4. Send Poll to trigger metrics export
+        shard_tx
+            .send(ShardMessage::Poll {
+                watermark: Some(window_end),
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            })
+            .await
+            .expect("send second poll");
+
+        let start = std::time::Instant::now();
+        loop {
+            let ingested = counters
+                .lock()
+                .unwrap()
+                .get(&(
+                    "logsluice_events_ingested_total".to_string(),
+                    vec![("shard".to_string(), "0".to_string())],
+                ))
+                .copied()
+                .unwrap_or(0);
+            if ingested == 1 {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(2) {
+                panic!(
+                    "timed out waiting for shard_loop to process second Poll and export metrics"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let forced_closes = counters
+            .lock()
+            .unwrap()
+            .get(&(
+                "logsluice_forced_closes_total".to_string(),
+                vec![("shard".to_string(), "0".to_string())],
+            ))
+            .copied()
+            .unwrap_or(0);
+
+        // Before the fix: drain_interval.tick() calls worker.poll(None, now_ms),
+        // treating the window close as forced (forced_closes == 1).
+        // With the fix: shard_loop retains last_watermark (Some(window_end)),
+        // closing cleanly (forced_closes == 0).
+        assert_eq!(forced_closes, 0);
+
+        // Cleanup
+        barrier.wait();
+        shard_tx
+            .send(ShardMessage::Drain { deadline_ms: 0 })
+            .await
+            .expect("send drain");
+        shard_handle.await.expect("join shard_handle");
     }
 }

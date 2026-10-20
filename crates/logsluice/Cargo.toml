@@ -31,6 +31,11 @@ tokio = { workspace = true }
 xxhash-rust = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 serde_yaml_ng = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
+
+[[bench]]
+name = "hot_path"
+harness = false

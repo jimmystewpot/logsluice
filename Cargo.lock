@@ -740,6 +740,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "chrono",
+ "criterion",
  "futures",
  "hashbrown 0.17.1",
  "humantime-serde",

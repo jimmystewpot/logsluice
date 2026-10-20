@@ -6,6 +6,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Write,
     sync::Arc,
 };
 
@@ -14,6 +15,19 @@ use hashbrown::hash_map::Entry;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AggError, AggResult};
+
+struct HashWriter(xxhash_rust::xxh3::Xxh3);
+
+impl Write for HashWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Payload describing OpenTelemetry resource and instrumentation scope metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,8 +67,9 @@ impl ResourceScopePayload {
     /// Returns 0 in the unexpected event of serialization failure without panicking.
     #[must_use]
     pub fn canonical_hash(&self) -> u64 {
-        match serde_json::to_vec(self) {
-            Ok(bytes) => xxhash_rust::xxh3::xxh3_64(&bytes),
+        let mut writer = HashWriter(xxhash_rust::xxh3::Xxh3::new());
+        match serde_json::to_writer(&mut writer, self) {
+            Ok(()) => writer.0.digest(),
             Err(_) => 0,
         }
     }
@@ -284,5 +299,23 @@ impl ResourceScopeTable {
                 return Err(AggError::Config("resource id space exhausted".to_string()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    #[test]
+    fn hash_writer_chunked_matches_oneshot() {
+        let mut writer = HashWriter(xxhash_rust::xxh3::Xxh3::new());
+        let data = b"{\"resource\":{\"service.name\":\"auth\"},\"scope_name\":\"s\",\"scope_version\":\"1\",\"scope_attrs\":{}}";
+        for chunk in data.chunks(7) {
+            assert!(writer.write_all(chunk).is_ok());
+        }
+        assert!(writer.flush().is_ok());
+        assert_eq!(writer.0.digest(), xxhash_rust::xxh3::xxh3_64(data));
     }
 }

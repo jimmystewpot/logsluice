@@ -482,3 +482,221 @@ fn recovery_rows_failure_retries_on_next_poll() {
     h.advance(DAY + 3_700_000, Some(DAY + 3_600_001));
     assert!(h.live_windows().is_empty());
 }
+
+#[test]
+fn worker_poll_performs_no_filesystem_io_for_spill() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use logsluice_core::{
+        codec::{header::NumericHeader, plan::AggregationPlan},
+        config::EngineConfig,
+        key::StorageKey24,
+        resource::ResourceScopePayload,
+        simd::{SimdKernelTable, SimdMode},
+        store::{
+            shard_store::{FlushStats, JoinedRow},
+            thread::{StoreCommand, StoreEvent},
+        },
+        window::WindowClock,
+        worker::{
+            ExemplarSource, IngestItem, PurgeHorizon, RecoveredState, ShardWorker, WorkerContext,
+        },
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cfg = EngineConfig::default();
+    cfg.output.emitter_id = "pod-0".to_string();
+    cfg.storage.data_dir = dir.path().to_path_buf();
+    cfg.window.emit.close_jitter_max = Duration::ZERO;
+    cfg.window.max_closing_duration = Duration::from_secs(60);
+    cfg.aggregations = common::spec_example();
+    let cfg = Arc::new(cfg);
+
+    let plan = Arc::new(AggregationPlan::new(&cfg.aggregations).expect("plan"));
+    let kernels = SimdKernelTable::detect(SimdMode::Scalar);
+    let clock = WindowClock::new(cfg.window.duration, cfg.window.offset).expect("clock");
+    let ctx = WorkerContext {
+        cfg: Arc::clone(&cfg),
+        shard: 0,
+        emitter_id: Arc::from("pod-0"),
+        kernels,
+        plan: Arc::clone(&plan),
+        clock,
+    };
+
+    let mut worker: ShardWorker<u32> =
+        ShardWorker::new(ctx, RecoveredState::empty(), PurgeHorizon::new(0));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+    let res = Arc::new(ResourceScopePayload {
+        resource: [(
+            "service.name".to_string(),
+            serde_json::json!("test-service"),
+        )]
+        .into(),
+        scope_name: "test-scope".to_string(),
+        scope_version: "1.0.0".to_string(),
+        scope_attrs: Default::default(),
+    });
+    let res_hash = res.canonical_hash();
+    let key = StorageKey24 {
+        epoch_ms: 0,
+        digest: 1,
+    };
+    worker.ingest(
+        vec![IngestItem {
+            key,
+            resource: res,
+            resource_hash: res_hash,
+            position: None,
+            event_ms: 1_000,
+            counters: vec![[1, 0, 0, 0]],
+            minmax_values: vec![1_000, 1_000],
+            exemplar: ExemplarSource::default(),
+        }],
+        0,
+        1_000,
+    );
+
+    // Advance to window close -> Flush
+    let out1 = worker.poll(Some(DAY), DAY + 31_000);
+    assert!(
+        out1.commands
+            .iter()
+            .any(|c| matches!(c, StoreCommand::Flush(_)))
+    );
+
+    // FlushDone -> Rows
+    let out2 = worker.on_event(
+        StoreEvent::FlushDone {
+            finalizers: vec![0],
+            stats: FlushStats::default(),
+            disk_bytes: 0,
+        },
+        DAY + 31_000,
+    );
+    assert!(
+        out2.commands
+            .iter()
+            .any(|c| matches!(c, StoreCommand::Rows { .. }))
+    );
+
+    // Rows -> PersistTickets
+    let mut hdr = NumericHeader::new_zeroed(plan.layout(), 1);
+    hdr.total = vec![[1, 0, 0, 0]];
+    hdr.minmax = vec![(1_000, 1_000), (1_000, 1_000)];
+    let out3 = worker.on_event(
+        StoreEvent::Rows {
+            epoch_ms: 0,
+            reason: EmitReason::Close,
+            rows: vec![JoinedRow {
+                key,
+                header: hdr,
+                tail: Some(common::tail()),
+            }],
+            next_after: None,
+            recovery_ticket: None,
+        },
+        DAY + 31_000,
+    );
+    let ticket_id = out3
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            StoreCommand::PersistTickets(ts) => Some(ts[0].id),
+            _ => None,
+        })
+        .expect("PersistTickets command");
+
+    // TicketsPersisted -> emits batch
+    let out4 = worker.on_event(StoreEvent::TicketsPersisted(vec![ticket_id]), DAY + 31_000);
+    assert_eq!(out4.emit.len(), 1);
+
+    // Nack the emitted ticket and poll past max_closing_duration
+    let _ = worker.on_ack(ticket_id, false, DAY + 31_000);
+    let spill_out = worker.poll(Some(DAY), DAY + 92_000);
+
+    // Tempdir must stay completely empty after poll — no filesystem I/O on worker thread!
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "worker.poll must not perform filesystem I/O for spill"
+    );
+    assert!(
+        spill_out.commands.iter().any(|c| matches!(
+            c,
+            StoreCommand::Spill {
+                ticket_id: id,
+                records,
+            } if *id == ticket_id && records.len() == 1
+        )),
+        "expected StoreCommand::Spill, got {:?}",
+        spill_out.commands
+    );
+}
+
+#[test]
+fn spill_failure_keeps_unacked_ticket() {
+    let mut h = Harness::new(|c| {
+        c.window.emit.close_jitter_max = std::time::Duration::ZERO;
+        c.window.max_closing_duration = std::time::Duration::from_secs(60);
+    });
+    h.ingest(&[(1, 1_000)]);
+    h.advance(DAY + 31_000, Some(DAY));
+    let first = h.drain_emitted();
+    assert_eq!(first.len(), 1);
+    h.nack_all();
+
+    // Inject spill failure on the store thread before advancing past max_closing_duration.
+    h.fail_next_spill();
+    h.advance(DAY + 92_000, Some(DAY));
+
+    // Spill failed: no spill file created, and the ticket must remain unacked in the ledger.
+    assert_eq!(h.spill_files(), 0);
+    assert_eq!(h.stats().spill_files, 0);
+    assert!(h.worker().has_inflight_tickets());
+    assert_eq!(h.stats().tickets_inflight, 1);
+
+    // Next poll retries the spill and succeeds.
+    h.advance(DAY + 93_000, Some(DAY));
+    assert_eq!(h.spill_files(), 1);
+    assert_eq!(h.stats().spill_files, 1);
+    assert!(!h.worker().has_inflight_tickets());
+    assert_eq!(h.stats().tickets_inflight, 0);
+}
+
+#[test]
+fn spill_file_count_is_cached_not_read_per_stats() {
+    let mut h = Harness::new(|c| {
+        c.window.emit.close_jitter_max = std::time::Duration::ZERO;
+        c.window.max_closing_duration = std::time::Duration::from_secs(60);
+    });
+    h.ingest(&[(1, 1_000)]);
+    h.advance(DAY + 31_000, Some(DAY));
+    let _ = h.drain_emitted();
+    h.nack_all();
+
+    // Trigger spill (92s > 60s max_closing_duration).
+    h.advance(DAY + 92_000, Some(DAY));
+    assert_eq!(h.stats().spill_files, 1);
+
+    // Mutate the spill directory directly on disk behind the store thread's back.
+    // Because ShardWorker caches the spill file count instead of calling read_dir on every stats() call,
+    // stats().spill_files must remain 1.
+    let spill_dir = h.data_dir().join("shard_0").join("spill");
+    std::fs::create_dir_all(&spill_dir).unwrap();
+    let bogus_file = spill_dir.join("00000000000000000999.ndjson");
+    std::fs::write(&bogus_file, b"{}\n").unwrap();
+    assert_eq!(h.stats().spill_files, 1);
+    assert_eq!(h.spill_files(), 1);
+    std::fs::remove_file(&bogus_file).unwrap();
+
+    // Replay and acknowledge the spilled ticket; cached count drops to 0.
+    h.advance(DAY + 153_000, Some(DAY));
+    let replayed = h.drain_emitted();
+    assert_eq!(replayed.len(), 1);
+    h.ack_all();
+    assert_eq!(h.stats().spill_files, 0);
+    assert_eq!(h.spill_files(), 0);
+}

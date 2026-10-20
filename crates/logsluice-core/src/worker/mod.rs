@@ -125,9 +125,9 @@ impl PurgeHorizon {
         self.0.load(Ordering::Acquire)
     }
 
-    /// Updates the purge horizon value.
+    /// Advances the purge horizon to at least `horizon`, never lowering the current value.
     pub fn set(&self, horizon: i64) {
-        self.0.store(horizon, Ordering::Release);
+        self.0.fetch_max(horizon, Ordering::AcqRel);
     }
 }
 
@@ -1335,5 +1335,18 @@ impl<F> ShardWorker<F> {
         let mut epochs: Vec<u64> = self.windows.keys().copied().collect();
         epochs.sort_unstable();
         epochs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn purge_horizon_never_regresses() {
+        let h = PurgeHorizon::new(0);
+        h.set(200);
+        h.set(100);
+        assert_eq!(h.get(), 200);
     }
 }

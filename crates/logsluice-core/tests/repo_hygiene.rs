@@ -80,6 +80,24 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
         "release.yml must install both build-essential and gcc-aarch64-linux-gnu"
     );
 
+    let bench_wf = fs::read_to_string(root.join(".github/workflows/benchmarks.yml")).unwrap();
+    assert!(
+        bench_wf.contains("external-data-json-path: target/bench-data/benchmark-data.json"),
+        "benchmarks.yml must configure external-data-json-path so github-action-benchmark does not fail fetching a missing gh-pages branch"
+    );
+    assert!(
+        bench_wf.contains("actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"),
+        "benchmarks.yml must cache target/bench-data with pinned actions/cache"
+    );
+    assert!(
+        bench_wf.contains("summary-always: true"),
+        "benchmarks.yml must enable summary-always for job summary output"
+    );
+    assert!(
+        bench_wf.contains("set -o pipefail"),
+        "benchmarks.yml must set -o pipefail when piping cargo bench output to tee"
+    );
+
     let dependabot = fs::read_to_string(root.join(".github/dependabot.yml")).unwrap();
     assert!(dependabot.contains("package-ecosystem: \"cargo\""));
     assert!(dependabot.contains("package-ecosystem: \"github-actions\""));

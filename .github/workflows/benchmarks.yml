@@ -34,7 +34,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: arc-runner-logsluice
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install C linker and build tools
@@ -46,16 +46,27 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+      - name: Cache benchmark history
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/bench-data
+          key: ${{ runner.os }}-bench-data-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-bench-data-
       - name: Run Criterion hot_path in bencher format
-        run: cargo bench -p logsluice-core --bench hot_path -- --output-format bencher | tee bench-output.txt
+        run: |
+          set -o pipefail
+          cargo bench -p logsluice-core --bench hot_path -- --output-format bencher | tee bench-output.txt
       - name: Record benchmark result
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: logsluice-core Criterion Benchmarks
           tool: "cargo"
           output-file-path: bench-output.txt
+          external-data-json-path: target/bench-data/benchmark-data.json
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: false
+          summary-always: true
           alert-threshold: "150%"
           comment-on-alert: false
           fail-on-alert: false

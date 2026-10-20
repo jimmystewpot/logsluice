@@ -535,6 +535,170 @@ impl ShardStore {
         Ok(results)
     }
 
+    /// Maximum consecutive entries to skip before re-seeking a range iterator in [`Self::rows_for_sorted`].
+    const RESEED_AFTER_SKIPPED: usize = 32;
+
+    /// Performs a sorted forward merge-join across header and tail keyspaces for the given keys.
+    ///
+    /// Results are returned in strictly ascending order by [`StorageKey24`]. Missing keys are
+    /// omitted, and duplicate keys in the input are collapsed.
+    ///
+    /// Sequential forward range iterators are advanced in lockstep. If more than
+    /// [`Self::RESEED_AFTER_SKIPPED`] consecutive entries are skipped without a match, the iterator
+    /// re-seeks directly to the next requested key to avoid O(N) scanning over sparse gaps.
+    ///
+    /// In accordance with AGENTS.md invariant 3, this function never calls [`Keyspace::get`]
+    /// or [`Self::counted_get`], preventing random disk I/O during window close and drain operations.
+    ///
+    /// # Errors
+    /// Returns [`AggError::Storage`] or [`AggError::Codec`] if reading or decoding fails.
+    pub fn rows_for_sorted(&self, keys: &[StorageKey24]) -> AggResult<Vec<JoinedRow>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut sorted_keys = keys.to_vec();
+        sorted_keys.sort_unstable();
+        sorted_keys.dedup();
+
+        let mut results = Vec::with_capacity(sorted_keys.len());
+
+        let mut start = 0;
+        while start < sorted_keys.len() {
+            let epoch_ms = sorted_keys[start].epoch_ms;
+            let mut end = start + 1;
+            while end < sorted_keys.len() && sorted_keys[end].epoch_ms == epoch_ms {
+                end += 1;
+            }
+            let epoch_keys = &sorted_keys[start..end];
+            start = end;
+
+            let Some(hdr_ks) = self.get_hdr_keyspace(epoch_ms) else {
+                continue;
+            };
+            let tail_ks = self.get_tail_keyspace(epoch_ms);
+
+            let first_key = epoch_keys[0];
+            let mut hdr_iter = hdr_ks.range((
+                std::ops::Bound::Included(first_key.to_bytes()),
+                std::ops::Bound::Unbounded,
+            ));
+            let mut tail_iter = tail_ks.as_ref().map(|t_ks| {
+                t_ks.range((
+                    std::ops::Bound::Included(first_key.to_bytes()),
+                    std::ops::Bound::Unbounded,
+                ))
+            });
+
+            let mut next_hdr: Option<(fjall::Slice, fjall::Slice)> = None;
+            let mut next_tail: Option<(fjall::Slice, fjall::Slice)> = None;
+
+            for &wanted_key in epoch_keys {
+                let wanted_bytes = wanted_key.to_bytes();
+                let mut hdr_skipped = 0;
+
+                loop {
+                    if next_hdr.is_none() {
+                        if hdr_skipped >= Self::RESEED_AFTER_SKIPPED {
+                            hdr_iter = hdr_ks.range((
+                                std::ops::Bound::Included(wanted_bytes),
+                                std::ops::Bound::Unbounded,
+                            ));
+                            hdr_skipped = 0;
+                        }
+                        if let Some(guard) = hdr_iter.next() {
+                            next_hdr = Some(guard.into_inner()?);
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if let Some((ref hk, _)) = next_hdr {
+                        match hk.as_ref().cmp(wanted_bytes.as_ref()) {
+                            std::cmp::Ordering::Less => {
+                                next_hdr = None;
+                                hdr_skipped += 1;
+                            }
+                            std::cmp::Ordering::Equal => {
+                                break;
+                            }
+                            std::cmp::Ordering::Greater => {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let has_match = match next_hdr {
+                    Some((ref hk, _)) => hk.as_ref() == wanted_bytes.as_ref(),
+                    None => false,
+                };
+                if !has_match {
+                    if next_hdr.is_none() {
+                        // Header iterator reached end of keyspace; remaining wanted keys in this epoch cannot exist.
+                        break;
+                    }
+                    continue;
+                }
+
+                let Some((_k_bytes, v_bytes)) = next_hdr.take() else {
+                    continue;
+                };
+
+                let header = NumericHeader::decode(self.opts.layout, &v_bytes)?;
+
+                let mut tail = None;
+                if let Some(ref t_ks) = tail_ks {
+                    if let Some(ref mut t_iter) = tail_iter {
+                        let mut tail_skipped = 0;
+                        loop {
+                            if next_tail.is_none() {
+                                if tail_skipped >= Self::RESEED_AFTER_SKIPPED {
+                                    *t_iter = t_ks.range((
+                                        std::ops::Bound::Included(wanted_bytes),
+                                        std::ops::Bound::Unbounded,
+                                    ));
+                                    tail_skipped = 0;
+                                }
+                                if let Some(t_guard) = t_iter.next() {
+                                    next_tail = Some(t_guard.into_inner()?);
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            if let Some((ref tk, _)) = next_tail {
+                                match tk.as_ref().cmp(wanted_bytes.as_ref()) {
+                                    std::cmp::Ordering::Less => {
+                                        next_tail = None;
+                                        tail_skipped += 1;
+                                    }
+                                    std::cmp::Ordering::Equal => {
+                                        if let Some((_, tv)) = next_tail.take() {
+                                            tail = Some(ExemplarTail::decode(&tv)?);
+                                        }
+                                        break;
+                                    }
+                                    std::cmp::Ordering::Greater => {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                results.push(JoinedRow {
+                    key: wanted_key,
+                    header,
+                    tail,
+                });
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Looks up multiple keys in sorted order, performing merge joins on existing records.
     ///
     /// # Errors

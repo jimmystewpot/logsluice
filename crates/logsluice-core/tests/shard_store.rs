@@ -30,17 +30,27 @@ fn opts(dir: &std::path::Path) -> StoreOptions {
 }
 
 fn entry(d: u128, new: bool, n: u64) -> FlushEntry {
+    entry_with_epoch_and_tail(0, d, new, new, n)
+}
+
+fn entry_with_epoch_and_tail(
+    epoch_ms: u64,
+    d: u128,
+    is_new: bool,
+    with_tail: bool,
+    n: u64,
+) -> FlushEntry {
     FlushEntry {
         key: StorageKey24 {
-            epoch_ms: 0,
+            epoch_ms,
             digest: d,
         },
-        is_new: new,
+        is_new,
         resource_scope_id: 1,
         delta: vec![[n, 0, 0, 0]],
         minmax: vec![(5, 5), (5, 5)],
         last_update_s: 1,
-        tail: new.then(|| ExemplarTail {
+        tail: with_tail.then(|| ExemplarTail {
             severity: 9,
             body: None,
             dims: vec![],
@@ -216,9 +226,9 @@ fn rows_for_window_keys_resources_and_disk_bytes() {
     };
     s.apply_flush(b, &k).unwrap();
 
-    // rows_for
+    // rows_for_sorted
     let rows = s
-        .rows_for(&[
+        .rows_for_sorted(&[
             StorageKey24 {
                 epoch_ms: 0,
                 digest: 10,
@@ -893,4 +903,301 @@ fn rows_for_increments_scan_point_gets() {
     assert_eq!(rows.len(), 2);
     // 2 keys * 2 gets (hdr + tail) = 4 point gets
     assert_eq!(store.scan_point_gets(), 4);
+}
+
+#[test]
+fn rows_for_sorted_returns_dense_keys_in_key_order_with_tails() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+    let mut store = ShardStore::open(opts(d.path()), &meta).unwrap();
+
+    let mut entries = Vec::with_capacity(100);
+    for digest in 1..=100 {
+        let with_tail = digest % 2 == 0;
+        entries.push(entry_with_epoch_and_tail(
+            0,
+            digest,
+            true,
+            with_tail,
+            digest as u64,
+        ));
+    }
+    store.apply_flush(batch(entries), &k).unwrap();
+
+    // Pass keys in reverse order to verify sorting
+    let input_keys: Vec<StorageKey24> = (1..=100)
+        .rev()
+        .map(|digest| StorageKey24 {
+            epoch_ms: 0,
+            digest,
+        })
+        .collect();
+
+    let rows = store.rows_for_sorted(&input_keys).unwrap();
+    assert_eq!(rows.len(), 100);
+    for (i, row) in rows.iter().enumerate() {
+        let expected_digest = (i + 1) as u128;
+        assert_eq!(row.key.epoch_ms, 0);
+        assert_eq!(row.key.digest, expected_digest);
+        assert_eq!(row.header.total[0][0], expected_digest as u64);
+        if expected_digest % 2 == 0 {
+            assert!(row.tail.is_some());
+        } else {
+            assert!(row.tail.is_none());
+        }
+    }
+    assert_eq!(store.scan_point_gets(), 0);
+}
+
+#[test]
+fn rows_for_sorted_skips_missing_keys_and_collapses_duplicates() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+    let mut store = ShardStore::open(opts(d.path()), &meta).unwrap();
+
+    store
+        .apply_flush(
+            batch(vec![
+                entry(10, true, 100),
+                entry(20, true, 200),
+                entry(30, true, 300),
+            ]),
+            &k,
+        )
+        .unwrap();
+
+    // Query with duplicates, missing keys (5, 25, 40), and out-of-order
+    let query_keys = vec![
+        StorageKey24 {
+            epoch_ms: 0,
+            digest: 20,
+        },
+        StorageKey24 {
+            epoch_ms: 0,
+            digest: 5,
+        },
+        StorageKey24 {
+            epoch_ms: 0,
+            digest: 20,
+        },
+        StorageKey24 {
+            epoch_ms: 0,
+            digest: 10,
+        },
+        StorageKey24 {
+            epoch_ms: 0,
+            digest: 25,
+        },
+        StorageKey24 {
+            epoch_ms: 0,
+            digest: 30,
+        },
+        StorageKey24 {
+            epoch_ms: 0,
+            digest: 20,
+        },
+        StorageKey24 {
+            epoch_ms: 0,
+            digest: 40,
+        },
+    ];
+
+    let rows = store.rows_for_sorted(&query_keys).unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].key.digest, 10);
+    assert_eq!(rows[0].header.total[0][0], 100);
+    assert_eq!(rows[1].key.digest, 20);
+    assert_eq!(rows[1].header.total[0][0], 200);
+    assert_eq!(rows[2].key.digest, 30);
+    assert_eq!(rows[2].header.total[0][0], 300);
+    assert_eq!(store.scan_point_gets(), 0);
+}
+
+#[test]
+fn rows_for_sorted_sparse_keys_across_large_window_reseeks() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+    let mut store = ShardStore::open(opts(d.path()), &meta).unwrap();
+
+    // 5,000 keys
+    let entries: Vec<FlushEntry> = (0..5000).map(|d| entry(d, true, d as u64)).collect();
+    store.apply_flush(batch(entries), &k).unwrap();
+
+    // Request digests 1, 2,500, 4,999
+    let query_keys = vec![
+        StorageKey24 {
+            epoch_ms: 0,
+            digest: 1,
+        },
+        StorageKey24 {
+            epoch_ms: 0,
+            digest: 2500,
+        },
+        StorageKey24 {
+            epoch_ms: 0,
+            digest: 4999,
+        },
+    ];
+
+    let rows = store.rows_for_sorted(&query_keys).unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].key.digest, 1);
+    assert_eq!(rows[0].header.total[0][0], 1);
+    assert!(rows[0].tail.is_some());
+
+    assert_eq!(rows[1].key.digest, 2500);
+    assert_eq!(rows[1].header.total[0][0], 2500);
+    assert!(rows[1].tail.is_some());
+
+    assert_eq!(rows[2].key.digest, 4999);
+    assert_eq!(rows[2].header.total[0][0], 4999);
+    assert!(rows[2].tail.is_some());
+
+    assert_eq!(store.scan_point_gets(), 0);
+}
+
+#[test]
+fn rows_for_sorted_spans_multiple_epochs_and_absent_epoch() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+    let mut store = ShardStore::open(opts(d.path()), &meta).unwrap();
+
+    // Epoch 1000: digests 1, 2
+    // Epoch 2000: digests 3, 4
+    let entries = vec![
+        entry_with_epoch_and_tail(1000, 1, true, true, 10),
+        entry_with_epoch_and_tail(1000, 2, true, false, 20),
+        entry_with_epoch_and_tail(2000, 3, true, true, 30),
+        entry_with_epoch_and_tail(2000, 4, true, false, 40),
+    ];
+    store.apply_flush(batch(entries), &k).unwrap();
+
+    // Query keys from epoch 1000, absent epoch 1500, epoch 2000, and absent epoch 3000
+    let query_keys = vec![
+        StorageKey24 {
+            epoch_ms: 1000,
+            digest: 2,
+        },
+        StorageKey24 {
+            epoch_ms: 1000,
+            digest: 1,
+        },
+        StorageKey24 {
+            epoch_ms: 1500,
+            digest: 99,
+        },
+        StorageKey24 {
+            epoch_ms: 2000,
+            digest: 4,
+        },
+        StorageKey24 {
+            epoch_ms: 2000,
+            digest: 3,
+        },
+        StorageKey24 {
+            epoch_ms: 3000,
+            digest: 50,
+        },
+    ];
+
+    let rows = store.rows_for_sorted(&query_keys).unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        rows[0].key,
+        StorageKey24 {
+            epoch_ms: 1000,
+            digest: 1
+        }
+    );
+    assert_eq!(rows[0].header.total[0][0], 10);
+    assert!(rows[0].tail.is_some());
+
+    assert_eq!(
+        rows[1].key,
+        StorageKey24 {
+            epoch_ms: 1000,
+            digest: 2
+        }
+    );
+    assert_eq!(rows[1].header.total[0][0], 20);
+    assert!(rows[1].tail.is_none());
+
+    assert_eq!(
+        rows[2].key,
+        StorageKey24 {
+            epoch_ms: 2000,
+            digest: 3
+        }
+    );
+    assert_eq!(rows[2].header.total[0][0], 30);
+    assert!(rows[2].tail.is_some());
+
+    assert_eq!(
+        rows[3].key,
+        StorageKey24 {
+            epoch_ms: 2000,
+            digest: 4
+        }
+    );
+    assert_eq!(rows[3].header.total[0][0], 40);
+    assert!(rows[3].tail.is_none());
+
+    assert_eq!(store.scan_point_gets(), 0);
+}
+
+#[test]
+fn rows_for_sorted_matches_header_and_tail_point_lookups() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+    let mut store = ShardStore::open(opts(d.path()), &meta).unwrap();
+
+    let mut entries = Vec::with_capacity(50);
+    for digest in 1..=50 {
+        let with_tail = digest % 3 != 0;
+        entries.push(entry_with_epoch_and_tail(
+            0,
+            digest,
+            true,
+            with_tail,
+            digest as u64 * 7,
+        ));
+    }
+    store.apply_flush(batch(entries), &k).unwrap();
+
+    let keys: Vec<StorageKey24> = (1..=50)
+        .map(|digest| StorageKey24 {
+            epoch_ms: 0,
+            digest,
+        })
+        .collect();
+
+    let rows = store.rows_for_sorted(&keys).unwrap();
+    assert_eq!(rows.len(), 50);
+
+    // Cross-check each returned row against header() and tail()
+    // Notice header() and tail() increment scan_point_gets(), so we assert 0 before point lookups
+    assert_eq!(store.scan_point_gets(), 0);
+
+    for row in &rows {
+        let h = store
+            .header(&row.key)
+            .unwrap()
+            .expect("header should exist");
+        assert_eq!(row.header.total, h.total);
+        assert_eq!(row.header.last_update_s, h.last_update_s);
+
+        let t = store.tail(&row.key).unwrap();
+        assert_eq!(
+            row.tail.as_ref().map(|x| x.severity),
+            t.as_ref().map(|x| x.severity)
+        );
+    }
+
+    // 50 headers + 50 tails looked up via point lookups = 100 point gets
+    assert_eq!(store.scan_point_gets(), 100);
 }

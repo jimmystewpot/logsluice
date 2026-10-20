@@ -30,6 +30,8 @@ pub fn export(shard: u16, stats: &WorkerStats, router: &RouterStats) {
     gauge!("logsluice_resources_table_entries", "shard" => shard_str.clone())
         .set(stats.resources_table_entries as f64);
     gauge!("logsluice_spill_files", "shard" => shard_str.clone()).set(stats.spill_files as f64);
+    counter!("logsluice_spill_quarantined_total", "shard" => shard_str.clone())
+        .absolute(stats.spill_quarantined_total);
     gauge!("logsluice_store_cmd_queue_depth", "shard" => shard_str.clone())
         .set(stats.store_cmd_queue_depth as f64);
     counter!("logsluice_dropped_events_total", "shard" => shard_str)
@@ -137,5 +139,26 @@ mod tests {
             vec![("shard".to_string(), "2".to_string())],
         ));
         assert_eq!(val, Some(&7));
+    }
+
+    #[test]
+    fn exports_spill_quarantined_total_counter() {
+        let recorder = TestRecorder::default();
+        let stats = WorkerStats {
+            spill_quarantined_total: 3,
+            ..WorkerStats::default()
+        };
+        let router = RouterStats::default();
+
+        metrics::with_local_recorder(&recorder, || {
+            export(1, &stats, &router);
+        });
+
+        let counters = recorder.counters.lock().expect("lock");
+        let val = counters.get(&(
+            "logsluice_spill_quarantined_total".to_string(),
+            vec![("shard".to_string(), "1".to_string())],
+        ));
+        assert_eq!(val, Some(&3));
     }
 }

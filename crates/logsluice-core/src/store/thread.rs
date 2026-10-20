@@ -179,6 +179,8 @@ pub enum StoreEvent<F> {
         entries: Vec<(u64, Vec<SliceRecord>)>,
         /// Current count of pending `.ndjson` spill files on disk.
         spill_files: usize,
+        /// Number of corrupt spill files quarantined during this scan.
+        quarantined: u64,
     },
     /// Disk spill operation failed.
     SpillFailed {
@@ -528,21 +530,24 @@ impl StoreThread {
                                 }
                             }
                         }
-                        StoreCommand::ReplaySpill => match spill_writer.pending() {
-                            Ok(entries) => {
-                                let spill_files = spill_writer.count_files();
-                                let _ = tx_event.unbounded_send(StoreEvent::SpillReplay {
-                                    entries,
-                                    spill_files,
-                                });
+                        StoreCommand::ReplaySpill => {
+                            match spill_writer.pending_with_quarantined() {
+                                Ok((entries, quarantined)) => {
+                                    let spill_files = spill_writer.count_files();
+                                    let _ = tx_event.unbounded_send(StoreEvent::SpillReplay {
+                                        entries,
+                                        spill_files,
+                                        quarantined,
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
+                                        ticket_id: None,
+                                        error,
+                                    });
+                                }
                             }
-                            Err(error) => {
-                                let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
-                                    ticket_id: None,
-                                    error,
-                                });
-                            }
-                        },
+                        }
                         StoreCommand::RemoveSpill { ticket_id } => {
                             match spill_writer.remove(ticket_id) {
                                 Ok(()) => {

@@ -6,6 +6,10 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -15,6 +19,11 @@ jobs:
     runs-on: arc-runner-logsluice
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install C linker and build tools
+        run: |
+          if ! command -v cc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
+          fi
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -31,16 +40,23 @@ jobs:
     runs-on: arc-runner-logsluice
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
       - name: Run cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories licenses bans sources
+        run: cargo deny --all-features check advisories licenses bans sources
 
   test:
     name: Test
     runs-on: arc-runner-logsluice
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install C linker and build tools
+        run: |
+          if ! command -v cc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
+          fi
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust dependencies
@@ -53,6 +69,11 @@ jobs:
     runs-on: arc-runner-logsluice
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install C linker and build tools
+        run: |
+          if ! command -v cc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
+          fi
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust dependencies

@@ -231,7 +231,7 @@ pub struct ShardWorker<F> {
     last_flush_ms: i64,
     stats: WorkerStats,
     pending_commands: VecDeque<StoreCommand<F>>,
-    pending_rows: HashMap<u64, Vec<JoinedRow>>,
+    pending_rows: HashMap<u64, Arc<[JoinedRow]>>,
     disk_override: Option<u64>,
     disk_full: bool,
     cached_spill_files: usize,
@@ -1199,8 +1199,10 @@ impl<F> ShardWorker<F> {
                                 );
 
                                 if !tickets.is_empty() {
+                                    let shared_rows: Arc<[JoinedRow]> = Arc::from(to_evict);
                                     for ticket in &tickets {
-                                        self.pending_rows.insert(ticket.id, to_evict.clone());
+                                        self.pending_rows
+                                            .insert(ticket.id, Arc::clone(&shared_rows));
                                     }
                                     self.persist_tickets_inflight += 1;
                                     output.commands.push(StoreCommand::PersistTickets(tickets));
@@ -1219,8 +1221,10 @@ impl<F> ShardWorker<F> {
                     let has_tickets = !tickets.is_empty();
 
                     if has_tickets {
+                        let shared_rows: Arc<[JoinedRow]> = Arc::from(rows);
                         for ticket in &tickets {
-                            self.pending_rows.insert(ticket.id, rows.clone());
+                            self.pending_rows
+                                .insert(ticket.id, Arc::clone(&shared_rows));
                         }
                         self.persist_tickets_inflight += 1;
                         output.commands.push(StoreCommand::PersistTickets(tickets));
@@ -1650,6 +1654,10 @@ impl<F> ShardWorker<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::header::NumericHeader;
+    use crate::codec::plan::HeaderLayout;
+    use crate::config::{AggregationKind, AggregationSpec};
+    use crate::simd::SimdMode;
 
     #[test]
     fn purge_horizon_never_regresses() {
@@ -1657,5 +1665,76 @@ mod tests {
         h.set(200);
         h.set(100);
         assert_eq!(h.get(), 200);
+    }
+
+    #[test]
+    fn pending_rows_shared_across_chunks() {
+        let mut cfg = EngineConfig::default();
+        cfg.output.max_records_per_ticket = 100;
+        cfg.aggregations = vec![AggregationSpec {
+            name: "event_count".into(),
+            kind: AggregationKind::Count,
+            field: None,
+        }];
+        let cfg = Arc::new(cfg);
+        let plan = Arc::new(AggregationPlan::new(&cfg.aggregations).expect("valid plan"));
+        let clock =
+            WindowClock::new(cfg.window.duration, cfg.window.offset).expect("valid window clock");
+        let kernels = SimdKernelTable::detect(SimdMode::Scalar);
+        let ctx = WorkerContext {
+            cfg,
+            shard: 0,
+            emitter_id: Arc::from("pod-0"),
+            kernels,
+            plan,
+            clock,
+        };
+
+        let mut worker: ShardWorker<()> =
+            ShardWorker::new(ctx, RecoveredState::empty(), PurgeHorizon::new(0));
+
+        let layout = HeaderLayout {
+            banks: 1,
+            minmax_slots: 0,
+        };
+        let rows: Vec<JoinedRow> = (0..1000u128)
+            .map(|digest| {
+                let mut header = NumericHeader::new_zeroed(layout, 1);
+                header.total[0] = [1, 0, 0, 0];
+                JoinedRow {
+                    key: StorageKey24 {
+                        epoch_ms: 0,
+                        digest,
+                    },
+                    header,
+                    tail: None,
+                }
+            })
+            .collect();
+
+        let out = worker.on_event(
+            StoreEvent::Rows {
+                epoch_ms: 0,
+                reason: EmitReason::Close,
+                rows,
+                next_after: None,
+                recovery_ticket: None,
+            },
+            0,
+        );
+
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(
+            &out.commands[0],
+            StoreCommand::PersistTickets(tickets) if tickets.len() == 10
+        ));
+        assert_eq!(worker.pending_rows.len(), 10);
+
+        let first_arc = worker.pending_rows.values().next().expect("non-empty");
+        for rows_arc in worker.pending_rows.values() {
+            assert_eq!(Arc::strong_count(rows_arc), 10);
+            assert!(Arc::ptr_eq(first_arc, rows_arc));
+            assert_eq!(rows_arc.len(), 1000);
+        }
     }
 }

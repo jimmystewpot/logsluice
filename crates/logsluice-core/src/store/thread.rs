@@ -431,7 +431,7 @@ impl StoreThread {
                                 continue;
                             }
                             if let Some(ref ks) = keys {
-                                match store.rows_for(ks) {
+                                match store.rows_for_sorted(ks) {
                                     Ok(rows) => {
                                         let _ = tx_event.unbounded_send(StoreEvent::Rows {
                                             epoch_ms,

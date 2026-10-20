@@ -542,3 +542,55 @@ fn store_handle_exposes_scan_point_gets() {
     h.send(StoreCommand::Shutdown).unwrap();
     j.join().unwrap();
 }
+
+#[test]
+fn store_thread_keyed_rows_do_no_point_reads() {
+    let all_keys: Vec<u128> = (1..=2000).collect();
+    let (store, k, _d) = common::store_with_keys(&all_keys);
+    let (h, mut ev, j) = StoreThread::spawn::<u32>(store, k).unwrap();
+
+    // Pick 500 unsorted keys (e.g., reversed order).
+    let query_keys: Vec<StorageKey24> = (1..=500)
+        .rev()
+        .map(|digest| StorageKey24 {
+            epoch_ms: 0,
+            digest,
+        })
+        .collect();
+
+    h.send(StoreCommand::Rows {
+        epoch_ms: 0,
+        reason: EmitReason::Periodic,
+        after: None,
+        keys: Some(query_keys),
+        limit: 1000,
+        recovery_ticket: Some(1),
+    })
+    .unwrap();
+
+    match common::recv(&mut ev, Duration::from_secs(5)) {
+        StoreEvent::Rows {
+            epoch_ms,
+            reason,
+            rows,
+            next_after,
+            recovery_ticket,
+        } => {
+            assert_eq!(epoch_ms, 0);
+            assert_eq!(reason, EmitReason::Periodic);
+            assert_eq!(rows.len(), 500);
+            let mut returned_digests: Vec<u128> = rows.iter().map(|r| r.key.digest).collect();
+            returned_digests.sort_unstable();
+            let expected_digests: Vec<u128> = (1..=500).collect();
+            assert_eq!(returned_digests, expected_digests);
+            assert_eq!(next_after, None);
+            assert_eq!(recovery_ticket, Some(1));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    assert_eq!(h.scan_point_gets(), 0);
+
+    h.send(StoreCommand::Shutdown).unwrap();
+    j.join().unwrap();
+}

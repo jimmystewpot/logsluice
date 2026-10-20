@@ -46,6 +46,11 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
     let sonar_props = fs::read_to_string(root.join("sonar-project.properties")).unwrap();
     assert!(sonar_props.contains("sonar.projectKey=jimmystewpot_logsluice"));
     assert!(sonar_props.contains("sonar.organization=jimmystewpot"));
+    assert!(
+        sonar_props.contains("sonar.rust.lcov.reportPaths=lcov.info")
+            && !sonar_props.contains("sonar.coverageReportPaths=lcov.info"),
+        "sonar-project.properties must use sonar.rust.lcov.reportPaths=lcov.info (not XML-only sonar.coverageReportPaths)"
+    );
 
     let sonar_wf = fs::read_to_string(root.join(".github/workflows/sonarcloud.yml")).unwrap();
     assert!(sonar_wf.contains("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"));
@@ -53,6 +58,10 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
     assert!(
         sonar_wf
             .contains("SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9")
+    );
+    assert!(
+        sonar_wf.contains("dirmngr"),
+        "sonarcloud.yml must install dirmngr so SonarQube GPG key verification succeeds on arc-runner-logsluice"
     );
 
     let ci_wf = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();

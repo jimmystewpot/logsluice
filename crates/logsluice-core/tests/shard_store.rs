@@ -23,6 +23,7 @@ fn opts(dir: &std::path::Path) -> StoreOptions {
         tail_memtable_bytes: 1 << 20,
         sync_wal: true,
         layout: L,
+        worker_threads: 2,
     }
 }
 
@@ -571,4 +572,31 @@ fn last_update_s_does_not_regress() {
 
     let hdr = s.header(&key).unwrap().unwrap();
     assert_eq!(hdr.last_update_s, 100);
+}
+
+#[test]
+fn store_opens_with_one_worker_thread() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+
+    let mut zero_opts = opts(d.path());
+    zero_opts.worker_threads = 0;
+    assert!(matches!(
+        ShardStore::open(zero_opts, &meta),
+        Err(AggError::Config(ref m)) if m.contains("worker_threads")
+    ));
+
+    let mut one_opts = opts(d.path());
+    one_opts.worker_threads = 1;
+    let mut store = ShardStore::open(one_opts, &meta).unwrap();
+    let st = store
+        .apply_flush(batch(vec![entry(1, true, 5)]), &k)
+        .unwrap();
+    assert_eq!(st.hdr_writes, 1);
+    let key = StorageKey24 {
+        epoch_ms: 0,
+        digest: 1,
+    };
+    assert_eq!(store.header(&key).unwrap().unwrap().total[0][0], 5);
 }

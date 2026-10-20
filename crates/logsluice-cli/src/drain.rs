@@ -81,6 +81,7 @@ pub fn run_drain(data_dir: &Path, format: &str) -> AggResult<()> {
             tail_memtable_bytes: 1 << 20,
             sync_wal: true,
             layout,
+            worker_threads: 2,
         };
 
         let store = ShardStore::open(store_opts, &meta)?;

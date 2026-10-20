@@ -137,6 +137,13 @@ pub struct StorageConfig {
     pub on_disk_full: OnDiskFull,
     /// Whether to synchronously flush write-ahead logs.
     pub sync_wal: bool,
+    /// Background compaction and flush worker threads per shard database.
+    #[serde(default = "default_storage_worker_threads")]
+    pub worker_threads: usize,
+}
+
+fn default_storage_worker_threads() -> usize {
+    2
 }
 
 impl Default for StorageConfig {
@@ -153,6 +160,7 @@ impl Default for StorageConfig {
             control_reserve_bytes: max_disk_bytes / 10, // 5 GiB
             on_disk_full: OnDiskFull::OverflowBucket,
             sync_wal: true,
+            worker_threads: default_storage_worker_threads(),
         }
     }
 }
@@ -386,6 +394,12 @@ impl EngineConfig {
                 "storage.control_reserve_bytes ({}) must be strictly less than storage.max_disk_bytes ({})",
                 self.storage.control_reserve_bytes, self.storage.max_disk_bytes
             )));
+        }
+
+        if self.storage.worker_threads == 0 {
+            return Err(AggError::Config(
+                "storage.worker_threads must be >= 1".to_string(),
+            ));
         }
 
         if !(self.cardinality.max_resource_share > 0.0

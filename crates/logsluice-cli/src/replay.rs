@@ -115,6 +115,7 @@ impl ShardDriver {
             tail_memtable_bytes: 1 << 20,
             sync_wal: true,
             layout: plan.layout(),
+            worker_threads: cfg.storage.worker_threads,
         };
 
         let store = ShardStore::open(store_opts.clone(), &meta)?;

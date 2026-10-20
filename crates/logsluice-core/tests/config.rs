@@ -127,3 +127,16 @@ fn serde_roundtrip() {
     assert_eq!(c, deserialized);
     deserialized.validate().unwrap();
 }
+
+#[test]
+fn config_rejects_zero_worker_threads() {
+    let mut c = EngineConfig::default();
+    assert_eq!(c.storage.worker_threads, 2);
+    c.validate().unwrap();
+
+    c.storage.worker_threads = 0;
+    assert!(matches!(
+        c.validate(),
+        Err(AggError::Config(ref m)) if m.contains("worker_threads")
+    ));
+}

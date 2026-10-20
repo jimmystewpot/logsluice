@@ -361,6 +361,7 @@ async fn run_pipeline(
             tail_memtable_bytes: cfg.storage.tail_max_memtable_size.max(1024 * 1024),
             sync_wal: cfg.storage.sync_wal,
             layout: plan.layout(),
+            worker_threads: cfg.storage.worker_threads,
         };
 
         let store = ShardStore::open(store_opts, &pod_meta)?;

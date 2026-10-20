@@ -378,3 +378,184 @@ fn render_otlp_groups_records_sharing_an_arc_without_deep_compare() {
     // All three records should be grouped under a single resource logs entry
     assert_eq!(resource_logs.len(), 1);
 }
+
+#[test]
+fn render_covers_periodic_reason_scope_attrs_and_typed_resource_values() {
+    let mut custom_cfg: AdapterConfig = serde_yaml_ng::from_str(
+        r#"
+window:
+  type: tumbling
+  duration: 1d
+  allowed_lateness: 0s
+group_by:
+  - source.ip
+aggregations:
+  event_count: count
+  bytes_total: { sum: "network.bytes" }
+  min_latency: { min: "latency_ms" }
+  max_latency: { max: "latency_ms" }
+  first_seen_time: { min: "@timestamp" }
+  last_seen_time: { max: "@timestamp" }
+"#,
+    )
+    .unwrap();
+    custom_cfg.output.route_field = String::new();
+    custom_cfg.attributes_policy.preserve_resource_and_scope = true;
+    custom_cfg.attributes_policy.body_policy = BodyPolicy::ReplaceWithTemplate;
+    custom_cfg.attributes_policy.template_target_field = String::new();
+
+    let eng = custom_cfg.engine().unwrap();
+    let custom_plan = AggregationPlan::new(&eng.aggregations).unwrap();
+
+    let mut resource_map = BTreeMap::new();
+    resource_map.insert("service.name".to_string(), serde_json::json!("billing"));
+    resource_map.insert("host.id".to_string(), serde_json::json!(42));
+    resource_map.insert("cpu.load".to_string(), serde_json::json!(0.75));
+    resource_map.insert("fips.enabled".to_string(), serde_json::json!(true));
+    resource_map.insert("tags".to_string(), serde_json::json!(["prod", "us-east"]));
+    resource_map.insert("meta".to_string(), serde_json::json!({"zone": "a"}));
+
+    let mut scope_attrs = BTreeMap::new();
+    scope_attrs.insert("otel.library".to_string(), serde_json::json!("custom-sdk"));
+
+    let rich_resource = Arc::new(ResourceScopePayload {
+        resource: resource_map,
+        scope_name: "billing-scope".to_string(),
+        scope_version: "3.2.1".to_string(),
+        scope_attrs,
+    });
+
+    let mut rec = fixture_record(0x456, 7, EmitReason::Periodic);
+    rec.resource = rich_resource;
+    rec.tail.severity = 21; // FATAL
+    rec.tail.dims = vec![Some(Bytes::from("10.1.2.3"))];
+    rec.tail.attrs = vec![
+        ("env".to_string(), Bytes::from("production")),
+        ("attributes.region".to_string(), Bytes::from("us-east-1")),
+    ];
+    rec.counters = vec![[10, 2048, 4, 0]];
+    rec.minmax = vec![
+        (12, 95),
+        (12, 95),
+        (1_700_000_001_000, 1_700_000_009_000),
+        (1_700_000_001_000, 1_700_000_009_000),
+    ];
+
+    let native_ev = render_native(&rec, &custom_cfg, &custom_plan);
+    assert_eq!(
+        native_ev.get_path("_wa_route"),
+        Some(&serde_json::json!("summary"))
+    );
+    assert_eq!(
+        native_ev.get_path("window.emit_reason"),
+        Some(&serde_json::json!("periodic"))
+    );
+    assert_eq!(
+        native_ev.get_path("severity"),
+        Some(&serde_json::json!("FATAL"))
+    );
+    assert_eq!(
+        native_ev.get_path("severity_number"),
+        Some(&serde_json::json!(21))
+    );
+    assert_eq!(
+        native_ev.get_path("log.template"),
+        Some(&serde_json::json!("login success"))
+    );
+    assert_eq!(
+        native_ev.get_path("scope.otel.library"),
+        Some(&serde_json::json!("custom-sdk"))
+    );
+    assert_eq!(
+        native_ev.get_path("resource.host.id"),
+        Some(&serde_json::json!(42))
+    );
+    assert_eq!(
+        native_ev.get_path("resource.fips.enabled"),
+        Some(&serde_json::json!(true))
+    );
+    assert_eq!(
+        native_ev.get_path("attributes.env"),
+        Some(&serde_json::json!("production"))
+    );
+    assert_eq!(
+        native_ev.get_path("attributes.region"),
+        Some(&serde_json::json!("us-east-1"))
+    );
+    assert_eq!(
+        native_ev.get_path("min_latency"),
+        Some(&serde_json::json!(12))
+    );
+    assert_eq!(
+        native_ev.get_path("max_latency"),
+        Some(&serde_json::json!(95))
+    );
+    assert_eq!(
+        native_ev.get_path("first_seen_time"),
+        Some(&serde_json::json!("2023-11-14T22:13:21.000Z"))
+    );
+    assert_eq!(
+        native_ev.get_path("last_seen_time"),
+        Some(&serde_json::json!("2023-11-14T22:13:29.000Z"))
+    );
+
+    // Check remaining EmitReason variants and severity levels (TRACE, DEBUG, INFO, out-of-range, Ignore body)
+    let mut cfg_ignore = custom_cfg.clone();
+    cfg_ignore.attributes_policy.body_policy = BodyPolicy::Ignore;
+    for (reason, expected_reason, sev, expected_sev) in [
+        (EmitReason::LateRevision, "late_revision", 1, Some("TRACE")),
+        (EmitReason::Evict, "evict", 5, Some("DEBUG")),
+        (EmitReason::Drain, "drain", 9, Some("INFO")),
+        (EmitReason::Close, "close", 99, None),
+    ] {
+        let mut r = rec.clone();
+        r.emit_reason = reason;
+        r.tail.severity = sev;
+        let ev = render_native(&r, &cfg_ignore, &custom_plan);
+        assert_eq!(
+            ev.get_path("window.emit_reason"),
+            Some(&serde_json::json!(expected_reason))
+        );
+        assert_eq!(
+            ev.get_path("severity").and_then(|v| v.as_str()),
+            expected_sev
+        );
+        assert!(ev.get_path("body").is_none());
+    }
+
+    // Empty slice returns empty vec; max_per_envelope = 0 defaults to 500
+    assert!(render_otlp(&[], &custom_cfg, &custom_plan, 0).is_empty());
+
+    let otlp_out = render_otlp(std::slice::from_ref(&rec), &custom_cfg, &custom_plan, 0);
+    assert_eq!(otlp_out.len(), 1);
+    let rl = &otlp_out[0]
+        .get_path("resourceLogs")
+        .and_then(|v| v.as_array())
+        .unwrap()[0];
+    let res_attrs = rl
+        .get("resource")
+        .and_then(|r| r.get("attributes"))
+        .and_then(|a| a.as_array())
+        .unwrap();
+    assert_eq!(res_attrs.len(), 6);
+
+    let sl = &rl.get("scopeLogs").and_then(|s| s.as_array()).unwrap()[0];
+    let scope_attrs_arr = sl
+        .get("scope")
+        .and_then(|s| s.get("attributes"))
+        .and_then(|a| a.as_array())
+        .unwrap();
+    assert_eq!(scope_attrs_arr.len(), 1);
+
+    let lr = &sl.get("logRecords").and_then(|l| l.as_array()).unwrap()[0];
+    assert_eq!(lr.get("severityText"), Some(&serde_json::json!("FATAL")));
+    let lr_attrs = lr.get("attributes").and_then(|a| a.as_array()).unwrap();
+    assert!(lr_attrs.iter().any(|a| {
+        a.get("key") == Some(&serde_json::json!("window.emit_reason"))
+            && a.get("value") == Some(&serde_json::json!({"stringValue": "periodic"}))
+    }));
+    assert!(lr_attrs.iter().any(|a| {
+        a.get("key") == Some(&serde_json::json!("min_latency"))
+            && a.get("value") == Some(&serde_json::json!({"intValue": 12}))
+    }));
+}

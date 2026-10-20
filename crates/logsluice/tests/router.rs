@@ -762,3 +762,223 @@ fn otlp_late_and_quarantine_passthrough_unchanged() {
         ]
     );
 }
+
+#[test]
+fn otlp_router_covers_severity_variants_and_any_value_types() {
+    use logsluice::config::{EnvelopeMode, NormalizerConfig};
+
+    let mut c = cfg();
+    c.output.route_field = String::new();
+    c.attributes_policy.preserve_resource_and_scope = true;
+    c.attributes_policy.unmatched_log_attributes = UnmatchedLogAttributes::KeepFirst;
+    c.attributes_policy.body_policy = BodyPolicy::ReplaceWithTemplate;
+
+    let mut r = test_router(c.clone());
+    assert_eq!(r.shards(), 4);
+    let _ = r.watermark(0);
+
+    let valid_ns = (NOW - 1_000) * 1_000_000;
+
+    let make_otlp_record = |sev_num: Option<Value>,
+                            sev_text: Option<&str>,
+                            attrs: Value,
+                            body: Option<Value>|
+     -> Value {
+        let mut rec = ObjectMap::new();
+        rec.insert("timeUnixNano".into(), Value::from(valid_ns));
+        if let Some(sn) = sev_num {
+            rec.insert("severityNumber".into(), sn);
+        }
+        if let Some(st) = sev_text {
+            rec.insert("severityText".into(), Value::from(st));
+        }
+        if let Some(b) = body {
+            rec.insert("body".into(), b);
+        }
+        rec.insert("attributes".into(), attrs);
+        Value::Object(rec)
+    };
+
+    let rich_attrs = serde_json::json!([
+        {"key": "source.ip", "value": {"stringValue": "10.0.0.1"}},
+        {"key": "network.bytes", "value": {"doubleValue": 42.8}},
+        {"key": "int_attr", "value": {"intValue": 100}},
+        {"key": "int_str_attr", "value": {"intValue": "200"}},
+        {"key": "bool_attr", "value": {"boolValue": true}},
+        {"key": "double_attr", "value": {"doubleValue": 3.5}},
+        {"key": "arr_attr", "value": {"arrayValue": {"values": [{"stringValue": "a"}]}}},
+        {"key": "kv_attr", "value": {"kvlistValue": {"values": [{"key": "k", "value": {"intValue": 1}}]}}}
+    ]);
+
+    let map_attrs_with_level = serde_json::json!({
+        "source.ip": "10.0.0.2",
+        "network.bytes": "not-a-number",
+        "network.packets": 42.8,
+        "level": "CRITICAL",
+        "custom_map_attr": {"boolValue": false}
+    });
+
+    let records = vec![
+        // Numeric severityNumber 1..=24
+        make_otlp_record(
+            Some(Value::from(1)),
+            None,
+            rich_attrs.clone(),
+            Some(serde_json::json!({"stringValue": "conn from 10.0.0.1"})),
+        ),
+        make_otlp_record(Some(Value::from(24)), None, rich_attrs.clone(), None),
+        // Out-of-range severityNumber 99 falling back to severityText
+        make_otlp_record(
+            Some(Value::from(99)),
+            Some("FATAL"),
+            rich_attrs.clone(),
+            None,
+        ),
+        make_otlp_record(None, Some("CRITICAL"), rich_attrs.clone(), None),
+        make_otlp_record(None, Some("TRACE"), rich_attrs.clone(), None),
+        make_otlp_record(None, Some("DEBUG"), rich_attrs.clone(), None),
+        make_otlp_record(None, Some("INFO"), rich_attrs.clone(), None),
+        make_otlp_record(None, Some("WARN"), rich_attrs.clone(), None),
+        make_otlp_record(None, Some("ERROR"), rich_attrs.clone(), None),
+        // Numeric string severityText ("13" and out-of-range "99") and object-wrapped severityNumber
+        make_otlp_record(
+            Some(serde_json::json!({"intValue": 9})),
+            None,
+            rich_attrs.clone(),
+            None,
+        ),
+        make_otlp_record(
+            Some(serde_json::json!({"stringValue": "13"})),
+            None,
+            rich_attrs,
+            None,
+        ),
+        // Map-style attributes with fallback to "level" and invalid network.bytes
+        make_otlp_record(
+            None,
+            Some("99"),
+            map_attrs_with_level,
+            Some(Value::from("raw body 192.168.1.1")),
+        ),
+        // Non-object logRecord entry (quarantined as missing_timestamp)
+        Value::from("invalid-record-entry"),
+    ];
+
+    let otlp_envelope = serde_json::json!({
+        "host": "collector-1",
+        "resourceLogs": [
+            "non-object-rl",
+            {
+                "resource": {
+                    "attributes": [
+                        {"key": "service.name", "value": {"stringValue": "api"}},
+                        {"key": "host.id", "value": {"intValue": 7}},
+                        {"key": "fips", "value": {"boolValue": true}},
+                        {"key": "extra", "value": {"arrayValue": {"values": []}}}
+                    ]
+                },
+                "scopeLogs": [
+                    "non-object-sl",
+                    {
+                        "scope": {
+                            "name": "otel-scope",
+                            "version": "1.0",
+                            "attributes": [
+                                {"key": "scope.env", "value": {"stringValue": "prod"}}
+                            ]
+                        },
+                        "logRecords": records
+                    }
+                ]
+            }
+        ]
+    });
+
+    let mut out = RouterOutput::new(4);
+    r.route(LogEvent::from_value(otlp_envelope).unwrap(), NOW, &mut out);
+
+    let items: Vec<_> = out.per_shard.iter().flatten().collect();
+    assert_eq!(items.len(), 12);
+    assert_eq!(out.passthrough.len(), 1);
+    assert!(r.watermark(NOW).is_some());
+    assert!(r.stats().field_coercions_total >= 1);
+    assert!(r.stats().field_type_errors_total >= 1);
+
+    let severities: Vec<u8> = items.iter().map(|i| i.exemplar.severity).collect();
+    assert!(severities.contains(&1)); // TRACE / 1
+    assert!(severities.contains(&24)); // 24
+    assert!(severities.contains(&21)); // FATAL / CRITICAL
+    assert!(severities.contains(&5)); // DEBUG
+    assert!(severities.contains(&9)); // INFO
+    assert!(severities.contains(&13)); // WARN
+    assert!(severities.contains(&17)); // ERROR
+
+    // Verify native routing edge cases: VectorNative mode, future drift, resources fallback, scope_attrs, body normalizer, and Min/Max coercions
+    let mut native_cfg = c;
+    native_cfg.envelope_mode = EnvelopeMode::VectorNative;
+    native_cfg
+        .normalizers
+        .insert("body".into(), NormalizerConfig::LogFingerprint);
+    let mut nr = test_router(native_cfg);
+    let mut nout = RouterOutput::new(4);
+
+    // Future drift quarantine in native routing
+    let future_ts = "2026-10-18T00:00:00Z";
+    nr.route(
+        ev(&[("@timestamp", future_ts.into()), ("host", "src-1".into())]),
+        NOW,
+        &mut nout,
+    );
+    assert_eq!(nout.passthrough.len(), 1);
+    assert_eq!(
+        nout.passthrough[0].get_path("_wa_reason"),
+        Some(&Value::from("future_drift"))
+    );
+
+    // Valid native event with resources fallback, scope extra attr, nested unmatched attr, float metric coercion
+    let mut nout2 = RouterOutput::new(4);
+    nr.route(
+        ev(&[
+            ("@timestamp", T.into()),
+            ("host", "src-1".into()),
+            ("severityNumber", Value::from(5)),
+            ("message", "hello from 10.0.0.9".into()),
+            ("network.bytes", Value::from(12.7_f64)),
+            ("resources.service.name", "worker".into()),
+            ("scope.name", "native-scope".into()),
+            ("scope.custom_tag", "v1".into()),
+            ("nested.leaf", "kept".into()),
+            ("top_scalar", Value::from(42)),
+        ]),
+        NOW,
+        &mut nout2,
+    );
+    let nitem = nout2.per_shard.iter().flatten().next().unwrap();
+    assert_eq!(nitem.exemplar.severity, 5);
+    assert_eq!(
+        nitem.exemplar.body.as_deref(),
+        Some(b"hello from <IP>".as_slice())
+    );
+    assert_eq!(
+        nitem.resource.resource.get("service.name"),
+        Some(&Value::from("worker"))
+    );
+    assert_eq!(
+        nitem.resource.scope_attrs.get("custom_tag"),
+        Some(&Value::from("v1"))
+    );
+    assert!(
+        nitem
+            .exemplar
+            .attrs
+            .iter()
+            .any(|(k, v)| k == "nested.leaf" && v.as_ref() == b"kept")
+    );
+    assert!(
+        nitem
+            .exemplar
+            .attrs
+            .iter()
+            .any(|(k, v)| k == "top_scalar" && v.as_ref() == b"42")
+    );
+}

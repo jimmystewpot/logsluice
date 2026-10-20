@@ -415,6 +415,8 @@ async fn run_pipeline(
             sync_wal: cfg.storage.sync_wal,
             layout: plan.layout(),
             worker_threads: cfg.storage.worker_threads,
+            max_write_buffer_bytes: cfg.storage.max_write_buffer_bytes,
+            max_cached_files: cfg.storage.max_cached_files,
         };
         let worker_ctx = WorkerContext {
             cfg: engine.clone(),
@@ -965,6 +967,8 @@ shutdown:
             sync_wal: false,
             layout: plan.layout(),
             worker_threads: 1,
+            max_write_buffer_bytes: None,
+            max_cached_files: None,
         };
         let store = ShardStore::open(store_opts, &pod_meta).unwrap();
         let worker_ctx = WorkerContext {
@@ -1235,6 +1239,8 @@ shutdown:
                 sync_wal: false,
                 layout: plan.layout(),
                 worker_threads: 1,
+                max_write_buffer_bytes: None,
+                max_cached_files: None,
             },
             &pod_meta,
         )
@@ -1456,6 +1462,8 @@ shutdown:
             sync_wal: false,
             layout: plan.layout(),
             worker_threads: 1,
+            max_write_buffer_bytes: None,
+            max_cached_files: None,
         };
         let store = ShardStore::open(store_opts, &pod_meta).unwrap();
         let worker_ctx = WorkerContext {
@@ -1675,6 +1683,8 @@ shutdown:
             sync_wal: false,
             layout: plan.layout(),
             worker_threads: 1,
+            max_write_buffer_bytes: None,
+            max_cached_files: None,
         };
         let mut store = ShardStore::open(store_opts, &pod_meta).unwrap();
         let worker_ctx = WorkerContext {

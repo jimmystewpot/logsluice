@@ -11,7 +11,10 @@ pub mod router;
 /// Compatibility module alias for [`pipeline`].
 pub use crate::pipeline as transform;
 
-pub use crate::config::{AdapterConfig, EnvelopeMode, SluiceConfig, WindowedAggregateConfig};
+pub use crate::config::{
+    AdapterConfig, EnvelopeMode, SluiceConfig, StorageAdapterConfig, StorageConfig,
+    WindowedAggregateConfig,
+};
 pub use crate::event::{
     AckFinalizer, AckFinalizers, AckNotifier, AckStatus, FieldPath, LogEvent, ObjectMap, Value,
 };

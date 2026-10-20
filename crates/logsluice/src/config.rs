@@ -11,7 +11,7 @@ use logsluice_core::config::{
     AggregationKind, AggregationSpec, CardinalityConfig, EmitConfig, EmitMode as CoreEmitMode,
     EmitStrategy as CoreEmitStrategy, EngineConfig, OnCap as CoreOnCap,
     OnDiskFull as CoreOnDiskFull, OnShutdown as CoreOnShutdown, OutputConfig as CoreOutputConfig,
-    ShutdownConfig as CoreShutdownConfig, StorageConfig, WindowConfig,
+    ShutdownConfig as CoreShutdownConfig, StorageConfig as CoreStorageConfig, WindowConfig,
 };
 use logsluice_core::error::{AggError, AggResult};
 use logsluice_core::simd::SimdMode as CoreSimdMode;
@@ -441,6 +441,12 @@ pub struct StorageAdapterConfig {
     /// Background compaction and flush worker threads per shard database.
     #[serde(default = "default_storage_worker_threads")]
     pub worker_threads: usize,
+    /// Maximum size of all memtables in bytes across keyspaces for this shard database (`None` = unlimited).
+    #[serde(default, deserialize_with = "parse_byte_size_option")]
+    pub max_write_buffer_bytes: Option<u64>,
+    /// Upper limit of cached file descriptors per shard database (`None` = engine default).
+    #[serde(default)]
+    pub max_cached_files: Option<usize>,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -488,6 +494,8 @@ impl Default for StorageAdapterConfig {
             on_disk_full: OnDiskFull::OverflowBucket,
             sync_wal: true,
             worker_threads: default_storage_worker_threads(),
+            max_write_buffer_bytes: None,
+            max_cached_files: None,
         }
     }
 }
@@ -570,6 +578,64 @@ fn parse_bytes_str(s: &str) -> Result<u64, String> {
     }
 
     Ok(total.round() as u64)
+}
+
+/// Helper function to parse optional byte size strings or numbers.
+///
+/// # Errors
+/// Returns a deserialization error if the value is negative, unparseable, or uses an unknown unit.
+pub fn parse_byte_size_option<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OptionalByteSizeVisitor;
+
+    impl<'de> Visitor<'de> for OptionalByteSizeVisitor {
+        type Value = Option<u64>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("an optional byte size string (e.g. '64MiB'), integer, or null")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            parse_byte_size(deserializer).map(Some)
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if v < 0 {
+                Err(E::custom("byte size cannot be negative"))
+            } else {
+                Ok(Some(v as u64))
+            }
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            parse_bytes_str(v).map(Some).map_err(E::custom)
+        }
+    }
+
+    deserializer.deserialize_option(OptionalByteSizeVisitor)
 }
 
 /// Window adapter configuration.
@@ -872,6 +938,9 @@ pub type AdapterConfig = SluiceConfig;
 /// Compatibility type alias for [`SluiceConfig`].
 pub type WindowedAggregateConfig = SluiceConfig;
 
+/// Compatibility type alias for [`StorageAdapterConfig`].
+pub type StorageConfig = StorageAdapterConfig;
+
 fn default_shards() -> u16 {
     4
 }
@@ -1008,7 +1077,7 @@ impl SluiceConfig {
             }
         }
 
-        let storage = StorageConfig {
+        let storage = CoreStorageConfig {
             data_dir: self.storage.data_dir.clone(),
             cache_size_total: self.storage.cache_size_total,
             l1_coalesce_max_keys: self.storage.l1_coalesce_max_keys,
@@ -1020,6 +1089,8 @@ impl SluiceConfig {
             on_disk_full: self.storage.on_disk_full.into(),
             sync_wal: self.storage.sync_wal,
             worker_threads: self.storage.worker_threads,
+            max_write_buffer_bytes: self.storage.max_write_buffer_bytes,
+            max_cached_files: self.storage.max_cached_files,
         };
 
         let window = WindowConfig {

@@ -46,6 +46,8 @@ pub fn store_with_layout() -> (ShardStore, SimdKernelTable, TempDir) {
         sync_wal: true,
         layout: TEST_LAYOUT,
         worker_threads: 2,
+        max_write_buffer_bytes: None,
+        max_cached_files: None,
     };
     let store = ShardStore::open(opts, &meta).expect("failed to open shard store");
     (store, k, d)
@@ -194,6 +196,8 @@ impl Harness {
             sync_wal: true,
             layout: plan.layout(),
             worker_threads: cfg.storage.worker_threads,
+            max_write_buffer_bytes: cfg.storage.max_write_buffer_bytes,
+            max_cached_files: cfg.storage.max_cached_files,
         };
         let store = ShardStore::open(opts, &meta).expect("failed to open shard store");
         let (store_handle, rx_event, join_handle) =
@@ -511,6 +515,8 @@ impl Harness {
             sync_wal: true,
             layout: plan.layout(),
             worker_threads: self._cfg.storage.worker_threads,
+            max_write_buffer_bytes: self._cfg.storage.max_write_buffer_bytes,
+            max_cached_files: self._cfg.storage.max_cached_files,
         };
         let mut store = ShardStore::open(opts, &meta).expect("failed to reopen shard store");
         mutate_store(&mut store);
@@ -599,6 +605,8 @@ impl Harness {
             sync_wal: true,
             layout: plan.layout(),
             worker_threads: self._cfg.storage.worker_threads,
+            max_write_buffer_bytes: self._cfg.storage.max_write_buffer_bytes,
+            max_cached_files: self._cfg.storage.max_cached_files,
         };
         let mut store = ShardStore::open(opts, &meta).expect("failed to reopen shard store");
         f(&mut store)

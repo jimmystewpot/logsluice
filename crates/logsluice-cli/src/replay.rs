@@ -116,6 +116,8 @@ impl ShardDriver {
             sync_wal: true,
             layout: plan.layout(),
             worker_threads: cfg.storage.worker_threads,
+            max_write_buffer_bytes: cfg.storage.max_write_buffer_bytes,
+            max_cached_files: cfg.storage.max_cached_files,
         };
 
         let store = ShardStore::open(store_opts.clone(), &meta)?;

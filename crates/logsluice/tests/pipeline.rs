@@ -290,6 +290,8 @@ shutdown:
         sync_wal: false,
         layout: plan.layout(),
         worker_threads: 1,
+        max_write_buffer_bytes: None,
+        max_cached_files: None,
     };
 
     let mut store = None;
@@ -372,6 +374,8 @@ shutdown:
                 sync_wal: false,
                 layout: plan.layout(),
                 worker_threads: 1,
+                max_write_buffer_bytes: None,
+                max_cached_files: None,
             };
             let mut store =
                 logsluice_core::store::shard_store::ShardStore::open(store_opts, &meta).unwrap();
@@ -477,4 +481,32 @@ shutdown:
         max_gap < MAX_ALLOWED_STARVATION_GAP,
         "Current-thread executor was starved during startup: max gap between 10ms ticks was {max_gap:?}, exceeding bound {MAX_ALLOWED_STARVATION_GAP:?}"
     );
+}
+
+#[test]
+fn config_parses_storage_limits() {
+    let yaml = r#"
+storage:
+  data_dir: "/tmp/state"
+  max_write_buffer_bytes: 64MiB
+  max_cached_files: 256
+shards: 1
+window:
+  type: tumbling
+  duration: 10s
+group_by:
+  - service
+aggregations:
+  event_count: count
+"#;
+    let cfg: SluiceConfig = serde_yaml_ng::from_str(yaml).unwrap();
+    assert_eq!(cfg.storage.max_write_buffer_bytes, Some(64 * 1024 * 1024));
+    assert_eq!(cfg.storage.max_cached_files, Some(256));
+
+    let (engine, _plan) = cfg.into_engine_and_plan().unwrap();
+    assert_eq!(
+        engine.storage.max_write_buffer_bytes,
+        Some(64 * 1024 * 1024)
+    );
+    assert_eq!(engine.storage.max_cached_files, Some(256));
 }

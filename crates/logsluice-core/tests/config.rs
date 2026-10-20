@@ -140,3 +140,36 @@ fn config_rejects_zero_worker_threads() {
         Err(AggError::Config(ref m)) if m.contains("worker_threads")
     ));
 }
+
+#[test]
+fn config_parses_max_write_buffer_bytes() {
+    let mut c = EngineConfig::default();
+    assert_eq!(c.storage.max_write_buffer_bytes, None);
+    assert_eq!(c.storage.max_cached_files, None);
+
+    c.storage.max_write_buffer_bytes = Some(64 * 1024 * 1024);
+    c.storage.max_cached_files = Some(256);
+    c.validate().unwrap();
+
+    let json = serde_json::to_string_pretty(&c).unwrap();
+    let deserialized: EngineConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(c, deserialized);
+    assert_eq!(
+        deserialized.storage.max_write_buffer_bytes,
+        Some(64 * 1024 * 1024)
+    );
+    assert_eq!(deserialized.storage.max_cached_files, Some(256));
+
+    c.storage.max_write_buffer_bytes = Some(512 * 1024);
+    assert!(matches!(
+        c.validate(),
+        Err(AggError::Config(ref m)) if m.contains("max_write_buffer_bytes")
+    ));
+
+    c.storage.max_write_buffer_bytes = None;
+    c.storage.max_cached_files = Some(0);
+    assert!(matches!(
+        c.validate(),
+        Err(AggError::Config(ref m)) if m.contains("max_cached_files")
+    ));
+}

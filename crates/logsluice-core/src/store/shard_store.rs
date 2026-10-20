@@ -40,6 +40,10 @@ pub struct StoreOptions {
     pub layout: HeaderLayout,
     /// Background compaction and flush worker threads for this shard's fjall database.
     pub worker_threads: usize,
+    /// Maximum size of all memtables in bytes across keyspaces for this shard database (`None` = fjall default / unlimited).
+    pub max_write_buffer_bytes: Option<u64>,
+    /// Upper limit of cached file descriptors for this shard database (`None` = fjall default).
+    pub max_cached_files: Option<usize>,
 }
 
 /// A single key aggregation delta to be committed into a shard.
@@ -129,11 +133,37 @@ impl ShardStore {
                 "storage.worker_threads must be >= 1".to_string(),
             ));
         }
+        if let Some(bytes) = opts.max_write_buffer_bytes {
+            if bytes < 1024 * 1024 {
+                return Err(AggError::Config(
+                    "storage.max_write_buffer_bytes must be >= 1048576 (1 MiB)".to_string(),
+                ));
+            }
+        }
+        if let Some(files) = opts.max_cached_files {
+            if files == 0 {
+                return Err(AggError::Config(
+                    "storage.max_cached_files must be >= 1".to_string(),
+                ));
+            }
+        }
 
-        let db = Database::builder(&opts.shard_dir)
+        let mut builder = Database::builder(&opts.shard_dir)
             .cache_size(opts.cache_bytes)
-            .worker_threads(opts.worker_threads)
-            .open()?;
+            .worker_threads(opts.worker_threads);
+
+        if let Some(bytes) = opts.max_write_buffer_bytes {
+            #[allow(deprecated)]
+            {
+                builder = builder.max_write_buffer_size(Some(bytes));
+            }
+        }
+
+        if let Some(files) = opts.max_cached_files {
+            builder = builder.max_cached_files(Some(files));
+        }
+
+        let db = builder.open()?;
 
         let meta_ks = db.keyspace("_meta", KeyspaceCreateOptions::default)?;
         let offsets_ks = db.keyspace("_offsets", KeyspaceCreateOptions::default)?;

@@ -82,6 +82,8 @@ pub fn run_drain(data_dir: &Path, format: &str) -> AggResult<()> {
             sync_wal: true,
             layout,
             worker_threads: 2,
+            max_write_buffer_bytes: None,
+            max_cached_files: None,
         };
 
         let store = ShardStore::open(store_opts, &meta)?;

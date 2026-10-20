@@ -24,6 +24,8 @@ fn opts(dir: &std::path::Path) -> StoreOptions {
         sync_wal: true,
         layout: L,
         worker_threads: 2,
+        max_write_buffer_bytes: None,
+        max_cached_files: None,
     }
 }
 
@@ -774,4 +776,44 @@ fn drop_window_deletes_tail_before_hdr() {
             .iter()
             .any(|n| n == "w00000000000000000000_hdr")
     );
+}
+
+#[test]
+fn shard_store_opens_with_limits() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+
+    let mut limited_opts = opts(d.path());
+    limited_opts.max_write_buffer_bytes = Some(64 * 1024 * 1024);
+    limited_opts.max_cached_files = Some(64);
+
+    let mut store = ShardStore::open(limited_opts, &meta).unwrap();
+    let st = store
+        .apply_flush(batch(vec![entry(1, true, 42)]), &k)
+        .unwrap();
+    assert_eq!(st.hdr_writes, 1);
+
+    let key = StorageKey24 {
+        epoch_ms: 0,
+        digest: 1,
+    };
+    let hdr = store.header(&key).unwrap().unwrap();
+    assert_eq!(hdr.total[0][0], 42);
+
+    // Validate too small max_write_buffer_bytes (< 1 MiB) is rejected
+    let mut bad_opts = opts(d.path());
+    bad_opts.max_write_buffer_bytes = Some(512 * 1024);
+    assert!(matches!(
+        ShardStore::open(bad_opts, &meta),
+        Err(AggError::Config(ref m)) if m.contains("max_write_buffer_bytes")
+    ));
+
+    // Validate 0 max_cached_files is rejected
+    let mut bad_fd_opts = opts(d.path());
+    bad_fd_opts.max_cached_files = Some(0);
+    assert!(matches!(
+        ShardStore::open(bad_fd_opts, &meta),
+        Err(AggError::Config(ref m)) if m.contains("max_cached_files")
+    ));
 }

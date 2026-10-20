@@ -100,7 +100,62 @@ fn drain_uses_persisted_window_duration_and_drains_spill_files() {
         .unwrap();
     assert!(st.success());
 
-    // 2. Also write a synthetic spill file in shard_0/spill/ to verify drain emits and removes it
+    // 2. Persist ticket 1 + key k7 (digest: 7) in shard_0 and write matching spill/1.ndjson
+    let meta: logsluice_core::store::meta::PodMeta =
+        serde_json::from_slice(&std::fs::read(dir.path().join("pod_meta.json")).unwrap()).unwrap();
+    let layout =
+        logsluice_core::codec::plan::HeaderLayout::from_schema_prefix(&meta.codec_schema).unwrap();
+    let store_opts = logsluice_core::store::shard_store::StoreOptions {
+        shard_dir: dir.path().join("shard_0"),
+        cache_bytes: 8 << 20,
+        hdr_memtable_bytes: 1 << 20,
+        tail_memtable_bytes: 1 << 20,
+        sync_wal: true,
+        layout,
+        worker_threads: 2,
+        max_write_buffer_bytes: None,
+        max_cached_files: None,
+    };
+    let k = logsluice_core::simd::SimdKernelTable::detect(logsluice_core::simd::SimdMode::Scalar);
+    let mut store =
+        logsluice_core::store::shard_store::ShardStore::open(store_opts.clone(), &meta).unwrap();
+    let k7 = logsluice_core::key::StorageKey24 {
+        epoch_ms: 1_700_000_000_000,
+        digest: 7,
+    };
+    store
+        .apply_flush(
+            logsluice_core::store::shard_store::FlushBatch {
+                entries: vec![logsluice_core::store::shard_store::FlushEntry {
+                    key: k7,
+                    is_new: true,
+                    resource_scope_id: 0,
+                    delta: vec![[42, 0, 0, 0]],
+                    minmax: vec![],
+                    last_update_s: 1,
+                    tail: None,
+                }],
+                offsets: Vec::new(),
+                new_resources: Vec::new(),
+                resource_refs: Vec::new(),
+            },
+            &k,
+        )
+        .unwrap();
+    let spilled_ticket = logsluice_core::codec::ticket::Ticket {
+        id: 1,
+        window_epoch_ms: 1_700_000_000_000,
+        reason: logsluice_core::codec::ticket::EmitReason::Close,
+        entries: vec![logsluice_core::codec::ticket::TicketEntry {
+            digest: 7,
+            slice_seq: 0,
+            delta: vec![[42, 0, 0, 0]],
+            minmax: vec![],
+        }],
+    };
+    store.put_tickets(&[spilled_ticket]).unwrap();
+    drop(store);
+
     let spill_dir = dir.path().join("shard_0").join("spill");
     let mut writer = logsluice_core::worker::spill::SpillWriter::new(spill_dir);
     let spilled_record = logsluice_core::emission::SliceRecord {
@@ -108,9 +163,9 @@ fn drain_uses_persisted_window_duration_and_drains_spill_files() {
         window_end_ms: 1_700_000_060_000,
         emit_reason: logsluice_core::codec::ticket::EmitReason::Close,
         emitter_id: "test-emitter".to_string(),
-        digest: 0x1234,
+        digest: 7,
         slice_seq: 0,
-        slice_id: "test-emitter:1700000000000:00000000000000000000000000001234:0".to_string(),
+        slice_id: "test-emitter:1700000000000:00000000000000000000000000000007:0".to_string(),
         resource: std::sync::Arc::new(logsluice_core::resource::ResourceScopePayload {
             resource: Default::default(),
             scope_name: String::new(),
@@ -127,10 +182,10 @@ fn drain_uses_persisted_window_duration_and_drains_spill_files() {
         minmax: vec![],
     };
     writer
-        .spill(999, std::slice::from_ref(&spilled_record))
+        .spill(1, std::slice::from_ref(&spilled_record))
         .unwrap();
 
-    // 3. Run drain and check both window_end_ms - window_start_ms == 60_000 and the spilled record (+42)
+    // 3. Run drain and check window_end_ms - window_start_ms == 60_000, spill emission, and k7 dedup
     let out = Command::new(bin)
         .args([
             "drain",
@@ -145,15 +200,24 @@ fn drain_uses_persisted_window_duration_and_drains_spill_files() {
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut total = 0u64;
+    let mut k7_emissions = 0usize;
     for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
         let start = v["window_start_ms"].as_i64().unwrap();
         let end = v["window_end_ms"].as_i64().unwrap();
         assert_eq!(end - start, 60_000);
+        if start == 1_700_000_000_000 && v["digest"].as_u64() == Some(7) {
+            k7_emissions += 1;
+        }
         total += v["counters"][0][0].as_u64().unwrap();
     }
+    assert_eq!(k7_emissions, 1);
     assert_eq!(total, 500 + 42);
     assert_eq!(writer.count_files(), 0);
+
+    let store_after =
+        logsluice_core::store::shard_store::ShardStore::open(store_opts, &meta).unwrap();
+    assert!(store_after.tickets().unwrap().is_empty());
 }
 
 #[test]
@@ -296,7 +360,7 @@ fn drain_replays_in_flight_ticket_with_original_slice_id_and_no_duplicate_delta(
     };
     store.apply_flush(batch, &k).unwrap();
 
-    // 2. Persist an in-flight ticket for Key A and Key B with slice_seq 0
+    // 2. Persist in-flight tickets for Key A and Key B with slice_seq 0, plus a stale slice_seq 99 entry
     let ticket = Ticket {
         id: 42,
         window_epoch_ms: epoch_ms,
@@ -309,14 +373,25 @@ fn drain_replays_in_flight_ticket_with_original_slice_id_and_no_duplicate_delta(
                 minmax: vec![(5, 10), (0, 0)],
             },
             TicketEntry {
-                digest: digest_b,
-                slice_seq: 0,
-                delta: vec![[100, 0, 0, 0]],
+                digest: digest_a,
+                slice_seq: 99,
+                delta: vec![[999, 0, 0, 0]],
                 minmax: vec![(5, 10), (0, 0)],
             },
         ],
     };
-    store.put_tickets(&[ticket]).unwrap();
+    let ticket_b = Ticket {
+        id: 43,
+        window_epoch_ms: epoch_ms,
+        reason: EmitReason::Periodic,
+        entries: vec![TicketEntry {
+            digest: digest_b,
+            slice_seq: 0,
+            delta: vec![[100, 0, 0, 0]],
+            minmax: vec![(5, 10), (0, 0)],
+        }],
+    };
+    store.put_tickets(&[ticket, ticket_b]).unwrap();
 
     // 3. Second flush of 50 counts for Key B only (Key A has no new events; Key B total becomes 150)
     let entry_b2 = FlushEntry {
@@ -353,11 +428,7 @@ fn drain_replays_in_flight_ticket_with_original_slice_id_and_no_duplicate_delta(
         ])
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "drain failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success());
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let records: Vec<serde_json::Value> = stdout

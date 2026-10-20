@@ -70,6 +70,7 @@ fn rows_are_resumable_in_chunks() {
         after: None,
         keys: None,
         limit: 2,
+        recovery_ticket: None,
     })
     .unwrap();
     let StoreEvent::Rows {
@@ -88,6 +89,7 @@ fn rows_are_resumable_in_chunks() {
         after: next_after,
         keys: None,
         limit: 2,
+        recovery_ticket: None,
     })
     .unwrap();
     let StoreEvent::Rows {
@@ -253,6 +255,7 @@ fn store_thread_rows_for_explicit_keys() {
         after: None,
         keys: Some(query_keys),
         limit: 10,
+        recovery_ticket: Some(77),
     })
     .unwrap();
 
@@ -262,6 +265,7 @@ fn store_thread_rows_for_explicit_keys() {
             reason,
             rows,
             next_after,
+            recovery_ticket,
         } => {
             assert_eq!(epoch_ms, 0);
             assert_eq!(reason, EmitReason::Periodic);
@@ -269,6 +273,7 @@ fn store_thread_rows_for_explicit_keys() {
             assert_eq!(rows[0].key.digest, 10);
             assert_eq!(rows[1].key.digest, 30);
             assert_eq!(next_after, None);
+            assert_eq!(recovery_ticket, Some(77));
         }
         other => panic!("unexpected {other:?}"),
     }
@@ -396,6 +401,7 @@ fn disk_bytes_failure_after_committed_flush_still_reports_flush_done() {
         after: None,
         keys: None,
         limit: 10,
+        recovery_ticket: None,
     })
     .unwrap();
     match common::recv(&mut ev, Duration::from_secs(5)) {

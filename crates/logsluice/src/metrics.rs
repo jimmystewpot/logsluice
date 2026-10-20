@@ -22,6 +22,8 @@ pub fn export(shard: u16, stats: &WorkerStats, router: &RouterStats) {
         .set(stats.tickets_inflight as f64);
     counter!("logsluice_slices_reemitted_total", "shard" => shard_str.clone())
         .absolute(stats.slices_reemitted_total);
+    counter!("logsluice_recovery_failures_total", "shard" => shard_str.clone())
+        .absolute(stats.recovery_failures_total);
     counter!("logsluice_forced_closes_total", "shard" => shard_str.clone())
         .absolute(stats.forced_closes_total);
     gauge!("logsluice_disk_bytes", "shard" => shard_str.clone()).set(stats.disk_bytes as f64);
@@ -36,4 +38,102 @@ pub fn export(shard: u16, stats: &WorkerStats, router: &RouterStats) {
     counter!("logsluice_events_routed_total", "route" => "late").absolute(router.late_total);
     counter!("logsluice_field_type_errors_total").absolute(router.field_type_errors_total);
     counter!("logsluice_field_coercions_total").absolute(router.field_coercions_total);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use logsluice_core::worker::WorkerStats;
+    use metrics::{
+        Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    };
+
+    use super::export;
+    use crate::router::RouterStats;
+
+    type CounterKey = (String, Vec<(String, String)>);
+    type CounterMap = Arc<Mutex<HashMap<CounterKey, u64>>>;
+
+    struct MapCounter {
+        name: String,
+        labels: Vec<(String, String)>,
+        values: CounterMap,
+    }
+
+    impl CounterFn for MapCounter {
+        fn increment(&self, value: u64) {
+            if let Ok(mut guard) = self.values.lock() {
+                *guard
+                    .entry((self.name.clone(), self.labels.clone()))
+                    .or_insert(0) += value;
+            }
+        }
+
+        fn absolute(&self, value: u64) {
+            if let Ok(mut guard) = self.values.lock() {
+                guard.insert((self.name.clone(), self.labels.clone()), value);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct TestRecorder {
+        counters: CounterMap,
+    }
+
+    impl Recorder for TestRecorder {
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
+        }
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+        fn describe_histogram(
+            &self,
+            _key: KeyName,
+            _unit: Option<Unit>,
+            _description: SharedString,
+        ) {
+        }
+
+        fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            let labels = key
+                .labels()
+                .map(|l| (l.key().to_string(), l.value().to_string()))
+                .collect();
+            Counter::from_arc(Arc::new(MapCounter {
+                name: key.name().to_string(),
+                labels,
+                values: Arc::clone(&self.counters),
+            }))
+        }
+
+        fn register_gauge(&self, _key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            Gauge::noop()
+        }
+
+        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn exports_recovery_failures_total_counter() {
+        let recorder = TestRecorder::default();
+        let stats = WorkerStats {
+            recovery_failures_total: 7,
+            ..WorkerStats::default()
+        };
+        let router = RouterStats::default();
+
+        metrics::with_local_recorder(&recorder, || {
+            export(2, &stats, &router);
+        });
+
+        let counters = recorder.counters.lock().expect("lock");
+        let val = counters.get(&(
+            "logsluice_recovery_failures_total".to_string(),
+            vec![("shard".to_string(), "2".to_string())],
+        ));
+        assert_eq!(val, Some(&7));
+    }
 }

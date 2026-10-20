@@ -699,53 +699,6 @@ impl ShardStore {
         Ok(results)
     }
 
-    /// Looks up multiple keys in sorted order, performing merge joins on existing records.
-    ///
-    /// # Errors
-    /// Returns [`AggError::Storage`] or [`AggError::Codec`].
-    pub fn rows_for(&self, keys: &[StorageKey24]) -> AggResult<Vec<JoinedRow>> {
-        let mut results = Vec::with_capacity(keys.len());
-        let mut cached_epoch: Option<(u64, Option<Keyspace>, Option<Keyspace>)> = None;
-
-        for key in keys {
-            let needs_refresh = match cached_epoch {
-                Some((ep, _, _)) => ep != key.epoch_ms,
-                None => true,
-            };
-            if needs_refresh {
-                cached_epoch = Some((
-                    key.epoch_ms,
-                    self.get_hdr_keyspace(key.epoch_ms),
-                    self.get_tail_keyspace(key.epoch_ms),
-                ));
-            }
-
-            if let Some((_, ref hdr_ks_opt, ref tail_ks_opt)) = cached_epoch {
-                let Some(ref hdr_ks) = *hdr_ks_opt else {
-                    continue;
-                };
-                let key_bytes = key.to_bytes();
-                let Some(hdr_slice) = self.counted_get(hdr_ks, key_bytes)? else {
-                    continue;
-                };
-                let header = NumericHeader::decode(self.opts.layout, &hdr_slice)?;
-                let tail = match *tail_ks_opt {
-                    Some(ref tail_ks) => match self.counted_get(tail_ks, key_bytes)? {
-                        Some(tail_slice) => Some(ExemplarTail::decode(&tail_slice)?),
-                        None => None,
-                    },
-                    None => None,
-                };
-                results.push(JoinedRow {
-                    key: *key,
-                    header,
-                    tail,
-                });
-            }
-        }
-        Ok(results)
-    }
-
     /// Returns all `(digest, resource_scope_id)` pairs indexed for the given window epoch.
     ///
     /// # Errors

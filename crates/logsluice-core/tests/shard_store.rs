@@ -880,32 +880,6 @@ fn rows_scan_does_not_increment_scan_point_gets() {
 }
 
 #[test]
-fn rows_for_increments_scan_point_gets() {
-    let d = tempfile::tempdir().unwrap();
-    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
-    let k = SimdKernelTable::detect(SimdMode::Scalar);
-    let mut store = ShardStore::open(opts(d.path()), &meta).unwrap();
-
-    let key1 = StorageKey24 {
-        epoch_ms: 0,
-        digest: 1,
-    };
-    let key2 = StorageKey24 {
-        epoch_ms: 0,
-        digest: 2,
-    };
-    store
-        .apply_flush(batch(vec![entry(1, true, 10), entry(2, true, 20)]), &k)
-        .unwrap();
-
-    assert_eq!(store.scan_point_gets(), 0);
-    let rows = store.rows_for(&[key1, key2]).unwrap();
-    assert_eq!(rows.len(), 2);
-    // 2 keys * 2 gets (hdr + tail) = 4 point gets
-    assert_eq!(store.scan_point_gets(), 4);
-}
-
-#[test]
 fn rows_for_sorted_returns_dense_keys_in_key_order_with_tails() {
     let d = tempfile::tempdir().unwrap();
     let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();

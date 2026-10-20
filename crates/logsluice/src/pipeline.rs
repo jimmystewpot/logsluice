@@ -8,7 +8,7 @@ use std::time::Duration;
 use futures::channel::mpsc as futures_mpsc;
 use futures::{SinkExt, Stream, StreamExt};
 use logsluice_core::codec::plan::AggregationPlan;
-use logsluice_core::error::AggResult;
+use logsluice_core::error::{AggError, AggResult};
 use logsluice_core::simd::SimdKernelTable;
 use logsluice_core::store::meta::PodMeta;
 use logsluice_core::store::shard_store::{ShardStore, StoreOptions};
@@ -388,17 +388,27 @@ async fn run_pipeline(
     mut input: Pin<Box<dyn Stream<Item = LogEvent> + Send>>,
     mut output_tx: futures_mpsc::Sender<LogEvent>,
 ) -> AggResult<()> {
-    std::fs::create_dir_all(&cfg.storage.data_dir)?;
-
+    let data_dir = cfg.storage.data_dir.clone();
+    let shards = cfg.shards;
     let codec_schema = cfg.codec_schema();
-    let pod_meta = PodMeta::load_or_init_with_window(
-        &cfg.storage.data_dir,
-        cfg.shards,
-        &codec_schema,
-        Some(cfg.output.emitter_id.as_str()),
-        cfg.window.duration.as_millis() as i64,
-        cfg.window.offset.as_millis() as i64,
-    )?;
+    let emitter_id = cfg.output.emitter_id.clone();
+    let window_duration_ms = cfg.window.duration.as_millis() as i64;
+    let window_offset_ms = cfg.window.offset.as_millis() as i64;
+
+    let pod_meta = tokio::task::spawn_blocking(move || -> AggResult<PodMeta> {
+        std::fs::create_dir_all(&data_dir)?;
+        PodMeta::load_or_init_with_window(
+            &data_dir,
+            shards,
+            &codec_schema,
+            Some(emitter_id.as_str()),
+            window_duration_ms,
+            window_offset_ms,
+        )
+    })
+    .await
+    .map_err(|e| AggError::Io(std::io::Error::other(e.to_string())))??;
+    let pod_meta = Arc::new(pod_meta);
 
     let (engine, plan) = cfg.into_engine_and_plan()?;
     let engine = Arc::new(engine);
@@ -406,6 +416,38 @@ async fn run_pipeline(
     let clock = WindowClock::new(cfg.window.duration, cfg.window.offset)?;
     let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
     let shards_count = usize::from(cfg.shards);
+
+    let mut init_handles = Vec::with_capacity(shards_count);
+    for s in 0..cfg.shards {
+        let shard_dir = cfg.storage.data_dir.join(format!("shard_{s}"));
+        let store_opts = StoreOptions {
+            shard_dir,
+            cache_bytes: (cfg.storage.cache_size_total / u64::from(cfg.shards)).max(1024 * 1024),
+            hdr_memtable_bytes: cfg.storage.hdr_max_memtable_size.max(1024 * 1024),
+            tail_memtable_bytes: cfg.storage.tail_max_memtable_size.max(1024 * 1024),
+            sync_wal: cfg.storage.sync_wal,
+            layout: plan.layout(),
+            worker_threads: cfg.storage.worker_threads,
+        };
+        let worker_ctx = WorkerContext {
+            cfg: engine.clone(),
+            shard: s,
+            emitter_id: Arc::from(pod_meta.emitter_id.as_str()),
+            kernels,
+            plan: plan.clone(),
+            clock,
+        };
+        let pod_meta_clone = pod_meta.clone();
+
+        let handle =
+            tokio::task::spawn_blocking(move || -> AggResult<(ShardStore, RecoveredState)> {
+                std::fs::create_dir_all(&store_opts.shard_dir)?;
+                let store = ShardStore::open(store_opts, &pod_meta_clone)?;
+                let recovered = RecoveredState::load(&store, &worker_ctx)?;
+                Ok((store, recovered))
+            });
+        init_handles.push((s, handle));
+    }
 
     let horizons: Vec<PurgeHorizon> = (0..cfg.shards).map(|_| PurgeHorizon::new(0)).collect();
 
@@ -416,21 +458,14 @@ async fn run_pipeline(
     let cfg_arc = Arc::new(cfg.clone());
     let router_stats_shared = Arc::new(std::sync::Mutex::new(RouterStats::default()));
 
-    for s in 0..cfg.shards {
-        let shard_dir = cfg.storage.data_dir.join(format!("shard_{s}"));
-        std::fs::create_dir_all(&shard_dir)?;
+    for (s, handle) in init_handles {
+        let (store, recovered) = handle
+            .await
+            .map_err(|e| AggError::Io(std::io::Error::other(e.to_string())))??;
+        all_known_partitions.extend(recovered.known_partitions.clone());
 
-        let store_opts = StoreOptions {
-            shard_dir,
-            cache_bytes: (cfg.storage.cache_size_total / u64::from(cfg.shards)).max(1024 * 1024),
-            hdr_memtable_bytes: cfg.storage.hdr_max_memtable_size.max(1024 * 1024),
-            tail_memtable_bytes: cfg.storage.tail_max_memtable_size.max(1024 * 1024),
-            sync_wal: cfg.storage.sync_wal,
-            layout: plan.layout(),
-            worker_threads: cfg.storage.worker_threads,
-        };
-
-        let store = ShardStore::open(store_opts, &pod_meta)?;
+        let (store_handle, store_events, store_thread) =
+            StoreThread::spawn::<AckFinalizers>(store, kernels)?;
         let worker_ctx = WorkerContext {
             cfg: engine.clone(),
             shard: s,
@@ -439,12 +474,6 @@ async fn run_pipeline(
             plan: plan.clone(),
             clock,
         };
-
-        let recovered = RecoveredState::load(&store, &worker_ctx)?;
-        all_known_partitions.extend(recovered.known_partitions.clone());
-
-        let (store_handle, store_events, store_thread) =
-            StoreThread::spawn::<AckFinalizers>(store, kernels)?;
         let worker = ShardWorker::new(worker_ctx, recovered, horizons[usize::from(s)].clone());
 
         let (shard_tx, shard_rx) = tokio_mpsc::channel::<ShardMessage>(1024);

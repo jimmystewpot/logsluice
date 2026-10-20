@@ -586,6 +586,7 @@ impl Harness {
             tail_memtable_bytes: 1 << 20,
             sync_wal: true,
             layout: plan.layout(),
+            worker_threads: self._cfg.storage.worker_threads,
         };
         let mut store = ShardStore::open(opts, &meta).expect("failed to reopen shard store");
         f(&mut store)

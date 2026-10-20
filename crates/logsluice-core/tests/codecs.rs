@@ -157,6 +157,55 @@ fn tail_decoding_error_handling() {
 }
 
 #[test]
+fn decode_rejects_huge_dims_count() {
+    let mut encoded = ExemplarTail {
+        severity: 1,
+        body: None,
+        dims: vec![],
+        attrs: vec![],
+    }
+    .encode();
+
+    // Find where dims_count is located in encoded:
+    // [0]: version (1)
+    // [1]: severity (1)
+    // [2]: body_tag (0)
+    // [3..7]: dims_count (u32 LE)
+    assert!(encoded.len() >= 7);
+    encoded[3..7].copy_from_slice(&u32::MAX.to_le_bytes());
+
+    let res = ExemplarTail::decode(&encoded);
+    assert!(res.is_err());
+}
+
+#[test]
+fn decode_never_panics_on_mutations() {
+    let t = ExemplarTail {
+        severity: 5,
+        body: Some(Bytes::from_static(b"body")),
+        dims: vec![Some(Bytes::from_static(b"dim1"))],
+        attrs: vec![("key".into(), Bytes::from_static(b"val"))],
+    };
+    let valid = t.encode();
+
+    // 1. Truncation test: every prefix length
+    for len in 0..=valid.len() {
+        let _ = ExemplarTail::decode(&valid[..len]);
+    }
+
+    // 2. Single-byte mutation test: flip every byte value
+    for i in 0..valid.len() {
+        let original = valid[i];
+        for b in [0, 1, 0xff, original.wrapping_add(1)] {
+            let mut mutated = valid.clone();
+            mutated[i] = b;
+            let _ = ExemplarTail::decode(&mutated);
+        }
+    }
+}
+
+
+#[test]
 fn ticket_roundtrip() {
     let l = HeaderLayout {
         banks: 1,

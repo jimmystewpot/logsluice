@@ -817,3 +817,80 @@ fn shard_store_opens_with_limits() {
         Err(AggError::Config(ref m)) if m.contains("max_cached_files")
     ));
 }
+
+#[test]
+fn header_and_tail_lookups_increment_scan_point_gets() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+    let mut store = ShardStore::open(opts(d.path()), &meta).unwrap();
+
+    let key = StorageKey24 {
+        epoch_ms: 0,
+        digest: 1,
+    };
+    store
+        .apply_flush(batch(vec![entry(1, true, 42)]), &k)
+        .unwrap();
+
+    assert_eq!(store.scan_point_gets(), 0);
+    assert!(store.header(&key).unwrap().is_some());
+    assert!(store.tail(&key).unwrap().is_some());
+    assert_eq!(store.scan_point_gets(), 2);
+    assert_eq!(
+        store
+            .scan_point_gets_counter()
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+}
+
+#[test]
+fn rows_scan_does_not_increment_scan_point_gets() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+    let mut store = ShardStore::open(opts(d.path()), &meta).unwrap();
+
+    store
+        .apply_flush(
+            batch(vec![
+                entry(1, true, 10),
+                entry(2, true, 20),
+                entry(3, true, 30),
+            ]),
+            &k,
+        )
+        .unwrap();
+
+    assert_eq!(store.scan_point_gets(), 0);
+    let rows = store.rows(0, None, 10).unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(store.scan_point_gets(), 0);
+}
+
+#[test]
+fn rows_for_increments_scan_point_gets() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+    let mut store = ShardStore::open(opts(d.path()), &meta).unwrap();
+
+    let key1 = StorageKey24 {
+        epoch_ms: 0,
+        digest: 1,
+    };
+    let key2 = StorageKey24 {
+        epoch_ms: 0,
+        digest: 2,
+    };
+    store
+        .apply_flush(batch(vec![entry(1, true, 10), entry(2, true, 20)]), &k)
+        .unwrap();
+
+    assert_eq!(store.scan_point_gets(), 0);
+    let rows = store.rows_for(&[key1, key2]).unwrap();
+    assert_eq!(rows.len(), 2);
+    // 2 keys * 2 gets (hdr + tail) = 4 point gets
+    assert_eq!(store.scan_point_gets(), 4);
+}

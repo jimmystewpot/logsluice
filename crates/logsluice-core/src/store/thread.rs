@@ -4,7 +4,7 @@
 //! off the hot ingestion path.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::thread::JoinHandle;
 
@@ -199,6 +199,7 @@ pub struct StoreHandle<F> {
     fail_next_flush: Arc<AtomicBool>,
     fail_next_disk_bytes: Arc<AtomicBool>,
     queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    scan_point_gets: Arc<AtomicU64>,
 }
 
 impl<F> Clone for StoreHandle<F> {
@@ -208,6 +209,7 @@ impl<F> Clone for StoreHandle<F> {
             fail_next_flush: Arc::clone(&self.fail_next_flush),
             fail_next_disk_bytes: Arc::clone(&self.fail_next_disk_bytes),
             queued: std::sync::Arc::clone(&self.queued),
+            scan_point_gets: Arc::clone(&self.scan_point_gets),
         }
     }
 }
@@ -260,6 +262,18 @@ impl<F> StoreHandle<F> {
         self.queued.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Returns the number of random point reads performed by read and scan APIs on the underlying shard.
+    ///
+    /// AGENTS.md invariant 3 forbids `Keyspace::get` random point reads on window close/drain scans,
+    /// and the offline `logsluice drain` over a large PVC backlog turned into per-key random I/O once
+    /// (PR #25 review). All keyed reads performed by read/scan APIs go through a counted get choke
+    /// point so this counter reflects them; regression tests assert the counter stays 0 for scan paths.
+    /// Read-modify-write gets in `apply_flush`/`apply_ack` are deliberately not counted.
+    #[must_use]
+    pub fn scan_point_gets(&self) -> u64 {
+        self.scan_point_gets.load(Ordering::Relaxed)
+    }
+
     /// Arms a one-shot simulated `apply_flush` error on the next `StoreCommand::Flush` processed by this shard.
     #[doc(hidden)]
     pub fn fail_next_flush(&self) {
@@ -309,6 +323,7 @@ impl StoreThread {
         let thread_fail_next_disk_bytes = Arc::clone(&shared_fail_next_disk_bytes);
         let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let thread_queued = std::sync::Arc::clone(&queued);
+        let scan_point_gets = store.scan_point_gets_counter();
 
         let join_handle = std::thread::Builder::new()
             .name("shard-store-worker".to_string())
@@ -599,6 +614,7 @@ impl StoreThread {
                 fail_next_flush: shared_fail_next_flush,
                 fail_next_disk_bytes: shared_fail_next_disk_bytes,
                 queued,
+                scan_point_gets,
             },
             rx_event,
             join_handle,

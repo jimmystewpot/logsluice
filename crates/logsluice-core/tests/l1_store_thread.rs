@@ -533,3 +533,12 @@ fn store_thread_emits_spill_failed_on_io_errors() {
     h.send(StoreCommand::Shutdown).unwrap();
     j.join().unwrap();
 }
+
+#[test]
+fn store_handle_exposes_scan_point_gets() {
+    let (store, k, _d) = common::store_with_layout();
+    let (h, _ev, j) = StoreThread::spawn::<u32>(store, k).unwrap();
+    assert_eq!(h.scan_point_gets(), 0);
+    h.send(StoreCommand::Shutdown).unwrap();
+    j.join().unwrap();
+}

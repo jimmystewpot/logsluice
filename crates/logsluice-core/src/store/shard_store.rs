@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fjall::{
     CompressionType, Database, Keyspace, KeyspaceCreateOptions, PersistMode,
@@ -118,6 +119,7 @@ pub struct ShardStore {
     hdr_keyspaces: HashMap<u64, Keyspace>,
     tail_keyspaces: HashMap<u64, Keyspace>,
     fail_drop_after_tail: bool,
+    scan_point_gets: Arc<AtomicU64>,
 }
 
 impl ShardStore {
@@ -253,6 +255,7 @@ impl ShardStore {
             hdr_keyspaces,
             tail_keyspaces,
             fail_drop_after_tail: false,
+            scan_point_gets: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -385,6 +388,35 @@ impl ShardStore {
         Ok(stats)
     }
 
+    /// `Keyspace::get` is a random point read. AGENTS.md invariant 3 forbids it on window close/drain scans,
+    /// and the offline `logsluice drain` over a large PVC backlog turned into per-key random I/O once (PR #25 review).
+    /// All keyed reads performed by read/scan APIs MUST go through this helper so `scan_point_gets` reflects them;
+    /// regression tests assert the counter stays 0 for scan paths. Read-modify-write gets in `apply_flush`/`apply_ack`
+    /// are deliberately not counted. A raw `.get(` in a scan API bypasses this safety net — don't add one.
+    fn counted_get(&self, ks: &Keyspace, key: [u8; 24]) -> AggResult<Option<fjall::Slice>> {
+        self.scan_point_gets.fetch_add(1, Ordering::Relaxed);
+        let slice = ks.get(key)?;
+        Ok(slice)
+    }
+
+    /// Returns the number of random point reads performed by read and scan APIs on this shard.
+    ///
+    /// `Keyspace::get` is a random point read. AGENTS.md invariant 3 forbids it on window close/drain scans,
+    /// and the offline `logsluice drain` over a large PVC backlog turned into per-key random I/O once (PR #25 review).
+    /// All keyed reads performed by read/scan APIs MUST go through [`Self::counted_get`] so `scan_point_gets` reflects them;
+    /// regression tests assert the counter stays 0 for scan paths. Read-modify-write gets in `apply_flush`/`apply_ack`
+    /// are deliberately not counted. A raw `.get(` in a scan API bypasses this safety net — don't add one.
+    #[must_use]
+    pub fn scan_point_gets(&self) -> u64 {
+        self.scan_point_gets.load(Ordering::Relaxed)
+    }
+
+    /// Returns a shared reference to the atomic scan point read counter.
+    #[must_use]
+    pub fn scan_point_gets_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.scan_point_gets)
+    }
+
     /// Looks up a numeric header by storage key.
     ///
     /// # Errors
@@ -395,7 +427,7 @@ impl ShardStore {
             None => return Ok(None),
         };
 
-        let slice = match hdr_ks.get(key.to_bytes())? {
+        let slice = match self.counted_get(&hdr_ks, key.to_bytes())? {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -414,7 +446,7 @@ impl ShardStore {
             None => return Ok(None),
         };
 
-        let slice = match tail_ks.get(key.to_bytes())? {
+        let slice = match self.counted_get(&tail_ks, key.to_bytes())? {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -529,12 +561,12 @@ impl ShardStore {
                     continue;
                 };
                 let key_bytes = key.to_bytes();
-                let Some(hdr_slice) = hdr_ks.get(key_bytes)? else {
+                let Some(hdr_slice) = self.counted_get(hdr_ks, key_bytes)? else {
                     continue;
                 };
                 let header = NumericHeader::decode(self.opts.layout, &hdr_slice)?;
                 let tail = match *tail_ks_opt {
-                    Some(ref tail_ks) => match tail_ks.get(key_bytes)? {
+                    Some(ref tail_ks) => match self.counted_get(tail_ks, key_bytes)? {
                         Some(tail_slice) => Some(ExemplarTail::decode(&tail_slice)?),
                         None => None,
                     },

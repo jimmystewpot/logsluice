@@ -350,3 +350,31 @@ fn render_otlp_and_fingerprinted_dim_respect_attributes_policy() {
         Some("WARN".into())
     );
 }
+
+#[test]
+fn render_otlp_groups_records_sharing_an_arc_without_deep_compare() {
+    let cfg = cfg();
+    let plan = plan();
+
+    let shared_res = fixture_resource("auth");
+    let mut rec1 = fixture_record(0x1, 0, EmitReason::Close);
+    rec1.resource = shared_res.clone();
+
+    let mut rec2 = fixture_record(0x2, 0, EmitReason::Close);
+    rec2.resource = shared_res.clone();
+
+    // Distinct Arc instance with equal payload value
+    let mut rec3 = fixture_record(0x3, 0, EmitReason::Close);
+    rec3.resource = fixture_resource("auth");
+
+    let recs = vec![rec1, rec2, rec3];
+    let otlp_evs = render_otlp(&recs, &cfg, &plan, 500);
+    assert_eq!(otlp_evs.len(), 1);
+
+    let resource_logs = otlp_evs[0]
+        .get_path("resourceLogs")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    // All three records should be grouped under a single resource logs entry
+    assert_eq!(resource_logs.len(), 1);
+}

@@ -310,10 +310,9 @@ pub fn render_otlp(
             Vec<&SliceRecord>,
         )> = Vec::new();
         for rec in chunk {
-            if let Some(group) = resource_groups
-                .iter_mut()
-                .find(|(res, _)| **res == *rec.resource)
-            {
+            if let Some(group) = resource_groups.iter_mut().find(|(res, _)| {
+                std::sync::Arc::ptr_eq(res, &rec.resource) || **res == *rec.resource
+            }) {
                 group.1.push(rec);
             } else {
                 resource_groups.push((rec.resource.clone(), vec![rec]));

@@ -88,16 +88,9 @@ mod tests {
     }
 
     impl Recorder for TestRecorder {
-        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
-        }
-        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
-        fn describe_histogram(
-            &self,
-            _key: KeyName,
-            _unit: Option<Unit>,
-            _description: SharedString,
-        ) {
-        }
+        fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
 
         fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
             let labels = key
@@ -120,9 +113,22 @@ mod tests {
         }
     }
 
+    fn init_test_recorder() -> TestRecorder {
+        let recorder = TestRecorder::default();
+        recorder.describe_counter("c".into(), None, "".into());
+        recorder.describe_gauge("g".into(), None, "".into());
+        recorder.describe_histogram("h".into(), None, "".into());
+        static META: Metadata<'static> = Metadata::new(module_path!(), metrics::Level::INFO, None);
+        let key = Key::from_name("init");
+        let _ = recorder.register_gauge(&key, &META);
+        let _ = recorder.register_histogram(&key, &META);
+        recorder.register_counter(&key, &META).increment(0);
+        recorder
+    }
+
     #[test]
     fn exports_recovery_failures_total_counter() {
-        let recorder = TestRecorder::default();
+        let recorder = init_test_recorder();
         let stats = WorkerStats {
             recovery_failures_total: 7,
             ..WorkerStats::default()
@@ -143,7 +149,7 @@ mod tests {
 
     #[test]
     fn exports_spill_quarantined_total_counter() {
-        let recorder = TestRecorder::default();
+        let recorder = init_test_recorder();
         let stats = WorkerStats {
             spill_quarantined_total: 3,
             ..WorkerStats::default()

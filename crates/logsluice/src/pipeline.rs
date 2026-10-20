@@ -205,7 +205,7 @@ async fn shard_loop(
 ) {
     // 1. Initial recovery output
     let rec_out = worker.recovery_output();
-    if !emit_worker_output(
+    let _ = emit_worker_output(
         rec_out,
         &mut worker,
         &store_handle,
@@ -215,16 +215,7 @@ async fn shard_loop(
         &plan,
         &detected_otlp,
     )
-    .await
-    {
-        while let Ok((_, finalizer)) = ingest_rx.try_recv() {
-            finalizer.update_status(AckStatus::Errored);
-        }
-        while control_rx.try_recv().is_ok() {}
-        let _ = store_handle.send(StoreCommand::Shutdown);
-        let _ = store_thread.join();
-        return;
-    }
+    .await;
 
     let mut draining = false;
     let mut drain_deadline: Option<i64> = None;
@@ -711,16 +702,9 @@ mod tests {
     }
 
     impl Recorder for PipelineTestRecorder {
-        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
-        }
-        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
-        fn describe_histogram(
-            &self,
-            _key: KeyName,
-            _unit: Option<Unit>,
-            _description: SharedString,
-        ) {
-        }
+        fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
 
         fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
             let labels = key
@@ -751,6 +735,15 @@ mod tests {
                 let recorder = PipelineTestRecorder {
                     counters: Arc::clone(&map),
                 };
+                recorder.describe_counter("c".into(), None, "".into());
+                recorder.describe_gauge("g".into(), None, "".into());
+                recorder.describe_histogram("h".into(), None, "".into());
+                static META: Metadata<'static> =
+                    Metadata::new(module_path!(), ::metrics::Level::INFO, None);
+                let key = Key::from_name("init");
+                let _ = recorder.register_gauge(&key, &META);
+                let _ = recorder.register_histogram(&key, &META);
+                recorder.register_counter(&key, &META).increment(0);
                 let _ = ::metrics::set_global_recorder(recorder);
                 map
             })
@@ -1588,11 +1581,7 @@ shutdown:
             if ingested == 1 {
                 break;
             }
-            if start.elapsed() > Duration::from_secs(2) {
-                panic!(
-                    "timed out waiting for shard_loop to process second Poll and export metrics"
-                );
-            }
+            assert!(start.elapsed() <= Duration::from_secs(2));
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
@@ -1808,5 +1797,353 @@ shutdown:
 
         // Cleanup
         shard_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn shard_loop_startup_and_exit_drain_queued_ingest_as_errored() {
+        let _serial = TEST_SERIAL.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let yaml = format!(
+            r#"
+storage:
+  data_dir: {:?}
+  l1_flush_interval: 10ms
+  max_disk_bytes: 1024B
+  control_reserve_bytes: 512B
+  on_disk_full: block
+  sync_wal: false
+shards: 1
+window:
+  type: tumbling
+  duration: 10s
+  allowed_skew: 0s
+  allowed_lateness: 0s
+  late_emit_interval: 10ms
+  max_close_delay: 10ms
+  max_future_drift: 1d
+  emit:
+    close_jitter_max: 0s
+group_by:
+  - service
+aggregations:
+  event_count: count
+shutdown:
+  drain_timeout: 100ms
+"#,
+            dir.path()
+        );
+
+        let cfg: SluiceConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        std::fs::create_dir_all(&cfg.storage.data_dir).unwrap();
+        let shard_dir = cfg.storage.data_dir.join("shard_0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        let codec_schema = cfg.codec_schema();
+        let pod_meta = PodMeta::load_or_init_with_window(
+            &cfg.storage.data_dir,
+            cfg.shards,
+            &codec_schema,
+            Some(cfg.output.emitter_id.as_str()),
+            cfg.window.duration.as_millis() as i64,
+            cfg.window.offset.as_millis() as i64,
+        )
+        .unwrap();
+
+        let (engine, plan) = cfg.clone().into_engine_and_plan().unwrap();
+        let engine = Arc::new(engine);
+        let plan = Arc::new(plan);
+        let clock = WindowClock::new(cfg.window.duration, cfg.window.offset).unwrap();
+        let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+
+        // Part A: Startup with a recovered ticket and closed output_rx drains queued ingest_rx as Errored.
+        let store_opts = StoreOptions {
+            shard_dir: shard_dir.clone(),
+            cache_bytes: 1024 * 1024,
+            hdr_memtable_bytes: 1024 * 1024,
+            tail_memtable_bytes: 1024 * 1024,
+            sync_wal: false,
+            layout: plan.layout(),
+            worker_threads: 1,
+            max_write_buffer_bytes: None,
+            max_cached_files: None,
+        };
+        let mut store = ShardStore::open(store_opts.clone(), &pod_meta).unwrap();
+        let resource = empty_resource();
+        let resource_hash = resource.canonical_hash();
+        let mut flush_buf = logsluice_core::l1::L1Buffer::<AckFinalizers>::new(16);
+        flush_buf.record_resource(1, Arc::clone(&resource), 0);
+        flush_buf.accumulate(
+            StorageKey24 {
+                epoch_ms: 0,
+                digest: 42,
+            },
+            true,
+            1,
+            &[[1, 0, 0, 0]],
+            &[],
+            1,
+            Some(ExemplarTail {
+                severity: 9,
+                body: None,
+                dims: vec![Some(bytes::Bytes::from_static(b"api"))],
+                attrs: Vec::new(),
+            }),
+            &kernels,
+        );
+        let (flush_batch, _) = flush_buf.into_flush();
+        store.apply_flush(flush_batch, &kernels).unwrap();
+        let ticket = logsluice_core::codec::ticket::Ticket {
+            id: 77,
+            window_epoch_ms: 0,
+            reason: EmitReason::Close,
+            entries: vec![logsluice_core::codec::ticket::TicketEntry {
+                digest: 42,
+                delta: vec![[1, 0, 0, 0]],
+                minmax: Vec::new(),
+                slice_seq: 1,
+            }],
+        };
+        store.put_tickets(std::slice::from_ref(&ticket)).unwrap();
+
+        let worker_ctx = WorkerContext {
+            cfg: Arc::clone(&engine),
+            shard: 0,
+            emitter_id: Arc::from(pod_meta.emitter_id.as_str()),
+            kernels,
+            plan: Arc::clone(&plan),
+            clock,
+        };
+        let recovered = RecoveredState::load(&store, &worker_ctx).unwrap();
+        let (store_handle_a, store_events_a, store_thread_a) =
+            StoreThread::spawn::<AckFinalizers>(store, kernels).unwrap();
+        let mut worker_a = ShardWorker::new(worker_ctx.clone(), recovered, PurgeHorizon::new(0));
+        worker_a.set_disk_bytes_for_test(Some(2048));
+
+        let (ingest_tx_a, ingest_rx_a) =
+            tokio_mpsc::channel::<(Vec<IngestItem>, AckFinalizers)>(16);
+        let (control_tx_a, control_rx_a) = tokio_mpsc::channel::<ControlMessage>(16);
+        let (output_tx_a, output_rx_a) = futures_mpsc::channel::<LogEvent>(16);
+        drop(output_rx_a);
+
+        let make_item = |digest: u128| IngestItem {
+            key: StorageKey24 {
+                epoch_ms: 0,
+                digest,
+            },
+            resource: Arc::clone(&resource),
+            resource_hash,
+            position: None,
+            event_ms: 1_000,
+            counters: vec![[1, 0, 0, 0]],
+            minmax_values: Vec::new(),
+            exemplar: ExemplarSource {
+                severity: 9,
+                body: None,
+                dims: vec![Some(bytes::Bytes::from_static(b"api"))],
+                attrs: Vec::new(),
+            },
+        };
+
+        let (notifier_a, ack_rx_a) = AckNotifier::new_with_receiver();
+        ingest_tx_a
+            .send((vec![make_item(99)], AckFinalizers::from_single(notifier_a)))
+            .await
+            .unwrap();
+        control_tx_a
+            .send(ControlMessage::Poll {
+                watermark: None,
+                now_ms: 1_000,
+            })
+            .await
+            .unwrap();
+
+        shard_loop(
+            0,
+            worker_a,
+            store_handle_a,
+            store_events_a,
+            store_thread_a,
+            ingest_rx_a,
+            control_rx_a,
+            control_tx_a,
+            output_tx_a,
+            Arc::new(cfg.clone()),
+            Arc::clone(&plan),
+            Arc::new(std::sync::Mutex::new(RouterStats::default())),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+        assert_eq!(ack_rx_a.await, Ok(AckStatus::Errored));
+
+        // Part B: Runtime loop exit with pending_ingest (OnDiskFull::Block) and queued ingest_rx.
+        let store_b = ShardStore::open(store_opts, &pod_meta).unwrap();
+        let (store_handle_b, _real_events_b, store_thread_b) =
+            StoreThread::spawn::<AckFinalizers>(store_b, kernels).unwrap();
+        let mut worker_b =
+            ShardWorker::new(worker_ctx, RecoveredState::empty(), PurgeHorizon::new(0));
+        worker_b.set_disk_bytes_for_test(Some(2048));
+
+        let (mut store_events_tx_b, store_events_rx_b) =
+            futures_mpsc::unbounded::<StoreEvent<AckFinalizers>>();
+        let (ingest_tx_b, ingest_rx_b) =
+            tokio_mpsc::channel::<(Vec<IngestItem>, AckFinalizers)>(16);
+        let (control_tx_b, control_rx_b) = tokio_mpsc::channel::<ControlMessage>(16);
+        let (output_tx_b, output_rx_b) = futures_mpsc::channel::<LogEvent>(16);
+
+        let handle_b = tokio::spawn(shard_loop(
+            0,
+            worker_b,
+            store_handle_b,
+            store_events_rx_b,
+            store_thread_b,
+            ingest_rx_b,
+            control_rx_b,
+            control_tx_b.clone(),
+            output_tx_b,
+            Arc::new(cfg),
+            plan,
+            Arc::new(std::sync::Mutex::new(RouterStats::default())),
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let (notifier_b1, ack_rx_b1) = AckNotifier::new_with_receiver();
+        ingest_tx_b
+            .send((
+                vec![make_item(100)],
+                AckFinalizers::from_single(notifier_b1),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let (notifier_b2, ack_rx_b2) = AckNotifier::new_with_receiver();
+        ingest_tx_b
+            .send((
+                vec![make_item(101)],
+                AckFinalizers::from_single(notifier_b2),
+            ))
+            .await
+            .unwrap();
+
+        // Exercise pending_ingest retry on store_events before breaking out of loop.
+        store_events_tx_b
+            .send(StoreEvent::KeysDeleted {
+                epoch_ms: 0,
+                count: 0,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        control_tx_b
+            .send(ControlMessage::Poll {
+                watermark: None,
+                now_ms: 2_000,
+            })
+            .await
+            .unwrap();
+
+        drop(output_rx_b);
+        store_events_tx_b
+            .send(StoreEvent::SpillReplay {
+                entries: vec![(99, vec![sample_slice_record(1)])],
+                spill_files: 0,
+                quarantined: 0,
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), handle_b)
+            .await
+            .expect("shard_loop should exit when output_rx_b is dropped")
+            .expect("shard_loop task should not panic");
+
+        assert_eq!(ack_rx_b1.await, Ok(AckStatus::Errored));
+        assert_eq!(ack_rx_b2.await, Ok(AckStatus::Errored));
+    }
+
+    #[tokio::test]
+    async fn pipeline_flushes_micro_batch_at_256_items() {
+        let _serial = TEST_SERIAL.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = test_config(dir.path());
+        let pipeline = SluicePipeline::new(cfg).unwrap();
+        let (tx, rx) = futures_mpsc::unbounded();
+        let mut out_stream = Box::new(pipeline).transform_stream(rx);
+
+        let now_nano = chrono::Utc::now().timestamp_millis() * 1_000_000;
+        let mut log_records = Vec::with_capacity(260);
+        for _ in 0..260 {
+            let mut str_val = crate::event::ObjectMap::new();
+            str_val.insert("stringValue".into(), Value::from("api"));
+            let mut attr = crate::event::ObjectMap::new();
+            attr.insert("key".into(), Value::from("service"));
+            attr.insert("value".into(), Value::Object(str_val));
+
+            let mut record = crate::event::ObjectMap::new();
+            record.insert("timeUnixNano".into(), Value::from(now_nano));
+            record.insert("attributes".into(), Value::Array(vec![Value::Object(attr)]));
+            log_records.push(Value::Object(record));
+        }
+
+        let mut scope_log = crate::event::ObjectMap::new();
+        scope_log.insert("logRecords".into(), Value::Array(log_records));
+
+        let mut rl = crate::event::ObjectMap::new();
+        rl.insert(
+            "scopeLogs".into(),
+            Value::Array(vec![Value::Object(scope_log)]),
+        );
+
+        let mut envelope = LogEvent::default();
+        envelope.insert_path("resourceLogs", Value::Array(vec![Value::Object(rl)]));
+
+        let (envelope_with_ack, ack_rx) = envelope.with_ack_notifier();
+        tx.unbounded_send(envelope_with_ack).unwrap();
+
+        let status = tokio::time::timeout(Duration::from_secs(2), ack_rx)
+            .await
+            .expect("timed out waiting for micro-batch flush ack")
+            .expect("ack channel closed");
+        assert_eq!(status, AckStatus::Delivered);
+
+        drop(tx);
+
+        let mut total_event_count = 0i64;
+        while let Some(mut emitted) = out_stream.next().await {
+            if let Some(Value::Array(rls)) = emitted.as_map().get("resourceLogs") {
+                for rl_val in rls {
+                    if let Some(sls) = rl_val.get("scopeLogs").and_then(Value::as_array) {
+                        for sl_val in sls {
+                            if let Some(lrs) = sl_val.get("logRecords").and_then(Value::as_array) {
+                                for lr_val in lrs {
+                                    if let Some(attrs) =
+                                        lr_val.get("attributes").and_then(Value::as_array)
+                                    {
+                                        for attr in attrs {
+                                            if attr.get("key").and_then(Value::as_str)
+                                                == Some("event_count")
+                                                && let Some(cnt) = attr
+                                                    .get("value")
+                                                    .and_then(|v| v.get("intValue"))
+                                                    .and_then(Value::as_i64)
+                                            {
+                                                total_event_count += cnt;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            emitted
+                .take_finalizers()
+                .update_status(AckStatus::Delivered);
+        }
+
+        assert_eq!(total_event_count, 260);
     }
 }

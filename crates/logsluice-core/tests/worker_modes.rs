@@ -8,6 +8,7 @@ use logsluice_core::{
     config::*,
     key::StorageKey24,
     resource::ResourceScopePayload,
+    simd::{SimdKernelTable, SimdMode},
     store::{StoreCommand, StoreEvent},
     window::WindowClock,
     worker::{
@@ -445,4 +446,160 @@ fn evicted_key_with_inflight_flush_keeps_exemplar() {
     // 1 (from swapped batch) + 5 (from third ingest) = 6!
     assert_eq!(rows[0].header.total[0][0], 6);
     assert_eq!(worker.stats().keys_evicted_total, 0);
+}
+
+#[test]
+fn pending_commands_stays_bounded_with_stalled_store() {
+    // Documented upper bound: 4x the 64-slot StoreCommand channel = 256.
+    const MAX_BOUND: usize = 256;
+
+    // --- Scenario A: Live pipeline encountering a stalled store ---
+    let mut h = Harness::new(|c| {
+        c.window.duration = Duration::from_secs(10);
+        c.window.emit = EmitConfig {
+            strategy: EmitStrategy::Periodic,
+            interval: Some(Duration::from_millis(1_000)),
+            close_jitter_max: Duration::ZERO,
+        };
+        c.window.late_emit_interval = Duration::from_millis(1_000);
+        c.window.max_closing_duration = Duration::from_millis(2_000);
+        c.cardinality.max_keys_per_window = 10;
+        c.cardinality.on_cap = OnCap::EvictCold;
+        c.cardinality.evict_interval = Duration::from_millis(1_000);
+        c.cardinality.evict_high_water = 0.5;
+        c.storage.l1_flush_interval = Duration::from_millis(1_000);
+    });
+
+    // 1. Establish an unacknowledged ticket and spill directory during normal operation.
+    let spill_dir = h.data_dir().join("shard_0").join("spill");
+    std::fs::create_dir_all(&spill_dir).expect("create spill dir");
+
+    // Ingest into initial window (epoch 0) and advance to emit a ticket.
+    h.ingest(&[(1, 1_000), (2, 2_000)]);
+    h.advance(11_000, Some(10_000));
+
+    // Verify an unacknowledged ticket is in flight.
+    assert!(
+        h.worker().stats().tickets_inflight > 0,
+        "expected in-flight tickets before stall"
+    );
+
+    let res = Arc::new(ResourceScopePayload {
+        resource: [(
+            "service.name".to_string(),
+            serde_json::json!("test-service"),
+        )]
+        .into(),
+        scope_name: "test-scope".to_string(),
+        scope_version: "1.0.0".to_string(),
+        scope_attrs: Default::default(),
+    });
+    let res_hash = res.canonical_hash();
+
+    // 2. The store now stalls completely: no StoreEvents are processed,
+    // and every command produced by worker.poll() is refused and deferred.
+    let worker = h.worker();
+    let mut now_ms: i64 = 11_000;
+
+    // Drive worker across 500 ticks spanning multiple windows, flushes, and scans.
+    for tick in 1..=500 {
+        now_ms += 1_000;
+        let watermark = Some(now_ms.saturating_sub(2_000));
+
+        // Attempt ingestion across multiple window epochs to exercise L1 flush & backpressure.
+        if tick % 2 == 0 {
+            let epoch = (now_ms / 10_000) * 10_000;
+            let item = IngestItem {
+                key: StorageKey24 {
+                    epoch_ms: epoch as u64,
+                    digest: (tick as u128 % 20) + 10,
+                },
+                resource: Arc::clone(&res),
+                resource_hash: res_hash,
+                position: None,
+                event_ms: now_ms,
+                counters: vec![[1, 0, 0, 0]],
+                minmax_values: vec![now_ms, now_ms],
+                exemplar: ExemplarSource::default(),
+            };
+            let _ = worker.ingest(vec![item], tick as u32, now_ms);
+        }
+
+        let out = worker.poll(watermark, now_ms);
+        for cmd in out.commands {
+            worker.defer_command(cmd);
+        }
+
+        let pending_len = worker.pending_commands_len();
+        let inflight = worker.stats().tickets_inflight;
+
+        assert!(
+            pending_len <= MAX_BOUND,
+            "pending_commands_len ({pending_len}) exceeded MAX_BOUND ({MAX_BOUND}) at tick {tick}"
+        );
+        assert!(
+            inflight <= MAX_BOUND,
+            "tickets_inflight ({inflight}) exceeded MAX_BOUND ({MAX_BOUND}) at tick {tick}"
+        );
+    }
+
+    // Verify final state remains strictly bounded (measured: pending_commands = 2, tickets_inflight = 2).
+    let final_pending = worker.pending_commands_len();
+    let final_inflight = worker.stats().tickets_inflight;
+    assert!(
+        final_pending <= MAX_BOUND,
+        "final pending commands ({final_pending}) exceeded bound ({MAX_BOUND})"
+    );
+    assert!(
+        final_inflight <= MAX_BOUND,
+        "final in-flight tickets ({final_inflight}) exceeded bound ({MAX_BOUND})"
+    );
+
+    // --- Scenario B: Crash-recovered worker with cached spill files under a stalled store ---
+    let recovered_dir = tempfile::tempdir().expect("create temp dir");
+    let rec_spill_dir = recovered_dir.path().join("shard_0").join("spill");
+    std::fs::create_dir_all(&rec_spill_dir).expect("create spill dir");
+    std::fs::write(rec_spill_dir.join("00000000000000000042.ndjson"), b"{}\n")
+        .expect("write spill file");
+
+    let cfg_rec = Arc::new(EngineConfig::default());
+    let plan = Arc::new(AggregationPlan::new(&common::spec_example()).expect("plan"));
+    let kernels = SimdKernelTable::detect(SimdMode::Scalar);
+    let clock = WindowClock::new(cfg_rec.window.duration, cfg_rec.window.offset).expect("clock");
+    let ctx = WorkerContext {
+        cfg: cfg_rec,
+        shard: 0,
+        emitter_id: Arc::from("pod-0"),
+        kernels,
+        plan,
+        clock,
+    };
+    let recovered = RecoveredState {
+        spill_files: 1,
+        ..RecoveredState::empty()
+    };
+    let mut rec_worker: ShardWorker<u32> = ShardWorker::new(ctx, recovered, PurgeHorizon::new(0));
+
+    let mut rec_now_ms: i64 = 0;
+    for tick in 1..=500 {
+        rec_now_ms += 1_000;
+        let out = rec_worker.poll(None, rec_now_ms);
+        for cmd in out.commands {
+            rec_worker.defer_command(cmd);
+        }
+        assert!(
+            rec_worker.pending_commands_len() <= MAX_BOUND,
+            "recovered worker pending commands exceeded bound at tick {tick}"
+        );
+        assert!(
+            rec_worker.stats().tickets_inflight <= MAX_BOUND,
+            "recovered worker tickets inflight exceeded bound at tick {tick}"
+        );
+    }
+
+    assert!(
+        rec_worker.pending_commands_len() <= MAX_BOUND,
+        "recovered worker final pending commands ({}) exceeded bound ({MAX_BOUND})",
+        rec_worker.pending_commands_len()
+    );
 }

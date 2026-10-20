@@ -372,9 +372,13 @@ async fn flush_micro_batch(
     let finalizer = std::mem::take(&mut mb.finalizer);
     mb.first_added = None;
 
-    let _ = shard_txs[shard_idx]
+    if let Err(tokio_mpsc::error::SendError(ShardMessage::Ingest { finalizer, .. })) = shard_txs
+        [shard_idx]
         .send(ShardMessage::Ingest { items, finalizer })
-        .await;
+        .await
+    {
+        finalizer.update_status(AckStatus::Errored);
+    }
 }
 
 async fn run_pipeline(
@@ -696,6 +700,96 @@ shutdown:
             .expect("timed out waiting for flush ack")
             .expect("ack channel closed");
         assert_eq!(status, AckStatus::Errored);
+
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn flush_micro_batch_marks_errored_when_shard_closed() {
+        let (tx, rx) = tokio_mpsc::channel(1);
+        drop(rx);
+
+        let (finalizer, receiver) = AckNotifier::new_with_receiver();
+        let mut mb = ShardMicroBatch::new();
+        mb.items.push(IngestItem {
+            key: StorageKey24 {
+                epoch_ms: 1_700_000_000_000,
+                digest: 42,
+            },
+            resource: empty_resource(),
+            resource_hash: 0,
+            position: None,
+            event_ms: 1_700_000_000_100,
+            counters: vec![[1, 0, 0, 0]],
+            minmax_values: Vec::new(),
+            exemplar: ExemplarSource {
+                severity: 9,
+                body: None,
+                dims: vec![Some(bytes::Bytes::from_static(b"api"))],
+                attrs: Vec::new(),
+            },
+        });
+        mb.finalizer.push(finalizer);
+
+        let mut batches = vec![mb];
+        let shard_txs = vec![tx];
+
+        flush_micro_batch(0, &mut batches, &shard_txs).await;
+
+        let status = tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("timeout waiting for ack")
+            .expect("ack channel closed");
+        assert_eq!(status, AckStatus::Errored);
+    }
+
+    #[tokio::test]
+    async fn empty_resource_logs_envelope_still_delivered() {
+        let _serial = TEST_SERIAL.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let yaml = format!(
+            r#"
+storage:
+  data_dir: {:?}
+  l1_flush_interval: 20ms
+  sync_wal: false
+shards: 1
+window:
+  type: tumbling
+  duration: 1d
+  allowed_skew: 30s
+  allowed_lateness: 0s
+  late_emit_interval: 20ms
+  max_close_delay: 1000d
+  max_future_drift: 2d
+  emit:
+    close_jitter_max: 0s
+group_by:
+  - source.ip
+aggregations:
+  event_count: count
+shutdown:
+  drain_timeout: 200ms
+"#,
+            dir.path()
+        );
+
+        let cfg: SluiceConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        let pipeline = SluicePipeline::new(cfg).unwrap();
+        let (tx, rx) = futures_mpsc::unbounded();
+        let _out = Box::new(pipeline).transform_stream(rx);
+
+        let mut log = LogEvent::default();
+        log.insert_path("resourceLogs", Value::Array(Vec::new()));
+        let (log_with_ack, ack_rx) = log.with_ack_notifier();
+
+        tx.unbounded_send(log_with_ack).unwrap();
+
+        let status = tokio::time::timeout(Duration::from_secs(2), ack_rx)
+            .await
+            .expect("timed out waiting for empty envelope ack")
+            .expect("ack channel closed");
+        assert_eq!(status, AckStatus::Delivered);
 
         drop(tx);
     }

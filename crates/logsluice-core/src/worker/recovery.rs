@@ -68,9 +68,33 @@ impl RecoveredState {
         known_partitions.sort_unstable();
         let offset_tracker = OffsetTracker::from_persisted(offsets.into_iter().collect());
 
+        let live_epochs = store.live_windows();
+        let live_set: HashSet<u64> = live_epochs.iter().copied().collect();
+
         let mut resources = ResourceScopeTable::new();
+        let mut released_resources = Vec::new();
+        let mut pruned_resources = Vec::new();
         for (id, payload, windows) in store.resources()? {
-            resources.restore(id, payload, windows);
+            let orig_len = windows.len();
+            let live_refs: Vec<u64> = windows
+                .into_iter()
+                .filter(|w| live_set.contains(w))
+                .collect();
+            if live_refs.is_empty() {
+                released_resources.push(id);
+            } else {
+                if live_refs.len() != orig_len {
+                    pruned_resources.push((id, payload.clone(), live_refs.clone()));
+                }
+                resources.restore(id, payload, live_refs);
+            }
+        }
+        released_resources.sort_unstable();
+        if !released_resources.is_empty() {
+            store.delete_resources(&released_resources)?;
+        }
+        if !pruned_resources.is_empty() {
+            store.update_resources(&pruned_resources)?;
         }
 
         let tickets = store.tickets()?;
@@ -78,7 +102,7 @@ impl RecoveredState {
         ledger.restore(tickets.clone());
 
         let mut windows = HashMap::new();
-        for epoch_ms in store.live_windows() {
+        for epoch_ms in live_epochs {
             let window_keys = store.window_keys(epoch_ms)?;
             let mut known = KnownKeySet::with_capacity(window_keys.len());
             let mut guard = CardinalityGuard::new(

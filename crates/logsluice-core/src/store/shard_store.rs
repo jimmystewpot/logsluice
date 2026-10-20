@@ -113,6 +113,7 @@ pub struct ShardStore {
     resources_ks: Keyspace,
     hdr_keyspaces: HashMap<u64, Keyspace>,
     tail_keyspaces: HashMap<u64, Keyspace>,
+    fail_drop_after_tail: bool,
 }
 
 impl ShardStore {
@@ -185,16 +186,31 @@ impl ShardStore {
         let mut hdr_keyspaces = HashMap::new();
         let mut tail_keyspaces = HashMap::new();
 
-        for name in db.list_keyspace_names() {
-            if let Some(epoch) = parse_hdr_epoch(&name) {
+        let keyspace_names = db.list_keyspace_names();
+        for name in &keyspace_names {
+            if let Some(epoch) = parse_hdr_epoch(name) {
                 let mem = opts.hdr_memtable_bytes;
-                let ks = db.keyspace(&name, || hdr_create_options(mem))?;
+                let ks = db.keyspace(name, || hdr_create_options(mem))?;
                 hdr_keyspaces.insert(epoch, ks);
-            } else if let Some(epoch) = parse_tail_epoch(&name) {
-                let mem = opts.tail_memtable_bytes;
-                let ks = db.keyspace(&name, || tail_create_options(mem))?;
-                tail_keyspaces.insert(epoch, ks);
             }
+        }
+
+        let mut removed_orphan_tail = false;
+        for name in &keyspace_names {
+            if let Some(epoch) = parse_tail_epoch(name) {
+                let mem = opts.tail_memtable_bytes;
+                let ks = db.keyspace(name, || tail_create_options(mem))?;
+                if hdr_keyspaces.contains_key(&epoch) {
+                    tail_keyspaces.insert(epoch, ks);
+                } else {
+                    db.delete_keyspace(ks)?;
+                    removed_orphan_tail = true;
+                }
+            }
+        }
+
+        if removed_orphan_tail {
+            db.persist(PersistMode::SyncAll)?;
         }
 
         Ok(Self {
@@ -206,6 +222,7 @@ impl ShardStore {
             resources_ks,
             hdr_keyspaces,
             tail_keyspaces,
+            fail_drop_after_tail: false,
         })
     }
 
@@ -666,10 +683,31 @@ impl ShardStore {
     ///
     /// # Errors
     /// Returns [`AggError::Storage`].
-    pub fn delete_resources(&mut self, ids: &[u32]) -> AggResult<()> {
+    pub fn delete_resources(&self, ids: &[u32]) -> AggResult<()> {
         let mut batch = self.db.batch();
         for &id in ids {
             batch.remove(&self.resources_ks, id.to_be_bytes());
+        }
+        batch.durability(Some(PersistMode::Buffer)).commit()?;
+        Ok(())
+    }
+
+    /// Updates the persisted window references for the specified resources in `_resources`.
+    ///
+    /// # Errors
+    /// Returns [`AggError::Storage`] or [`AggError::Codec`].
+    pub fn update_resources(
+        &self,
+        entries: &[(u32, ResourceScopePayload, Vec<u64>)],
+    ) -> AggResult<()> {
+        let mut batch = self.db.batch();
+        for (id, payload, windows) in entries {
+            let stored = StoredResource {
+                payload: payload.clone(),
+                windows: windows.clone(),
+            };
+            let val = serde_json::to_vec(&stored).map_err(|e| AggError::Codec(e.to_string()))?;
+            batch.insert(&self.resources_ks, id.to_be_bytes(), val);
         }
         batch.durability(Some(PersistMode::Buffer)).commit()?;
         Ok(())
@@ -717,21 +755,14 @@ impl ShardStore {
         Ok(())
     }
 
-    /// Drops the header and tail keyspaces for window `epoch_ms`.
+    /// Drops the tail and header keyspaces for window `epoch_ms`, deleting `_tail` before `_hdr`
+    /// so `_hdr` serves as the durable commit marker.
     ///
     /// # Errors
     /// Returns [`AggError::Storage`].
     pub fn drop_window(&mut self, epoch_ms: u64) -> AggResult<()> {
         let hdr_name = format!("w{:020}_hdr", epoch_ms);
         let tail_name = format!("w{:020}_tail", epoch_ms);
-
-        if let Some(ks) = self.hdr_keyspaces.remove(&epoch_ms) {
-            self.db.delete_keyspace(ks)?;
-        } else if self.db.keyspace_exists(&hdr_name) {
-            let mem = self.opts.hdr_memtable_bytes;
-            let ks = self.db.keyspace(&hdr_name, || hdr_create_options(mem))?;
-            self.db.delete_keyspace(ks)?;
-        }
 
         if let Some(ks) = self.tail_keyspaces.remove(&epoch_ms) {
             self.db.delete_keyspace(ks)?;
@@ -741,7 +772,41 @@ impl ShardStore {
             self.db.delete_keyspace(ks)?;
         }
 
+        if self.fail_drop_after_tail {
+            self.fail_drop_after_tail = false;
+            return Err(AggError::Io(std::io::Error::other(
+                "injected drop_window failure after tail delete",
+            )));
+        }
+
+        if let Some(ks) = self.hdr_keyspaces.remove(&epoch_ms) {
+            self.db.delete_keyspace(ks)?;
+        } else if self.db.keyspace_exists(&hdr_name) {
+            let mem = self.opts.hdr_memtable_bytes;
+            let ks = self.db.keyspace(&hdr_name, || hdr_create_options(mem))?;
+            self.db.delete_keyspace(ks)?;
+        }
+
         Ok(())
+    }
+
+    /// Returns the sorted list of all keyspace names currently present in the underlying database.
+    #[must_use]
+    pub fn list_keyspace_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .db
+            .list_keyspace_names()
+            .into_iter()
+            .map(|n| n.to_string())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Injects a simulated failure after deleting the tail keyspace in the next `drop_window` call.
+    #[doc(hidden)]
+    pub fn set_fail_drop_after_tail(&mut self, fail: bool) {
+        self.fail_drop_after_tail = fail;
     }
 
     /// Returns the filesystem directory path for this shard store.
@@ -833,16 +898,16 @@ fn tail_create_options(max_mem: u64) -> KeyspaceCreateOptions {
         .max_memtable_size(max_mem)
 }
 
-fn parse_hdr_epoch(name: &str) -> Option<u64> {
-    if name.len() == 25 && name.starts_with('w') && name.ends_with("_hdr") {
+fn parse_tail_epoch(name: &str) -> Option<u64> {
+    if name.len() == 26 && name.starts_with('w') && name.ends_with("_tail") {
         name[1..21].parse::<u64>().ok()
     } else {
         None
     }
 }
 
-fn parse_tail_epoch(name: &str) -> Option<u64> {
-    if name.len() == 26 && name.starts_with('w') && name.ends_with("_tail") {
+fn parse_hdr_epoch(name: &str) -> Option<u64> {
+    if name.len() == 25 && name.starts_with('w') && name.ends_with("_hdr") {
         name[1..21].parse::<u64>().ok()
     } else {
         None

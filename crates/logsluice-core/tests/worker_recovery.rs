@@ -340,3 +340,107 @@ fn recovery_ticket_with_no_entries_is_resolved() {
         assert!(store.tickets().unwrap().is_empty());
     });
 }
+
+#[test]
+fn recovery_prunes_resource_refs_to_dropped_windows() {
+    let mut h = Harness::new(|c| {
+        c.window.emit.close_jitter_max = Duration::ZERO;
+    });
+    // Ingest same resource in Window 0 [0, DAY) and Window 1 [DAY, 2 * DAY) and flush L1
+    h.ingest(&[(1, 1_000)]);
+    h.advance(30_000, None);
+    h.ingest(&[(2, DAY + 1_000)]);
+    h.advance(60_000, None);
+
+    // Close, ack, and purge Window 0 while Window 1 is still active.
+    // On disk in `_resources`, the resource still lists `[0, DAY]` because its refcount did not hit 0.
+    h.advance(DAY + 31_000, Some(DAY));
+    let _ = h.drain_emitted();
+    h.ack_all();
+    h.advance(DAY + 3_700_000, Some(DAY + 3_600_001));
+    assert_eq!(h.live_windows(), vec![DAY as u64]);
+    assert_eq!(h.stats().resources_table_entries, 1);
+
+    // Restart: RecoveredState::load must prune the stale reference to dropped Window 0.
+    let mut h = h.restart();
+    assert_eq!(h.live_windows(), vec![DAY as u64]);
+    assert_eq!(h.stats().resources_table_entries, 1);
+
+    // Now close, ack, and purge Window 1: because Window 0 ref was pruned, the resource refcount
+    // now reaches 0 and it is evicted from ResourceScopeTable and deleted from `_resources`.
+    h.advance(2 * DAY + 31_000, Some(2 * DAY));
+    let _ = h.drain_emitted();
+    h.ack_all();
+    h.advance(2 * DAY + 3_700_000, Some(2 * DAY + 3_600_001));
+    assert!(h.live_windows().is_empty());
+    assert_eq!(h.stats().resources_table_entries, 0);
+}
+
+#[test]
+fn recovery_releases_unreferenced_resources() {
+    use logsluice_core::{
+        codec::plan::AggregationPlan,
+        config::EngineConfig,
+        key::StorageKey24,
+        resource::ResourceScopePayload,
+        store::shard_store::{FlushBatch, FlushEntry},
+        window::WindowClock,
+        worker::{RecoveredState, WorkerContext},
+    };
+    use std::sync::Arc;
+
+    let (mut store, kernels, _dir) = common::store_with_layout();
+    let payload = Arc::new(ResourceScopePayload {
+        resource: std::collections::BTreeMap::new(),
+        scope_name: "orphan-scope".into(),
+        scope_version: "1.0".into(),
+        scope_attrs: std::collections::BTreeMap::new(),
+    });
+
+    // Flush a resource referenced only by window 0, then drop window 0 without deleting the resource
+    // (simulating a crash between drop_window and delete_resources).
+    store
+        .apply_flush(
+            FlushBatch {
+                entries: vec![FlushEntry {
+                    key: StorageKey24 {
+                        epoch_ms: 0,
+                        digest: 42,
+                    },
+                    is_new: true,
+                    resource_scope_id: 7,
+                    delta: vec![[1, 0, 0, 0]],
+                    minmax: vec![(1, 1), (1, 1)],
+                    last_update_s: 1,
+                    tail: None,
+                }],
+                offsets: vec![],
+                new_resources: vec![(7, payload)],
+                resource_refs: vec![(7, 0)],
+            },
+            &kernels,
+        )
+        .unwrap();
+    store.drop_window(0).unwrap();
+    assert!(store.live_windows().is_empty());
+    assert_eq!(store.resources().unwrap().len(), 1);
+
+    let cfg = Arc::new(EngineConfig {
+        aggregations: common::spec_example(),
+        ..EngineConfig::default()
+    });
+    let plan = Arc::new(AggregationPlan::new(&cfg.aggregations).unwrap());
+    let clock = WindowClock::new(cfg.window.duration, cfg.window.offset).unwrap();
+    let ctx = WorkerContext {
+        cfg,
+        shard: 0,
+        emitter_id: Arc::from("pod-0"),
+        kernels,
+        plan,
+        clock,
+    };
+
+    let recovered = RecoveredState::load(&store, &ctx).unwrap();
+    assert!(recovered.resources.is_empty());
+    assert!(store.resources().unwrap().is_empty());
+}

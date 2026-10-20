@@ -600,3 +600,81 @@ fn store_opens_with_one_worker_thread() {
     };
     assert_eq!(store.header(&key).unwrap().unwrap().total[0][0], 5);
 }
+
+#[test]
+fn open_removes_orphan_tail_keyspace() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let store_opts = opts(d.path());
+    let s = ShardStore::open(store_opts.clone(), &meta).unwrap();
+    drop(s);
+
+    {
+        let db = fjall::Database::builder(&store_opts.shard_dir)
+            .open()
+            .unwrap();
+        let orphan_tail = db
+            .keyspace(
+                "w00000000000000000000_tail",
+                fjall::KeyspaceCreateOptions::default,
+            )
+            .unwrap();
+        orphan_tail.insert(b"k", b"v").unwrap();
+        db.persist(fjall::PersistMode::SyncAll).unwrap();
+        assert!(
+            db.list_keyspace_names()
+                .iter()
+                .any(|n| n.as_ref() == "w00000000000000000000_tail")
+        );
+    }
+
+    let s = ShardStore::open(store_opts, &meta).unwrap();
+    assert!(
+        !s.list_keyspace_names()
+            .iter()
+            .any(|n| n == "w00000000000000000000_tail")
+    );
+}
+
+#[test]
+fn drop_window_deletes_tail_before_hdr() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+    let mut s = ShardStore::open(opts(d.path()), &meta).unwrap();
+    s.apply_flush(batch(vec![entry(1, true, 1)]), &k).unwrap();
+
+    let key = StorageKey24 {
+        epoch_ms: 0,
+        digest: 1,
+    };
+    assert!(s.header(&key).unwrap().is_some());
+    assert!(s.tail(&key).unwrap().is_some());
+
+    s.set_fail_drop_after_tail(true);
+    assert!(s.drop_window(0).is_err());
+
+    // _tail must be deleted first, while _hdr remains as the durable commit marker.
+    assert!(
+        !s.list_keyspace_names()
+            .iter()
+            .any(|n| n == "w00000000000000000000_tail")
+    );
+    assert!(
+        s.list_keyspace_names()
+            .iter()
+            .any(|n| n == "w00000000000000000000_hdr")
+    );
+    assert_eq!(s.live_windows(), vec![0]);
+    assert!(s.header(&key).unwrap().is_some());
+    assert!(s.tail(&key).unwrap().is_none());
+
+    // Subsequent retry completes deletion of _hdr.
+    s.drop_window(0).unwrap();
+    assert!(s.live_windows().is_empty());
+    assert!(
+        !s.list_keyspace_names()
+            .iter()
+            .any(|n| n == "w00000000000000000000_hdr")
+    );
+}

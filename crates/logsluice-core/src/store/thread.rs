@@ -111,12 +111,16 @@ pub enum StoreEvent<F> {
         /// Storage error encountered during ticket persistence.
         error: AggError,
     },
-    /// Row scan or key lookup failed; returns the window epoch, emission reason, and error.
+    /// Row scan or key lookup failed; returns the window epoch, emission reason, scan parameters, and error.
     RowsFailed {
         /// Target window epoch in milliseconds.
         epoch_ms: u64,
         /// Reason that triggered the row read.
         reason: EmitReason,
+        /// Resume key boundary (exclusive) for paged scans.
+        after: Option<StorageKey24>,
+        /// Optional explicit keys requested for the row read.
+        keys: Option<Vec<StorageKey24>>,
         /// Storage error encountered during the row read.
         error: AggError,
     },
@@ -315,6 +319,8 @@ impl StoreThread {
                                 let _ = tx_event.unbounded_send(StoreEvent::RowsFailed {
                                     epoch_ms,
                                     reason,
+                                    after,
+                                    keys,
                                     error: AggError::Channel("injected Rows failure".into()),
                                 });
                                 continue;
@@ -333,6 +339,8 @@ impl StoreThread {
                                         let _ = tx_event.unbounded_send(StoreEvent::RowsFailed {
                                             epoch_ms,
                                             reason,
+                                            after,
+                                            keys,
                                             error,
                                         });
                                     }
@@ -356,6 +364,8 @@ impl StoreThread {
                                         let _ = tx_event.unbounded_send(StoreEvent::RowsFailed {
                                             epoch_ms,
                                             reason,
+                                            after,
+                                            keys,
                                             error,
                                         });
                                     }

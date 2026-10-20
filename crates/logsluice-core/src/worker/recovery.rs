@@ -118,6 +118,7 @@ impl RecoveredState {
                     forced: false,
                     flush_done: true,
                     scan_cursor: None,
+                    pending_next_cursor: None,
                     scan_started: true,
                     scan_complete: true,
                 });

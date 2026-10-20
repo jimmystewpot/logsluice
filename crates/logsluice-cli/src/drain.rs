@@ -7,16 +7,17 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use logsluice_core::{
     codec::{plan::HeaderLayout, tail::ExemplarTail, ticket::EmitReason},
     emission::{SliceRecord, slice_id},
     error::{AggError, AggResult},
+    key::StorageKey24,
     resource::ResourceScopePayload,
     simd::{SimdKernelTable, SimdMode},
     store::{
         meta::PodMeta,
-        shard_store::{ShardStore, StoreOptions},
+        shard_store::{JoinedRow, ShardStore, StoreOptions},
     },
     window::WindowClock,
     worker::spill::SpillWriter,
@@ -86,14 +87,16 @@ pub fn run_drain(data_dir: &Path, format: &str) -> AggResult<()> {
             max_cached_files: None,
         };
 
-        let store = ShardStore::open(store_opts, &meta)?;
+        let mut store = ShardStore::open(store_opts, &meta)?;
         let mut resources = HashMap::new();
         for (id, payload, _windows) in store.resources()? {
             resources.insert(id, Arc::new(payload));
         }
 
         let mut spill_writer = SpillWriter::new(spill_dir);
+        let mut spilled_ticket_ids = HashSet::new();
         for (ticket_id, records) in spill_writer.pending()? {
+            spilled_ticket_ids.insert(ticket_id);
             for record in records {
                 let line =
                     serde_json::to_string(&record).map_err(|e| AggError::Codec(e.to_string()))?;
@@ -101,6 +104,91 @@ pub fn run_drain(data_dir: &Path, format: &str) -> AggResult<()> {
             }
             std::io::stdout().flush()?;
             spill_writer.remove(ticket_id)?;
+        }
+
+        let mut tickets = store.tickets()?;
+        tickets.sort_by_key(|t| t.id);
+
+        for ticket in tickets {
+            if spilled_ticket_ids.contains(&ticket.id) {
+                store.apply_ack(&ticket, &kernels)?;
+                continue;
+            }
+
+            let keys: Vec<StorageKey24> = ticket
+                .entries
+                .iter()
+                .map(|e| StorageKey24 {
+                    epoch_ms: ticket.window_epoch_ms,
+                    digest: e.digest,
+                })
+                .collect();
+            let rows = store.rows_for(&keys)?;
+            let row_map: HashMap<u128, &JoinedRow> =
+                rows.iter().map(|r| (r.key.digest, r)).collect();
+
+            let window_start_ms = ticket.window_epoch_ms as i64;
+            let window_end_ms = clock.end_of(window_start_ms);
+
+            for entry in &ticket.entries {
+                let matching_row = row_map.get(&entry.digest).copied();
+                if let Some(row) = matching_row {
+                    if row.header.slice_seq != entry.slice_seq {
+                        continue;
+                    }
+                }
+
+                let (res, tail) = if let Some(row) = matching_row {
+                    let res = resources
+                        .get(&row.header.resource_scope_id)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::clone(&default_res));
+                    let tail = row.tail.clone().unwrap_or_else(|| ExemplarTail {
+                        severity: 0,
+                        body: None,
+                        dims: Vec::new(),
+                        attrs: Vec::new(),
+                    });
+                    (res, tail)
+                } else {
+                    (
+                        Arc::clone(&default_res),
+                        ExemplarTail {
+                            severity: 0,
+                            body: None,
+                            dims: Vec::new(),
+                            attrs: Vec::new(),
+                        },
+                    )
+                };
+
+                let sid = slice_id(
+                    &meta.emitter_id,
+                    ticket.window_epoch_ms,
+                    entry.digest,
+                    entry.slice_seq,
+                );
+
+                let record = SliceRecord {
+                    window_start_ms,
+                    window_end_ms,
+                    emit_reason: ticket.reason,
+                    emitter_id: meta.emitter_id.clone(),
+                    digest: entry.digest,
+                    slice_seq: entry.slice_seq,
+                    slice_id: sid,
+                    resource: res,
+                    tail,
+                    counters: entry.delta.clone(),
+                    minmax: entry.minmax.clone(),
+                };
+
+                let line =
+                    serde_json::to_string(&record).map_err(|e| AggError::Codec(e.to_string()))?;
+                println!("{line}");
+            }
+            std::io::stdout().flush()?;
+            store.apply_ack(&ticket, &kernels)?;
         }
 
         for epoch_ms in store.live_windows() {

@@ -210,3 +210,214 @@ fn replay_with_nack_rate_exercises_rng_and_matches_totals() {
     assert!(o.status.success(), "{s}");
     assert!(s.contains("totals_match=true"));
 }
+
+#[test]
+fn drain_replays_in_flight_ticket_with_original_slice_id_and_no_duplicate_delta() {
+    use logsluice_core::{
+        codec::{
+            plan::HeaderLayout,
+            ticket::{EmitReason, Ticket, TicketEntry},
+        },
+        emission::slice_id,
+        key::StorageKey24,
+        resource::ResourceScopePayload,
+        simd::{SimdKernelTable, SimdMode},
+        store::{
+            meta::PodMeta,
+            shard_store::{FlushBatch, FlushEntry, ShardStore, StoreOptions},
+        },
+    };
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let meta = PodMeta::load_or_init(dir.path(), "test-pod", 1, b"schema").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+    let layout = HeaderLayout {
+        banks: 1,
+        minmax_slots: 2,
+    };
+    let opts = StoreOptions {
+        shard_dir: dir.path().join("shard_0"),
+        cache_bytes: 8 << 20,
+        hdr_memtable_bytes: 1 << 20,
+        tail_memtable_bytes: 1 << 20,
+        sync_wal: true,
+        layout,
+        worker_threads: 2,
+        max_write_buffer_bytes: None,
+        max_cached_files: None,
+    };
+
+    let mut store = ShardStore::open(opts.clone(), &meta).unwrap();
+    let epoch_ms = 1_700_000_000_000u64;
+    let digest_a = 0x1111u128;
+    let digest_b = 0x2222u128;
+    let res = Arc::new(ResourceScopePayload {
+        resource: [(
+            "service.name".to_string(),
+            serde_json::json!("test-service"),
+        )]
+        .into(),
+        scope_name: "test-scope".to_string(),
+        scope_version: "1.0.0".to_string(),
+        scope_attrs: Default::default(),
+    });
+
+    // 1. Initial flush: 100 counts for Key A and Key B
+    let entry_a = FlushEntry {
+        key: StorageKey24 {
+            epoch_ms,
+            digest: digest_a,
+        },
+        is_new: true,
+        resource_scope_id: 0,
+        delta: vec![[100, 0, 0, 0]],
+        minmax: vec![(5, 10), (0, 0)],
+        last_update_s: 1,
+        tail: None,
+    };
+    let entry_b = FlushEntry {
+        key: StorageKey24 {
+            epoch_ms,
+            digest: digest_b,
+        },
+        is_new: true,
+        resource_scope_id: 0,
+        delta: vec![[100, 0, 0, 0]],
+        minmax: vec![(5, 10), (0, 0)],
+        last_update_s: 1,
+        tail: None,
+    };
+    let batch = FlushBatch {
+        entries: vec![entry_a, entry_b],
+        offsets: Vec::new(),
+        new_resources: vec![(0, res)],
+        resource_refs: vec![(0, epoch_ms)],
+    };
+    store.apply_flush(batch, &k).unwrap();
+
+    // 2. Persist an in-flight ticket for Key A and Key B with slice_seq 0
+    let ticket = Ticket {
+        id: 42,
+        window_epoch_ms: epoch_ms,
+        reason: EmitReason::Periodic,
+        entries: vec![
+            TicketEntry {
+                digest: digest_a,
+                slice_seq: 0,
+                delta: vec![[100, 0, 0, 0]],
+                minmax: vec![(5, 10), (0, 0)],
+            },
+            TicketEntry {
+                digest: digest_b,
+                slice_seq: 0,
+                delta: vec![[100, 0, 0, 0]],
+                minmax: vec![(5, 10), (0, 0)],
+            },
+        ],
+    };
+    store.put_tickets(&[ticket]).unwrap();
+
+    // 3. Second flush of 50 counts for Key B only (Key A has no new events; Key B total becomes 150)
+    let entry_b2 = FlushEntry {
+        key: StorageKey24 {
+            epoch_ms,
+            digest: digest_b,
+        },
+        is_new: false,
+        resource_scope_id: 0,
+        delta: vec![[50, 0, 0, 0]],
+        minmax: vec![(3, 12), (0, 0)],
+        last_update_s: 2,
+        tail: None,
+    };
+    let batch2 = FlushBatch {
+        entries: vec![entry_b2],
+        offsets: Vec::new(),
+        new_resources: Vec::new(),
+        resource_refs: vec![(0, epoch_ms)],
+    };
+    store.apply_flush(batch2, &k).unwrap();
+
+    // Close store so drain can open it cleanly
+    drop(store);
+
+    // 4. Run `drain`
+    let out = bin()
+        .args([
+            "drain",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "ndjson",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "drain failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    assert_eq!(
+        records.len(),
+        3,
+        "expected exactly 3 records (2 from replayed ticket, 1 for remaining delta of Key B):\n{stdout}"
+    );
+
+    // Find records by digest and emit_reason
+    let key_a_ticket = records
+        .iter()
+        .find(|r| r["digest"].as_u64() == Some(digest_a as u64) && r["emit_reason"] == "periodic")
+        .expect("key A ticket record must exist");
+    assert_eq!(key_a_ticket["slice_seq"], 0);
+    assert_eq!(
+        key_a_ticket["slice_id"],
+        slice_id(&meta.emitter_id, epoch_ms, digest_a, 0)
+    );
+    assert_eq!(key_a_ticket["counters"][0][0], 100);
+
+    // Key A must NOT have any duplicate record under "drain" because total == emitted
+    assert!(
+        records.iter().all(
+            |r| !(r["digest"].as_u64() == Some(digest_a as u64) && r["emit_reason"] == "drain")
+        ),
+        "key A must not be emitted a second time under drain"
+    );
+
+    let key_b_ticket = records
+        .iter()
+        .find(|r| r["digest"].as_u64() == Some(digest_b as u64) && r["emit_reason"] == "periodic")
+        .expect("key B ticket record must exist");
+    assert_eq!(key_b_ticket["slice_seq"], 0);
+    assert_eq!(
+        key_b_ticket["slice_id"],
+        slice_id(&meta.emitter_id, epoch_ms, digest_b, 0)
+    );
+    assert_eq!(key_b_ticket["counters"][0][0], 100);
+
+    let key_b_drain = records
+        .iter()
+        .find(|r| r["digest"].as_u64() == Some(digest_b as u64) && r["emit_reason"] == "drain")
+        .expect("key B drain record must exist");
+    assert_eq!(key_b_drain["slice_seq"], 1);
+    assert_eq!(
+        key_b_drain["slice_id"],
+        slice_id(&meta.emitter_id, epoch_ms, digest_b, 1)
+    );
+    assert_eq!(key_b_drain["counters"][0][0], 50);
+
+    // 5. Verify that in the store, the ticket has been acknowledged and removed from _tickets
+    let store_after = ShardStore::open(opts, &meta).unwrap();
+    assert!(
+        store_after.tickets().unwrap().is_empty(),
+        "persisted tickets must be acknowledged and removed from _tickets after drain replay"
+    );
+}

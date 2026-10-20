@@ -278,6 +278,103 @@ fn rows_for_window_keys_resources_and_disk_bytes() {
 }
 
 #[test]
+fn disk_bytes_grows_after_flush_and_shrinks_after_drop_window() {
+    let d = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"s").unwrap();
+    let k = SimdKernelTable::detect(SimdMode::Scalar);
+    let mut store_opts = opts(d.path());
+    store_opts.hdr_memtable_bytes = 1;
+    store_opts.tail_memtable_bytes = 1;
+    let mut s = ShardStore::open(store_opts.clone(), &meta).unwrap();
+
+    let initial = s.disk_bytes().unwrap();
+
+    // Flush a 64 KiB incompressible exemplar tail so both the journal (~64 KiB) and the
+    // rotated window tail SSTable (~64 KiB) contribute to fjall's disk_space().
+    let incompressible: Vec<u8> = (0..16_384u32)
+        .flat_map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes())
+        .collect();
+    let mut flush_entry = entry(1, true, 1);
+    flush_entry.tail = Some(ExemplarTail {
+        severity: 9,
+        body: Some(bytes::Bytes::from(incompressible)),
+        dims: vec![],
+        attrs: vec![],
+    });
+    s.apply_flush(batch(vec![flush_entry]), &k).unwrap();
+
+    // Wait for fjall's background flush worker to materialize the rotated memtable SSTable.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let after_flush = loop {
+        let current = s.disk_bytes().unwrap();
+        if current > initial || std::time::Instant::now() >= deadline {
+            break current;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(
+        after_flush > initial,
+        "expected disk_bytes after flush ({after_flush}) > initial ({initial})"
+    );
+
+    s.drop_window(0).unwrap();
+    let after_drop = s.disk_bytes().unwrap();
+    assert!(
+        after_drop < after_flush,
+        "expected disk_bytes after drop_window ({after_drop}) < after_flush ({after_flush})"
+    );
+}
+
+#[test]
+fn disk_bytes_includes_spill_files() {
+    use logsluice_core::emission::SliceRecord;
+    use logsluice_core::worker::spill::SpillWriter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let meta = PodMeta::load_or_init(dir.path(), "pod-0", 1, b"s").unwrap();
+    let mut store_opts = opts(dir.path());
+    store_opts.shard_dir = dir.path().to_path_buf();
+    let store = ShardStore::open(store_opts, &meta).unwrap();
+
+    let initial = store.disk_bytes().unwrap();
+
+    let mut spill_writer = SpillWriter::new(dir.path().to_path_buf());
+    let record = SliceRecord {
+        window_start_ms: 0,
+        window_end_ms: 60_000,
+        emit_reason: EmitReason::Close,
+        emitter_id: "pod-0".to_string(),
+        digest: 123,
+        slice_seq: 0,
+        slice_id: "pod-0:0:0000000000000000000000000000007b:0".to_string(),
+        resource: Arc::new(ResourceScopePayload {
+            resource: std::collections::BTreeMap::new(),
+            scope_name: "test".to_string(),
+            scope_version: "1.0".to_string(),
+            scope_attrs: std::collections::BTreeMap::new(),
+        }),
+        tail: ExemplarTail {
+            severity: 9,
+            body: Some(bytes::Bytes::from_static(b"spill-payload-body")),
+            dims: Vec::new(),
+            attrs: Vec::new(),
+        },
+        counters: vec![[1, 0, 0, 0]],
+        minmax: vec![(10, 20)],
+    };
+
+    spill_writer.spill(42, &[record]).unwrap();
+    let spill_file = spill_writer.spill_dir().join(format!("{:020}.ndjson", 42));
+    let spill_len = std::fs::metadata(&spill_file).unwrap().len();
+    assert!(spill_len > 0);
+
+    assert_eq!(store.disk_bytes().unwrap(), initial + spill_len);
+
+    spill_writer.remove(42).unwrap();
+    assert_eq!(store.disk_bytes().unwrap(), initial);
+}
+
+#[test]
 fn shard_store_cross_checks_meta_on_reopen() {
     let d = tempfile::tempdir().unwrap();
     let meta = PodMeta::load_or_init(d.path(), "pod-0", 2, b"schema-v1").unwrap();

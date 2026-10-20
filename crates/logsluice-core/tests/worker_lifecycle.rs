@@ -700,3 +700,55 @@ fn spill_file_count_is_cached_not_read_per_stats() {
     assert_eq!(h.stats().spill_files, 0);
     assert_eq!(h.spill_files(), 0);
 }
+
+#[test]
+fn spill_files_update_worker_disk_bytes_and_trigger_disk_full_policy() {
+    use logsluice_core::config::OnDiskFull;
+    use std::time::Duration;
+
+    let max_disk_bytes = (64 << 20) + 100;
+    let mut h = Harness::new(|c| {
+        c.window.emit.close_jitter_max = Duration::ZERO;
+        c.window.max_closing_duration = Duration::from_secs(60);
+        c.storage.max_disk_bytes = max_disk_bytes;
+        c.storage.control_reserve_bytes = 0;
+        c.storage.on_disk_full = OnDiskFull::Block;
+    });
+
+    h.ingest(&[(1, 1_000)]);
+    h.advance(DAY + 31_000, Some(DAY));
+    let emitted = h.drain_emitted();
+    assert_eq!(emitted.len(), 1);
+    h.nack_all();
+
+    let before_spill = h.worker().effective_disk_bytes();
+    assert!(
+        before_spill > 0 && before_spill < max_disk_bytes,
+        "expected initial disk_bytes ({before_spill}) to be in (0, {max_disk_bytes})"
+    );
+
+    // Advance past max_closing_duration (60s) with an empty L1 buffer so no Flush runs;
+    // the unacked ticket spills to disk on StoreThread and SpillDone updates disk_bytes.
+    h.advance(DAY + 92_000, Some(DAY));
+    assert_eq!(h.spill_files(), 1);
+
+    let after_spill = h.worker().effective_disk_bytes();
+    assert!(
+        after_spill > before_spill,
+        "expected effective_disk_bytes after spill ({after_spill}) > before_spill ({before_spill})"
+    );
+    assert!(
+        after_spill >= max_disk_bytes,
+        "expected effective_disk_bytes after spill ({after_spill}) >= max_disk_bytes ({max_disk_bytes})"
+    );
+
+    // Because spill bytes pushed disk usage past max_disk_bytes, OnDiskFull::Block must now backpressure new keys.
+    assert!(h.ingest(&[(3, DAY + 2_000)]).backpressure);
+
+    // Replay the spilled slice and acknowledge delivery; removing the spill file shrinks disk_bytes back.
+    h.advance(DAY + 153_000, Some(DAY));
+    assert_eq!(h.drain_emitted().len(), 1);
+    h.ack_all();
+    assert_eq!(h.spill_files(), 0);
+    assert_eq!(h.worker().effective_disk_bytes(), before_spill);
+}

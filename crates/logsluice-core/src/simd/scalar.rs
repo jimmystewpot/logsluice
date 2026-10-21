@@ -225,6 +225,39 @@ pub(crate) fn fingerprint_log_bytes_scalar(input: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// Scans log bytes in `width`-byte chunks, copying a chunk only when it cannot
+/// start or continue a replaced token.
+///
+/// AVX2 and NEON only prefilter chunks. Token replacement (UUID, IPv4, hex,
+/// numbers) is scalar so the three backends stay bit-identical. The last byte
+/// of a clean chunk is still checked with `is_ascii_hexdigit` because a hex run
+/// can straddle the chunk boundary; skipping that check would let the vector
+/// path disagree with scalar. `tests/simd_parity.rs` is the gate.
+///
+/// `width` is the chunk size (32 for AVX2, 16 for NEON) and must be non-zero.
+/// `chunk_has_marker` reports whether that chunk contains a digit or `'-'`.
+pub(crate) fn fingerprint_scan(
+    input: &[u8],
+    out: &mut Vec<u8>,
+    width: usize,
+    mut chunk_has_marker: impl FnMut(&[u8]) -> bool,
+) {
+    out.reserve(input.len());
+    let mut pos = 0;
+    while pos + width <= input.len() {
+        let chunk = &input[pos..pos + width];
+        if !chunk_has_marker(chunk) && !chunk[width - 1].is_ascii_hexdigit() {
+            out.extend_from_slice(chunk);
+            pos += width;
+        } else {
+            step_scalar(input, &mut pos, out);
+        }
+    }
+    while pos < input.len() {
+        step_scalar(input, &mut pos, out);
+    }
+}
+
 /// Hashes input bytes with 64-bit seed using XXH3-128.
 pub(crate) fn hash_key_128_scalar(bytes: &[u8], seed: u64) -> u128 {
     xxhash_rust::xxh3::xxh3_128_with_seed(bytes, seed)

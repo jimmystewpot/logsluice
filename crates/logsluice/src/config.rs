@@ -588,54 +588,10 @@ pub fn parse_byte_size_option<'de, D>(deserializer: D) -> Result<Option<u64>, D:
 where
     D: Deserializer<'de>,
 {
-    struct OptionalByteSizeVisitor;
+    #[derive(Deserialize)]
+    struct ByteSizeField(#[serde(deserialize_with = "parse_byte_size")] u64);
 
-    impl<'de> Visitor<'de> for OptionalByteSizeVisitor {
-        type Value = Option<u64>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("an optional byte size string (e.g. '64MiB'), integer, or null")
-        }
-
-        fn visit_none<E>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_unit<E>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            parse_byte_size(deserializer).map(Some)
-        }
-
-        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
-            Ok(Some(v))
-        }
-
-        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            if v < 0 {
-                Err(E::custom("byte size cannot be negative"))
-            } else {
-                Ok(Some(v as u64))
-            }
-        }
-
-        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            parse_bytes_str(v).map(Some).map_err(E::custom)
-        }
-    }
-
-    deserializer.deserialize_option(OptionalByteSizeVisitor)
+    Option::<ByteSizeField>::deserialize(deserializer).map(|opt| opt.map(|w| w.0))
 }
 
 /// Window adapter configuration.
@@ -1196,5 +1152,210 @@ impl SluiceConfig {
         }
 
         bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::de::value::{Error as DeValueError, I64Deserializer};
+
+    #[test]
+    fn parse_byte_size_option_handles_null_int_and_invalid_inputs() {
+        let null_cfg: StorageAdapterConfig =
+            serde_yaml_ng::from_str("max_write_buffer_bytes: null").expect("null should parse");
+        assert_eq!(null_cfg.max_write_buffer_bytes, None);
+
+        let int_cfg: StorageAdapterConfig =
+            serde_yaml_ng::from_str("max_write_buffer_bytes: 67108864").expect("int should parse");
+        assert_eq!(int_cfg.max_write_buffer_bytes, Some(67_108_864));
+
+        let tb_cfg: StorageAdapterConfig =
+            serde_yaml_ng::from_str("max_write_buffer_bytes: \"1TB\"").expect("1TB should parse");
+        assert_eq!(tb_cfg.max_write_buffer_bytes, Some(1_000_000_000_000));
+
+        for (raw, expected) in [
+            ("512B", 512_u64),
+            ("2KB", 2_000),
+            ("2KiB", 2_048),
+            ("3MB", 3_000_000),
+            ("3MiB", 3 * 1024 * 1024),
+            ("4GB", 4_000_000_000),
+            ("4GiB", 4 * 1024 * 1024 * 1024),
+            ("1TiB", 1024 * 1024 * 1024 * 1024),
+        ] {
+            let cfg: StorageAdapterConfig =
+                serde_yaml_ng::from_str(&format!("max_write_buffer_bytes: \"{raw}\""))
+                    .expect("unit should parse");
+            assert_eq!(cfg.max_write_buffer_bytes, Some(expected));
+        }
+
+        let pos_i64 =
+            parse_byte_size(I64Deserializer::<DeValueError>::new(4096)).expect("i64 should parse");
+        assert_eq!(pos_i64, 4096);
+
+        for invalid_yaml in [
+            "max_write_buffer_bytes: \"\"",
+            "max_write_buffer_bytes: -1",
+            "max_write_buffer_bytes: [1, 2]",
+            "max_write_buffer_bytes: \"..B\"",
+            "max_write_buffer_bytes: \"10PB\"",
+            "max_write_buffer_bytes: \"999999999999999999999TiB\"",
+        ] {
+            let res: Result<StorageAdapterConfig, _> = serde_yaml_ng::from_str(invalid_yaml);
+            assert!(res.is_err(), "expected error for {invalid_yaml}");
+        }
+    }
+
+    #[test]
+    fn sluice_config_defaults_and_enum_conversions_roundtrip() {
+        let default_window = WindowAdapterConfig::default();
+        assert_eq!(default_window.r#type, "tumbling");
+        assert_eq!(default_window.duration, Duration::from_secs(86400));
+
+        let mut cfg = SluiceConfig::default();
+        assert_eq!(cfg.shards, 4);
+        assert_eq!(CoreSimdMode::from(SimdMode::Auto), CoreSimdMode::Auto);
+        assert_eq!(CoreSimdMode::from(SimdMode::Scalar), CoreSimdMode::Scalar);
+        assert_eq!(
+            CoreOnDiskFull::from(OnDiskFull::Block),
+            CoreOnDiskFull::Block
+        );
+
+        let yaml_defaults: SluiceConfig = serde_yaml_ng::from_str(
+            r#"
+window: {}
+source_position: {}
+normalizers:
+  client.ip:
+    type: ip_cidr
+    when:
+      field: env
+      equals: prod
+  message:
+    type: log_fingerprint
+"#,
+        )
+        .expect("minimal yaml should parse");
+        assert_eq!(yaml_defaults.window, default_window);
+        assert_eq!(
+            yaml_defaults.source_position,
+            Some(SourcePositionConfig::default())
+        );
+
+        cfg.emit_mode = EmitMode::Cumulative;
+        cfg.storage.on_disk_full = OnDiskFull::DropNewest;
+        cfg.cardinality.on_cap = OnCap::EvictCold;
+        cfg.window.emit.strategy = EmitStrategy::Periodic;
+        cfg.window.emit.interval = Some(Duration::from_secs(60));
+        cfg.shutdown.on_shutdown = OnShutdown::Persist;
+        cfg.attributes_policy.body_policy = BodyPolicy::ReplaceWithTemplate;
+        cfg.attributes_policy.unmatched_log_attributes = UnmatchedLogAttributes::KeepFirst;
+        cfg.attributes_policy
+            .resource_attributes_exclude
+            .insert("host.id".to_string());
+        cfg.attributes_policy
+            .exclude_attributes
+            .insert("trace_id".to_string());
+        cfg.source_position = Some(SourcePositionConfig::default());
+        cfg.normalizers = yaml_defaults.normalizers;
+        cfg.group_by = vec!["service.name".to_string()];
+        cfg.aggregations.insert(
+            "events".to_string(),
+            AggregationDefinition::Simple("count".to_string()),
+        );
+        cfg.aggregations.insert(
+            "detailed_count".to_string(),
+            AggregationDefinition::Detailed(IndexMap::from([(
+                "count".to_string(),
+                "event.id".to_string(),
+            )])),
+        );
+        cfg.aggregations.insert(
+            "bytes_sum".to_string(),
+            AggregationDefinition::Detailed(IndexMap::from([(
+                "sum".to_string(),
+                "network.bytes".to_string(),
+            )])),
+        );
+        cfg.aggregations.insert(
+            "lat_min".to_string(),
+            AggregationDefinition::Detailed(IndexMap::from([(
+                "min".to_string(),
+                "latency".to_string(),
+            )])),
+        );
+        cfg.aggregations.insert(
+            "lat_max".to_string(),
+            AggregationDefinition::Detailed(IndexMap::from([(
+                "max".to_string(),
+                "latency".to_string(),
+            )])),
+        );
+
+        let (engine, plan) = cfg
+            .into_engine_and_plan()
+            .expect("valid config should compile");
+        assert_eq!(engine.emit_mode, CoreEmitMode::Cumulative);
+        assert_eq!(engine.storage.on_disk_full, CoreOnDiskFull::DropNewest);
+        assert_eq!(engine.cardinality.on_cap, CoreOnCap::EvictCold);
+        assert_eq!(engine.window.emit.strategy, CoreEmitStrategy::Periodic);
+        assert_eq!(engine.shutdown.on_shutdown, CoreOnShutdown::Persist);
+        assert_eq!(plan.specs().len(), 5);
+
+        let schema_replace = cfg.codec_schema();
+        assert!(!schema_replace.is_empty());
+
+        cfg.attributes_policy.body_policy = BodyPolicy::Ignore;
+        cfg.attributes_policy.unmatched_log_attributes = UnmatchedLogAttributes::Drop;
+        let schema_ignore = cfg.codec_schema();
+        assert!(!schema_ignore.is_empty());
+        assert_ne!(schema_replace, schema_ignore);
+    }
+
+    #[test]
+    fn into_engine_and_plan_rejects_invalid_aggregation_specs() {
+        for missing_field_kind in ["sum", "min", "max", "unknown_kind"] {
+            let mut cfg = SluiceConfig::default();
+            cfg.aggregations.insert(
+                "metric".to_string(),
+                AggregationDefinition::Simple(missing_field_kind.to_string()),
+            );
+            let err = cfg
+                .into_engine_and_plan()
+                .expect_err("simple non-count or unknown aggregation must fail");
+            assert!(matches!(err, AggError::Config(_)));
+            assert!(cfg.codec_schema().is_empty());
+        }
+
+        for (kind, field) in [
+            ("sum", ""),
+            ("min", ""),
+            ("max", ""),
+            ("unknown_kind", "latency"),
+        ] {
+            let mut cfg = SluiceConfig::default();
+            cfg.aggregations.insert(
+                "metric".to_string(),
+                AggregationDefinition::Detailed(IndexMap::from([(
+                    kind.to_string(),
+                    field.to_string(),
+                )])),
+            );
+            let err = cfg
+                .into_engine_and_plan()
+                .expect_err("invalid detailed aggregation spec must fail");
+            assert!(matches!(err, AggError::Config(_)));
+        }
+
+        let mut empty_detailed = SluiceConfig::default();
+        empty_detailed.aggregations.insert(
+            "metric".to_string(),
+            AggregationDefinition::Detailed(IndexMap::new()),
+        );
+        assert!(matches!(
+            empty_detailed.into_engine_and_plan(),
+            Err(AggError::Config(_))
+        ));
     }
 }

@@ -310,18 +310,24 @@ mod tests {
             .join(format!("{:020}.ndjson.corrupt", 10));
         fs::write(&corrupt_orig, b"{broken json\n").expect("write corrupt file");
 
-        assert_eq!(writer.count_files(), 2);
+        let bad_stem_orig = writer.spill_dir().join("bad_stem.ndjson");
+        let bad_stem_quarantined = writer.spill_dir().join("bad_stem.ndjson.corrupt");
+        fs::write(&bad_stem_orig, b"{\"not\":\"valid_id\"}\n").expect("write bad stem file");
+
+        assert_eq!(writer.count_files(), 3);
 
         let (first, quarantined) = writer
             .pending_with_quarantined()
             .expect("pending should skip corrupt file instead of failing");
-        assert_eq!(quarantined, 1);
+        assert_eq!(quarantined, 2);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].0, 20);
         assert_eq!(first[0].1, vec![valid_record]);
 
         assert!(!corrupt_orig.exists());
         assert!(corrupt_quarantined.exists());
+        assert!(!bad_stem_orig.exists());
+        assert!(bad_stem_quarantined.exists());
         assert_eq!(writer.count_files(), 1);
 
         let (second, second_quarantined) = writer

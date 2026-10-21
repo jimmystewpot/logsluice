@@ -23,6 +23,25 @@ use logsluice_core::{
     worker::spill::SpillWriter,
 };
 
+fn scan_window_rows_map(store: &ShardStore, epoch_ms: u64) -> AggResult<HashMap<u128, JoinedRow>> {
+    let mut map = HashMap::new();
+    let mut after: Option<StorageKey24> = None;
+    loop {
+        let rows = store.rows(epoch_ms, after, 500)?;
+        let batch_len = rows.len();
+        if let Some(last) = rows.last() {
+            after = Some(last.key);
+        }
+        for row in rows {
+            map.insert(row.key.digest, row);
+        }
+        if batch_len < 500 {
+            break;
+        }
+    }
+    Ok(map)
+}
+
 /// Executes the offline drain command across all shard stores in `data_dir`.
 ///
 /// # Errors
@@ -108,6 +127,7 @@ pub fn run_drain(data_dir: &Path, format: &str) -> AggResult<()> {
 
         let mut tickets = store.tickets()?;
         tickets.sort_by_key(|t| t.id);
+        let mut ticket_window_rows: HashMap<u64, HashMap<u128, JoinedRow>> = HashMap::new();
 
         for ticket in tickets {
             if spilled_ticket_ids.contains(&ticket.id) {
@@ -115,52 +135,35 @@ pub fn run_drain(data_dir: &Path, format: &str) -> AggResult<()> {
                 continue;
             }
 
-            let keys: Vec<StorageKey24> = ticket
-                .entries
-                .iter()
-                .map(|e| StorageKey24 {
-                    epoch_ms: ticket.window_epoch_ms,
-                    digest: e.digest,
-                })
-                .collect();
-            let rows = store.rows_for(&keys)?;
-            let row_map: HashMap<u128, &JoinedRow> =
-                rows.iter().map(|r| (r.key.digest, r)).collect();
+            let row_map = match ticket_window_rows.entry(ticket.window_epoch_ms) {
+                hashbrown::hash_map::Entry::Occupied(e) => e.into_mut(),
+                hashbrown::hash_map::Entry::Vacant(e) => {
+                    let scanned = scan_window_rows_map(&store, ticket.window_epoch_ms)?;
+                    e.insert(scanned)
+                }
+            };
 
             let window_start_ms = ticket.window_epoch_ms as i64;
             let window_end_ms = clock.end_of(window_start_ms);
 
             for entry in &ticket.entries {
-                let matching_row = row_map.get(&entry.digest).copied();
-                if let Some(row) = matching_row {
-                    if row.header.slice_seq != entry.slice_seq {
-                        continue;
-                    }
-                }
-
-                let (res, tail) = if let Some(row) = matching_row {
-                    let res = resources
-                        .get(&row.header.resource_scope_id)
-                        .cloned()
-                        .unwrap_or_else(|| Arc::clone(&default_res));
-                    let tail = row.tail.clone().unwrap_or_else(|| ExemplarTail {
-                        severity: 0,
-                        body: None,
-                        dims: Vec::new(),
-                        attrs: Vec::new(),
-                    });
-                    (res, tail)
-                } else {
-                    (
-                        Arc::clone(&default_res),
-                        ExemplarTail {
-                            severity: 0,
-                            body: None,
-                            dims: Vec::new(),
-                            attrs: Vec::new(),
-                        },
-                    )
+                let Some(row) = row_map
+                    .get(&entry.digest)
+                    .filter(|r| r.header.slice_seq == entry.slice_seq)
+                else {
+                    continue;
                 };
+
+                let res = resources
+                    .get(&row.header.resource_scope_id)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::clone(&default_res));
+                let tail = row.tail.clone().unwrap_or_else(|| ExemplarTail {
+                    severity: 0,
+                    body: None,
+                    dims: Vec::new(),
+                    attrs: Vec::new(),
+                });
 
                 let sid = slice_id(
                     &meta.emitter_id,

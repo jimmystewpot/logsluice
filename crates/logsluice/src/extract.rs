@@ -262,3 +262,174 @@ impl NormalizerExecutor {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use logsluice_core::simd::SimdMode;
+
+    #[test]
+    fn timestamp_and_ipv6_normalizer_edge_cases() {
+        let expected_ms = 1_700_000_000_000_i64;
+
+        // Value::Number across all 4 epoch ranges: seconds, milliseconds, microseconds, nanoseconds
+        assert_eq!(
+            extract_timestamp_ms(&Value::from(1_700_000_000_i64)),
+            Ok(expected_ms)
+        );
+        assert_eq!(
+            extract_timestamp_ms(&Value::from(1_700_000_000_000_i64)),
+            Ok(expected_ms)
+        );
+        assert_eq!(
+            extract_timestamp_ms(&Value::from(1_700_000_000_000_000_i64)),
+            Ok(expected_ms)
+        );
+        assert_eq!(
+            extract_timestamp_ms(&Value::from(1_700_000_000_000_000_000_i64)),
+            Ok(expected_ms)
+        );
+
+        // Numeric strings across all 4 epoch ranges
+        assert_eq!(
+            extract_timestamp_ms(&Value::from("1700000000")),
+            Ok(expected_ms)
+        );
+        assert_eq!(
+            extract_timestamp_ms(&Value::from("1700000000000")),
+            Ok(expected_ms)
+        );
+        assert_eq!(
+            extract_timestamp_ms(&Value::from("1700000000000000")),
+            Ok(expected_ms)
+        );
+        assert_eq!(
+            extract_timestamp_ms(&Value::from("1700000000000000000")),
+            Ok(expected_ms)
+        );
+        assert_eq!(
+            extract_timestamp_ms(&Value::from(" 2023-11-14T22:13:20Z ")),
+            Ok(expected_ms)
+        );
+
+        // Negative numbers, floats, overflow u64, non-timestamp strings, booleans, null
+        assert_eq!(
+            extract_timestamp_ms(&Value::from(-1_i64)),
+            Err(TimestampError)
+        );
+        assert_eq!(
+            extract_timestamp_ms(&Value::from("-100")),
+            Err(TimestampError)
+        );
+        assert_eq!(
+            extract_timestamp_ms(&Value::from(1.5_f64)),
+            Err(TimestampError)
+        );
+        assert_eq!(
+            extract_timestamp_ms(&Value::from(u64::MAX)),
+            Err(TimestampError)
+        );
+        assert_eq!(
+            extract_timestamp_ms(&Value::from("not-a-timestamp")),
+            Err(TimestampError)
+        );
+        assert_eq!(
+            extract_timestamp_ms(&Value::Bool(true)),
+            Err(TimestampError)
+        );
+        assert_eq!(extract_timestamp_ms(&Value::Null), Err(TimestampError));
+        assert_eq!(
+            TimestampError.to_string(),
+            "invalid or unparseable timestamp"
+        );
+
+        // extract_otlp_time_nano_ms edge cases
+        assert_eq!(
+            extract_otlp_time_nano_ms(&Value::from(1_700_000_000_000_000_000_i64)),
+            Some(expected_ms)
+        );
+        assert_eq!(extract_otlp_time_nano_ms(&Value::from(0_i64)), None);
+        assert_eq!(extract_otlp_time_nano_ms(&Value::from(-5_i64)), None);
+        assert_eq!(extract_otlp_time_nano_ms(&Value::from(u64::MAX)), None);
+        assert_eq!(
+            extract_otlp_time_nano_ms(&Value::from("1700000000000000000")),
+            Some(expected_ms)
+        );
+        assert_eq!(extract_otlp_time_nano_ms(&Value::from("0")), None);
+        assert_eq!(extract_otlp_time_nano_ms(&Value::from("-5")), None);
+        assert_eq!(extract_otlp_time_nano_ms(&Value::from("invalid")), None);
+        assert_eq!(extract_otlp_time_nano_ms(&Value::Null), None);
+
+        // metric_value with u64::MAX and invalid types
+        assert_eq!(
+            metric_value(&Value::from(u64::MAX)),
+            MetricValue::Int(i64::MAX)
+        );
+        assert_eq!(metric_value(&Value::Null), MetricValue::Invalid);
+
+        // SourcePositionPaths missing or out-of-range partition
+        let sp_paths = SourcePositionPaths::new(&SourcePositionConfig::default());
+        let mut ev = LogEvent::new();
+        assert!(sp_paths.extract(&ev).is_none());
+        ev.insert_path("topic", "t");
+        ev.insert_path("partition", i64::from(i32::MAX) + 1);
+        ev.insert_path("offset", 10);
+        assert!(sp_paths.extract(&ev).is_none());
+
+        // NormalizerConfig::IpCidr on IPv6, IPv4, clamped prefixes,when condition, and non-IP fallback
+        let kernels = SimdKernelTable::detect(SimdMode::Scalar);
+        let norm = NormalizerExecutor::new(NormalizerConfig::IpCidr {
+            ipv4_prefix: 24,
+            ipv6_prefix: 48,
+            when: None,
+        });
+        let ipv6_out = norm
+            .apply(&ev, &Value::from("2001:db8:abcd:1234::1"), &kernels)
+            .unwrap();
+        assert_eq!(ipv6_out.as_ref(), b"2001:db8:abcd::");
+
+        let ipv4_out = norm
+            .apply(&ev, &Value::from("10.20.30.40"), &kernels)
+            .unwrap();
+        assert_eq!(ipv4_out.as_ref(), b"10.20.30.0");
+
+        let fallback_out = norm
+            .apply(&ev, &Value::from("not-an-ip"), &kernels)
+            .unwrap();
+        assert_eq!(fallback_out.as_ref(), b"not-an-ip");
+
+        // Clamped prefixes (ipv4_prefix > 32, ipv6_prefix > 128)
+        let clamped_norm = NormalizerExecutor::new(NormalizerConfig::IpCidr {
+            ipv4_prefix: 64,
+            ipv6_prefix: 200,
+            when: Some(WhenCondition {
+                field: "event.action".to_string(),
+                equals: "deny".to_string(),
+            }),
+        });
+        // Condition not met -> unmasked
+        let unmasked = clamped_norm
+            .apply(&ev, &Value::from("2001:db8:abcd:1234::1"), &kernels)
+            .unwrap();
+        assert_eq!(unmasked.as_ref(), b"2001:db8:abcd:1234::1");
+
+        // Condition met -> masked with clamped prefix (full 128 bits preserved)
+        ev.insert_path("event.action", "deny");
+        let clamped_v6 = clamped_norm
+            .apply(&ev, &Value::from("2001:db8:abcd:1234::1"), &kernels)
+            .unwrap();
+        assert_eq!(clamped_v6.as_ref(), b"2001:db8:abcd:1234::1");
+        let clamped_v4 = clamped_norm
+            .apply(&ev, &Value::from("10.20.30.40"), &kernels)
+            .unwrap();
+        assert_eq!(clamped_v4.as_ref(), b"10.20.30.40");
+
+        // LogFingerprint normalizer
+        let fp_norm = NormalizerExecutor::new(NormalizerConfig::LogFingerprint);
+        let fp_out = fp_norm
+            .apply(&ev, &Value::from("conn from 10.0.0.1"), &kernels)
+            .unwrap();
+        assert_eq!(fp_out.as_ref(), b"conn from <IP>");
+    }
+}

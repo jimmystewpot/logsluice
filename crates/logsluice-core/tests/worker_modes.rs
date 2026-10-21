@@ -286,7 +286,7 @@ fn evicted_key_with_inflight_flush_keeps_exemplar() {
     let out = worker.flush_l1(1_000);
     assert_eq!(out.commands.len(), 1);
     let StoreCommand::Flush(buf) = out.commands.into_iter().next().unwrap() else {
-        panic!("expected flush command");
+        panic!("expected flush command")
     };
     let (batch, finalizers) = buf.into_flush();
     let stats = store.apply_flush(batch, &kernels).unwrap();
@@ -318,7 +318,7 @@ fn evicted_key_with_inflight_flush_keeps_exemplar() {
         ..
     } = out.commands.into_iter().next().unwrap()
     else {
-        panic!("expected rows command");
+        panic!("expected rows command")
     };
     assert_eq!(reason, EmitReason::Evict);
     let rows = store.rows(epoch_ms, after, limit).unwrap();
@@ -334,7 +334,7 @@ fn evicted_key_with_inflight_flush_keeps_exemplar() {
     );
     assert_eq!(out.commands.len(), 1);
     let StoreCommand::PersistTickets(tickets) = out.commands.into_iter().next().unwrap() else {
-        panic!("expected persist tickets");
+        panic!("expected persist tickets")
     };
     store.put_tickets(&tickets).unwrap();
     let ticket_id = tickets[0].id;
@@ -362,7 +362,7 @@ fn evicted_key_with_inflight_flush_keeps_exemplar() {
     let out = worker.flush_l1(12_500);
     assert_eq!(out.commands.len(), 1);
     let StoreCommand::Flush(swapped_buf) = out.commands.into_iter().next().unwrap() else {
-        panic!("expected flush command");
+        panic!("expected flush command")
     };
     let (swapped, swapped_finalizers) = swapped_buf.into_flush();
 
@@ -370,7 +370,7 @@ fn evicted_key_with_inflight_flush_keeps_exemplar() {
     let out = worker.on_ack(ticket_id, true, 12_500);
     assert_eq!(out.commands.len(), 1);
     let StoreCommand::Ack(ticket) = out.commands.into_iter().next().unwrap() else {
-        panic!("expected ack command");
+        panic!("expected ack command")
     };
     let evicted_keys = store.apply_ack(&ticket, &kernels).unwrap();
     assert_eq!(evicted_keys.len(), 1);
@@ -428,7 +428,7 @@ fn evicted_key_with_inflight_flush_keeps_exemplar() {
     let out = worker.flush_l1(13_000);
     assert_eq!(out.commands.len(), 1);
     let StoreCommand::Flush(batch3_buf) = out.commands.into_iter().next().unwrap() else {
-        panic!("expected flush command");
+        panic!("expected flush command")
     };
     let (batch3, batch3_finalizers) = batch3_buf.into_flush();
     let stats = store.apply_flush(batch3, &kernels).unwrap();
@@ -599,7 +599,6 @@ fn pending_commands_stays_bounded_with_stalled_store() {
 
     assert!(
         rec_worker.pending_commands_len() <= MAX_BOUND,
-        "recovered worker final pending commands ({}) exceeded bound ({MAX_BOUND})",
-        rec_worker.pending_commands_len()
+        "recovered worker final pending commands exceeded bound"
     );
 }

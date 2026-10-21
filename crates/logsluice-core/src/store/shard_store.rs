@@ -107,6 +107,82 @@ struct StoredResource {
     windows: Vec<u64>,
 }
 
+/// Peeked merge-join cursor over one tail keyspace iterator.
+///
+/// [`ShardStore::rows`] and [`ShardStore::rows_for_sorted`] both walk a header
+/// iterator and a tail iterator in lockstep and compare key bytes: `Less`
+/// advances the tail, `Equal` decodes it, `Greater` means the header has no
+/// tail. The scans are merge-joins so a window close never does random tail
+/// point reads (`Keyspace::get` / [`ShardStore::counted_get`]). That regression
+/// showed up as `scan_point_gets` > 0 and as drain latency on a large PVC.
+///
+/// The re-seek threshold stays in `rows_for_sorted` because a sparse key list
+/// must not walk the whole keyspace between hits. `rows` is a dense forward
+/// scan and must not re-seek.
+struct TailCursor {
+    iter: fjall::Iter,
+    peeked: Option<(fjall::Slice, fjall::Slice)>,
+}
+
+impl TailCursor {
+    fn new(iter: fjall::Iter) -> Self {
+        Self { iter, peeked: None }
+    }
+
+    /// Advance until the peeked tail key is equal to or greater than `header_key`.
+    ///
+    /// Returns the decoded tail on equality. Returns `None` if the tail iterator
+    /// runs out or the next tail key is greater (that entry stays peeked for the
+    /// next header). A missing tail is not an error. Decode and storage failures
+    /// surface as [`AggError`].
+    ///
+    /// `reseek_if` is called with the number of strictly-lesser tail entries
+    /// dropped since this call began, and only when the peek is empty, before
+    /// the next entry is loaded. Return `Some(iter)` to replace the iterator;
+    /// the skip count then resets. `rows` passes a closure that always returns
+    /// `None` — a dense forward scan must not re-seek. `rows_for_sorted` re-seeks
+    /// after [`ShardStore::RESEED_AFTER_SKIPPED`] consecutive misses so a sparse
+    /// key list does not walk the whole keyspace between hits.
+    ///
+    /// # Errors
+    /// Returns [`AggError::Storage`] if the iterator fails to read, or
+    /// [`AggError::Codec`] if the matched tail bytes do not decode.
+    fn take_equal(
+        &mut self,
+        header_key: &[u8],
+        mut reseek_if: impl FnMut(usize) -> Option<fjall::Iter>,
+    ) -> AggResult<Option<ExemplarTail>> {
+        let mut skipped = 0usize;
+        loop {
+            let pair = if let Some(pair) = self.peeked.take() {
+                pair
+            } else {
+                if let Some(iter) = reseek_if(skipped) {
+                    self.iter = iter;
+                    skipped = 0;
+                }
+                let Some(guard) = self.iter.next() else {
+                    return Ok(None);
+                };
+                guard.into_inner()?
+            };
+
+            match pair.0.as_ref().cmp(header_key) {
+                std::cmp::Ordering::Less => {
+                    skipped += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    return Ok(Some(ExemplarTail::decode(&pair.1)?));
+                }
+                std::cmp::Ordering::Greater => {
+                    self.peeked = Some(pair);
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
 /// Shard storage controller managing header, tail, offset, ticket, and metadata keyspaces.
 pub struct ShardStore {
     db: Database,
@@ -483,14 +559,17 @@ impl ShardStore {
             None => hdr_ks.iter(),
         };
 
-        let mut tail_iter = tail_ks.as_ref().map(|t_ks| match after {
-            Some(after_key) => t_ks.range((
-                std::ops::Bound::Excluded(after_key.to_bytes()),
-                std::ops::Bound::Unbounded,
-            )),
-            None => t_ks.iter(),
+        // Dense forward scan: do not re-seek. `reseek_if` stays a no-op.
+        let mut tail_cursor = tail_ks.as_ref().map(|t_ks| {
+            let iter = match after {
+                Some(after_key) => t_ks.range((
+                    std::ops::Bound::Excluded(after_key.to_bytes()),
+                    std::ops::Bound::Unbounded,
+                )),
+                None => t_ks.iter(),
+            };
+            TailCursor::new(iter)
         });
-        let mut next_tail: Option<(fjall::Slice, fjall::Slice)> = None;
 
         for item in iter {
             if results.len() >= limit {
@@ -499,35 +578,10 @@ impl ShardStore {
             let (k_bytes, v_bytes) = item.into_inner()?;
             let key = StorageKey24::from_bytes(&k_bytes)?;
             let header = NumericHeader::decode(self.opts.layout, &v_bytes)?;
-
-            let mut tail = None;
-            if let Some(ref mut t_iter) = tail_iter {
-                loop {
-                    if next_tail.is_none() {
-                        if let Some(t_guard) = t_iter.next() {
-                            next_tail = Some(t_guard.into_inner()?);
-                        } else {
-                            break;
-                        }
-                    }
-                    if let Some((ref tk, _)) = next_tail {
-                        match tk.as_ref().cmp(k_bytes.as_ref()) {
-                            std::cmp::Ordering::Less => {
-                                next_tail = None;
-                            }
-                            std::cmp::Ordering::Equal => {
-                                if let Some((_, tv)) = next_tail.take() {
-                                    tail = Some(ExemplarTail::decode(&tv)?);
-                                }
-                                break;
-                            }
-                            std::cmp::Ordering::Greater => {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            let tail = match tail_cursor.as_mut() {
+                Some(cursor) => cursor.take_equal(k_bytes.as_ref(), |_| None)?,
+                None => None,
+            };
 
             results.push(JoinedRow { key, header, tail });
         }
@@ -583,15 +637,14 @@ impl ShardStore {
                 std::ops::Bound::Included(first_key.to_bytes()),
                 std::ops::Bound::Unbounded,
             ));
-            let mut tail_iter = tail_ks.as_ref().map(|t_ks| {
-                t_ks.range((
+            let mut tail_cursor = tail_ks.as_ref().map(|t_ks| {
+                TailCursor::new(t_ks.range((
                     std::ops::Bound::Included(first_key.to_bytes()),
                     std::ops::Bound::Unbounded,
-                ))
+                )))
             });
 
             let mut next_hdr: Option<(fjall::Slice, fjall::Slice)> = None;
-            let mut next_tail: Option<(fjall::Slice, fjall::Slice)> = None;
 
             for &wanted_key in epoch_keys {
                 let wanted_bytes = wanted_key.to_bytes();
@@ -647,46 +700,23 @@ impl ShardStore {
 
                 let header = NumericHeader::decode(self.opts.layout, &v_bytes)?;
 
-                let mut tail = None;
-                if let Some(ref t_ks) = tail_ks {
-                    if let Some(ref mut t_iter) = tail_iter {
-                        let mut tail_skipped = 0;
-                        loop {
-                            if next_tail.is_none() {
-                                if tail_skipped >= Self::RESEED_AFTER_SKIPPED {
-                                    *t_iter = t_ks.range((
-                                        std::ops::Bound::Included(wanted_bytes),
-                                        std::ops::Bound::Unbounded,
-                                    ));
-                                    tail_skipped = 0;
-                                }
-                                if let Some(t_guard) = t_iter.next() {
-                                    next_tail = Some(t_guard.into_inner()?);
-                                } else {
-                                    break;
-                                }
+                // Sparse key list: re-seek after RESEED_AFTER_SKIPPED misses so the
+                // tail iterator does not walk the whole keyspace between hits.
+                let tail = match (tail_cursor.as_mut(), tail_ks.as_ref()) {
+                    (Some(cursor), Some(t_ks)) => {
+                        cursor.take_equal(wanted_bytes.as_ref(), |skipped| {
+                            if skipped >= Self::RESEED_AFTER_SKIPPED {
+                                Some(t_ks.range((
+                                    std::ops::Bound::Included(wanted_bytes),
+                                    std::ops::Bound::Unbounded,
+                                )))
+                            } else {
+                                None
                             }
-
-                            if let Some((ref tk, _)) = next_tail {
-                                match tk.as_ref().cmp(wanted_bytes.as_ref()) {
-                                    std::cmp::Ordering::Less => {
-                                        next_tail = None;
-                                        tail_skipped += 1;
-                                    }
-                                    std::cmp::Ordering::Equal => {
-                                        if let Some((_, tv)) = next_tail.take() {
-                                            tail = Some(ExemplarTail::decode(&tv)?);
-                                        }
-                                        break;
-                                    }
-                                    std::cmp::Ordering::Greater => {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                        })?
                     }
-                }
+                    _ => None,
+                };
 
                 results.push(JoinedRow {
                     key: wanted_key,

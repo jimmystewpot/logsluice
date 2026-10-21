@@ -287,18 +287,10 @@ impl<F> StoreHandle<F> {
     }
 }
 
-static FAIL_NEXT_FLUSH: AtomicBool = AtomicBool::new(false);
-
 /// Controller for spawning and managing a per-shard storage worker thread.
 pub struct StoreThread;
 
 impl StoreThread {
-    /// Arms a one-shot simulated `apply_flush` error on the next `StoreCommand::Flush` processed.
-    #[doc(hidden)]
-    pub fn fail_next_flush() {
-        FAIL_NEXT_FLUSH.store(true, Ordering::SeqCst);
-    }
-
     /// Spawns a dedicated background thread for shard persistence operations.
     ///
     /// Commands are queued across a bounded channel (capacity 64), and events are published
@@ -337,272 +329,21 @@ impl StoreThread {
                 let mut fail_next_spill = false;
                 while let Ok(cmd) = rx_cmd.recv() {
                     thread_queued.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                    match cmd {
-                        StoreCommand::Flush(buf) => {
-                            let (batch, finalizers) = buf.into_flush();
-                            let local_fail = std::mem::replace(&mut fail_next_flush, false);
-                            let handle_fail = thread_fail_next_flush.swap(false, Ordering::SeqCst);
-                            let global_fail = FAIL_NEXT_FLUSH.swap(false, Ordering::SeqCst);
-                            let flush_res = if local_fail || handle_fail || global_fail {
-                                Err(AggError::Channel("injected Flush failure".into()))
-                            } else {
-                                store.apply_flush_ref(&batch, &k)
-                            };
-                            match flush_res {
-                                Ok(stats) => {
-                                    let fail_disk =
-                                        thread_fail_next_disk_bytes.swap(false, Ordering::SeqCst);
-                                    if !fail_disk && let Ok(b) = store.disk_bytes() {
-                                        last_disk_bytes = b;
-                                    }
-                                    let _ = tx_event.unbounded_send(StoreEvent::FlushDone {
-                                        finalizers,
-                                        stats,
-                                        disk_bytes: last_disk_bytes,
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = tx_event.unbounded_send(StoreEvent::FlushFailed {
-                                        error: e,
-                                        batch,
-                                        finalizers,
-                                    });
-                                }
-                            }
-                        }
-                        StoreCommand::PersistTickets(tickets) => {
-                            let ticket_ids: Vec<u64> = tickets.iter().map(|t| t.id).collect();
-                            if fail_next_persist {
-                                fail_next_persist = false;
-                                let _ = tx_event.unbounded_send(StoreEvent::PersistTicketsFailed {
-                                    ticket_ids,
-                                    error: AggError::Channel(
-                                        "injected PersistTickets failure".into(),
-                                    ),
-                                });
-                                continue;
-                            }
-                            match store.put_tickets(&tickets) {
-                                Ok(()) => {
-                                    let _ = tx_event
-                                        .unbounded_send(StoreEvent::TicketsPersisted(ticket_ids));
-                                }
-                                Err(error) => {
-                                    let _ =
-                                        tx_event.unbounded_send(StoreEvent::PersistTicketsFailed {
-                                            ticket_ids,
-                                            error,
-                                        });
-                                }
-                            }
-                        }
-                        StoreCommand::Ack(ticket) => {
-                            let ticket_id = ticket.id;
-                            match store.apply_ack(&ticket, &k) {
-                                Ok(evicted_keys) => {
-                                    let _ = tx_event.unbounded_send(StoreEvent::AckApplied {
-                                        ticket_id,
-                                        evicted_keys,
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = tx_event.unbounded_send(StoreEvent::Failed(e));
-                                }
-                            }
-                        }
-                        StoreCommand::Rows {
-                            epoch_ms,
-                            reason,
-                            after,
-                            keys,
-                            limit,
-                            recovery_ticket,
-                        } => {
-                            if fail_next_rows {
-                                fail_next_rows = false;
-                                let _ = tx_event.unbounded_send(StoreEvent::RowsFailed {
-                                    epoch_ms,
-                                    reason,
-                                    after,
-                                    keys,
-                                    error: AggError::Channel("injected Rows failure".into()),
-                                    recovery_ticket,
-                                });
-                                continue;
-                            }
-                            if let Some(ref ks) = keys {
-                                match store.rows_for_sorted(ks) {
-                                    Ok(rows) => {
-                                        let _ = tx_event.unbounded_send(StoreEvent::Rows {
-                                            epoch_ms,
-                                            reason,
-                                            rows,
-                                            next_after: None,
-                                            recovery_ticket,
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = tx_event.unbounded_send(StoreEvent::RowsFailed {
-                                            epoch_ms,
-                                            reason,
-                                            after,
-                                            keys,
-                                            error,
-                                            recovery_ticket,
-                                        });
-                                    }
-                                }
-                            } else {
-                                match store.rows(epoch_ms, after, limit) {
-                                    Ok(rows) => {
-                                        let next_after = if rows.len() == limit {
-                                            rows.last().map(|r| r.key)
-                                        } else {
-                                            None
-                                        };
-                                        let _ = tx_event.unbounded_send(StoreEvent::Rows {
-                                            epoch_ms,
-                                            reason,
-                                            rows,
-                                            next_after,
-                                            recovery_ticket,
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = tx_event.unbounded_send(StoreEvent::RowsFailed {
-                                            epoch_ms,
-                                            reason,
-                                            after,
-                                            keys,
-                                            error,
-                                            recovery_ticket,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        StoreCommand::DeleteKeys { epoch_ms, keys } => {
-                            let count = keys.len();
-                            match store.delete_keys(epoch_ms, &keys) {
-                                Ok(()) => {
-                                    let _ = tx_event.unbounded_send(StoreEvent::KeysDeleted {
-                                        epoch_ms,
-                                        count,
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = tx_event.unbounded_send(StoreEvent::Failed(e));
-                                }
-                            }
-                        }
-                        StoreCommand::DropWindow {
-                            epoch_ms,
-                            release_resources,
-                        } => {
-                            let res = (|| -> AggResult<()> {
-                                store.drop_window(epoch_ms)?;
-                                if !release_resources.is_empty() {
-                                    store.delete_resources(&release_resources)?;
-                                }
-                                Ok(())
-                            })();
-                            match res {
-                                Ok(()) => {
-                                    let _ = tx_event
-                                        .unbounded_send(StoreEvent::WindowDropped(epoch_ms));
-                                }
-                                Err(e) => {
-                                    let _ = tx_event.unbounded_send(StoreEvent::Failed(e));
-                                }
-                            }
-                        }
-                        StoreCommand::Spill { ticket_id, records } => {
-                            if fail_next_spill {
-                                fail_next_spill = false;
-                                let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
-                                    ticket_id: Some(ticket_id),
-                                    error: AggError::Channel("injected Spill failure".into()),
-                                });
-                                continue;
-                            }
-                            match spill_writer.spill(ticket_id, &records) {
-                                Ok(()) => {
-                                    let spill_files = spill_writer.count_files();
-                                    if let Ok(bytes) = store.disk_bytes() {
-                                        last_disk_bytes = bytes;
-                                    }
-                                    let _ = tx_event.unbounded_send(StoreEvent::SpillDone {
-                                        ticket_id,
-                                        spill_files,
-                                        disk_bytes: last_disk_bytes,
-                                    });
-                                }
-                                Err(error) => {
-                                    let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
-                                        ticket_id: Some(ticket_id),
-                                        error,
-                                    });
-                                }
-                            }
-                        }
-                        StoreCommand::ReplaySpill => {
-                            match spill_writer.pending_with_quarantined() {
-                                Ok((entries, quarantined)) => {
-                                    let spill_files = spill_writer.count_files();
-                                    let _ = tx_event.unbounded_send(StoreEvent::SpillReplay {
-                                        entries,
-                                        spill_files,
-                                        quarantined,
-                                    });
-                                }
-                                Err(error) => {
-                                    let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
-                                        ticket_id: None,
-                                        error,
-                                    });
-                                }
-                            }
-                        }
-                        StoreCommand::RemoveSpill { ticket_id } => {
-                            match spill_writer.remove(ticket_id) {
-                                Ok(()) => {
-                                    let spill_files = spill_writer.count_files();
-                                    if let Ok(bytes) = store.disk_bytes() {
-                                        last_disk_bytes = bytes;
-                                    }
-                                    let _ = tx_event.unbounded_send(StoreEvent::SpillDone {
-                                        ticket_id,
-                                        spill_files,
-                                        disk_bytes: last_disk_bytes,
-                                    });
-                                }
-                                Err(error) => {
-                                    let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
-                                        ticket_id: Some(ticket_id),
-                                        error,
-                                    });
-                                }
-                            }
-                        }
-                        StoreCommand::TestPause(barrier) => {
-                            barrier.wait();
-                            barrier.wait();
-                        }
-                        StoreCommand::FailNextPersist => {
-                            fail_next_persist = true;
-                        }
-                        StoreCommand::FailNextFlush => {
-                            fail_next_flush = true;
-                        }
-                        StoreCommand::FailNextRows => {
-                            fail_next_rows = true;
-                        }
-                        StoreCommand::FailNextSpill => {
-                            fail_next_spill = true;
-                        }
-                        StoreCommand::Shutdown => {
-                            break;
-                        }
+                    if !dispatch(
+                        cmd,
+                        &mut store,
+                        &k,
+                        &mut spill_writer,
+                        &mut fail_next_flush,
+                        &mut fail_next_persist,
+                        &mut fail_next_rows,
+                        &mut fail_next_spill,
+                        &mut last_disk_bytes,
+                        &thread_fail_next_flush,
+                        &thread_fail_next_disk_bytes,
+                        &tx_event,
+                    ) {
+                        break;
                     }
                 }
             })
@@ -620,4 +361,277 @@ impl StoreThread {
             join_handle,
         ))
     }
+}
+
+/// The thread loop used to own both channel lifetime and every command.
+/// `dispatch` is one command so a new `StoreCommand` variant does not grow `spawn`.
+///
+/// Returns `false` when the command is [`StoreCommand::Shutdown`].
+#[allow(clippy::too_many_arguments)]
+fn dispatch<F>(
+    cmd: StoreCommand<F>,
+    store: &mut ShardStore,
+    k: &SimdKernelTable,
+    spill_writer: &mut crate::worker::spill::SpillWriter,
+    fail_next_flush: &mut bool,
+    fail_next_persist: &mut bool,
+    fail_next_rows: &mut bool,
+    fail_next_spill: &mut bool,
+    last_disk_bytes: &mut u64,
+    thread_fail_next_flush: &AtomicBool,
+    thread_fail_next_disk_bytes: &AtomicBool,
+    tx_event: &futures_channel::mpsc::UnboundedSender<StoreEvent<F>>,
+) -> bool {
+    match cmd {
+        StoreCommand::Flush(buf) => {
+            let (batch, finalizers) = buf.into_flush();
+            let local_fail = std::mem::replace(fail_next_flush, false);
+            let handle_fail = thread_fail_next_flush.swap(false, Ordering::SeqCst);
+            let flush_res = if local_fail || handle_fail {
+                Err(AggError::Channel("injected Flush failure".into()))
+            } else {
+                store.apply_flush_ref(&batch, k)
+            };
+            match flush_res {
+                Ok(stats) => {
+                    let fail_disk = thread_fail_next_disk_bytes.swap(false, Ordering::SeqCst);
+                    if !fail_disk && let Ok(b) = store.disk_bytes() {
+                        *last_disk_bytes = b;
+                    }
+                    let _ = tx_event.unbounded_send(StoreEvent::FlushDone {
+                        finalizers,
+                        stats,
+                        disk_bytes: *last_disk_bytes,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx_event.unbounded_send(StoreEvent::FlushFailed {
+                        error: e,
+                        batch,
+                        finalizers,
+                    });
+                }
+            }
+        }
+        StoreCommand::PersistTickets(tickets) => {
+            let ticket_ids: Vec<u64> = tickets.iter().map(|t| t.id).collect();
+            if *fail_next_persist {
+                *fail_next_persist = false;
+                let _ = tx_event.unbounded_send(StoreEvent::PersistTicketsFailed {
+                    ticket_ids,
+                    error: AggError::Channel("injected PersistTickets failure".into()),
+                });
+                return true;
+            }
+            match store.put_tickets(&tickets) {
+                Ok(()) => {
+                    let _ = tx_event.unbounded_send(StoreEvent::TicketsPersisted(ticket_ids));
+                }
+                Err(error) => {
+                    let _ = tx_event
+                        .unbounded_send(StoreEvent::PersistTicketsFailed { ticket_ids, error });
+                }
+            }
+        }
+        StoreCommand::Ack(ticket) => {
+            let ticket_id = ticket.id;
+            match store.apply_ack(&ticket, k) {
+                Ok(evicted_keys) => {
+                    let _ = tx_event.unbounded_send(StoreEvent::AckApplied {
+                        ticket_id,
+                        evicted_keys,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx_event.unbounded_send(StoreEvent::Failed(e));
+                }
+            }
+        }
+        StoreCommand::Rows {
+            epoch_ms,
+            reason,
+            after,
+            keys,
+            limit,
+            recovery_ticket,
+        } => {
+            if *fail_next_rows {
+                *fail_next_rows = false;
+                let _ = tx_event.unbounded_send(StoreEvent::RowsFailed {
+                    epoch_ms,
+                    reason,
+                    after,
+                    keys,
+                    error: AggError::Channel("injected Rows failure".into()),
+                    recovery_ticket,
+                });
+                return true;
+            }
+            if let Some(ref ks) = keys {
+                match store.rows_for_sorted(ks) {
+                    Ok(rows) => {
+                        let _ = tx_event.unbounded_send(StoreEvent::Rows {
+                            epoch_ms,
+                            reason,
+                            rows,
+                            next_after: None,
+                            recovery_ticket,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = tx_event.unbounded_send(StoreEvent::RowsFailed {
+                            epoch_ms,
+                            reason,
+                            after,
+                            keys,
+                            error,
+                            recovery_ticket,
+                        });
+                    }
+                }
+            } else {
+                match store.rows(epoch_ms, after, limit) {
+                    Ok(rows) => {
+                        let next_after = if rows.len() == limit {
+                            rows.last().map(|r| r.key)
+                        } else {
+                            None
+                        };
+                        let _ = tx_event.unbounded_send(StoreEvent::Rows {
+                            epoch_ms,
+                            reason,
+                            rows,
+                            next_after,
+                            recovery_ticket,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = tx_event.unbounded_send(StoreEvent::RowsFailed {
+                            epoch_ms,
+                            reason,
+                            after,
+                            keys,
+                            error,
+                            recovery_ticket,
+                        });
+                    }
+                }
+            }
+        }
+        StoreCommand::DeleteKeys { epoch_ms, keys } => {
+            let count = keys.len();
+            match store.delete_keys(epoch_ms, &keys) {
+                Ok(()) => {
+                    let _ = tx_event.unbounded_send(StoreEvent::KeysDeleted { epoch_ms, count });
+                }
+                Err(e) => {
+                    let _ = tx_event.unbounded_send(StoreEvent::Failed(e));
+                }
+            }
+        }
+        StoreCommand::DropWindow {
+            epoch_ms,
+            release_resources,
+        } => {
+            let res = (|| -> AggResult<()> {
+                store.drop_window(epoch_ms)?;
+                if !release_resources.is_empty() {
+                    store.delete_resources(&release_resources)?;
+                }
+                Ok(())
+            })();
+            match res {
+                Ok(()) => {
+                    let _ = tx_event.unbounded_send(StoreEvent::WindowDropped(epoch_ms));
+                }
+                Err(e) => {
+                    let _ = tx_event.unbounded_send(StoreEvent::Failed(e));
+                }
+            }
+        }
+        StoreCommand::Spill { ticket_id, records } => {
+            if *fail_next_spill {
+                *fail_next_spill = false;
+                let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
+                    ticket_id: Some(ticket_id),
+                    error: AggError::Channel("injected Spill failure".into()),
+                });
+                return true;
+            }
+            match spill_writer.spill(ticket_id, &records) {
+                Ok(()) => {
+                    let spill_files = spill_writer.count_files();
+                    if let Ok(bytes) = store.disk_bytes() {
+                        *last_disk_bytes = bytes;
+                    }
+                    let _ = tx_event.unbounded_send(StoreEvent::SpillDone {
+                        ticket_id,
+                        spill_files,
+                        disk_bytes: *last_disk_bytes,
+                    });
+                }
+                Err(error) => {
+                    let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
+                        ticket_id: Some(ticket_id),
+                        error,
+                    });
+                }
+            }
+        }
+        StoreCommand::ReplaySpill => match spill_writer.pending_with_quarantined() {
+            Ok((entries, quarantined)) => {
+                let spill_files = spill_writer.count_files();
+                let _ = tx_event.unbounded_send(StoreEvent::SpillReplay {
+                    entries,
+                    spill_files,
+                    quarantined,
+                });
+            }
+            Err(error) => {
+                let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
+                    ticket_id: None,
+                    error,
+                });
+            }
+        },
+        StoreCommand::RemoveSpill { ticket_id } => match spill_writer.remove(ticket_id) {
+            Ok(()) => {
+                let spill_files = spill_writer.count_files();
+                if let Ok(bytes) = store.disk_bytes() {
+                    *last_disk_bytes = bytes;
+                }
+                let _ = tx_event.unbounded_send(StoreEvent::SpillDone {
+                    ticket_id,
+                    spill_files,
+                    disk_bytes: *last_disk_bytes,
+                });
+            }
+            Err(error) => {
+                let _ = tx_event.unbounded_send(StoreEvent::SpillFailed {
+                    ticket_id: Some(ticket_id),
+                    error,
+                });
+            }
+        },
+        StoreCommand::TestPause(barrier) => {
+            barrier.wait();
+            barrier.wait();
+        }
+        StoreCommand::FailNextPersist => {
+            *fail_next_persist = true;
+        }
+        StoreCommand::FailNextFlush => {
+            *fail_next_flush = true;
+        }
+        StoreCommand::FailNextRows => {
+            *fail_next_rows = true;
+        }
+        StoreCommand::FailNextSpill => {
+            *fail_next_spill = true;
+        }
+        StoreCommand::Shutdown => {
+            return false;
+        }
+    }
+    true
 }

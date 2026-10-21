@@ -187,6 +187,20 @@ async fn emit_worker_output(
     true
 }
 
+/// Arms a one-shot flush failure on the shard that owns the store handle.
+///
+/// The store thread must not own a process-global, and the test arms the
+/// injection after spawn but before the flush command is processed. Applying
+/// it on the shard task that owns the handle closes that window without a
+/// cross-shard static.
+#[cfg(test)]
+pub(crate) fn arm_fail_next_flush() {
+    FAIL_NEXT_FLUSH.store(true, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+static FAIL_NEXT_FLUSH: AtomicBool = AtomicBool::new(false);
+
 #[allow(clippy::too_many_arguments)]
 async fn shard_loop(
     shard_idx: u16,
@@ -224,6 +238,15 @@ async fn shard_loop(
     let mut last_watermark: Option<i64> = None;
 
     loop {
+        // Once per wake, before ingest or flush. The test arms the flag after
+        // `transform_stream` returns, which may be while this task is already
+        // inside the loop; copying it here lands on this shard's handle before
+        // the flush command is sent.
+        #[cfg(test)]
+        if FAIL_NEXT_FLUSH.swap(false, Ordering::SeqCst) {
+            store_handle.fail_next_flush();
+        }
+
         tokio::select! {
             biased;
 
@@ -786,7 +809,7 @@ shutdown:
         let (tx, rx) = futures_mpsc::unbounded();
         let _out = Box::new(pipeline).transform_stream(rx);
 
-        StoreThread::fail_next_flush();
+        arm_fail_next_flush();
 
         let mut log = LogEvent::default();
         let rfc = chrono::DateTime::from_timestamp_millis(1_728_000_000_000)

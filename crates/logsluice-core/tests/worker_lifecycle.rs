@@ -6,6 +6,34 @@ use logsluice_core::codec::ticket::EmitReason;
 
 const DAY: i64 = 86_400_000;
 
+fn must_try_ingest(
+    worker: &mut logsluice_core::worker::ShardWorker<u32>,
+    items: Vec<logsluice_core::worker::IngestItem>,
+    finalizer: u32,
+    now_ms: i64,
+) {
+    if let Err((batch, _)) = worker.try_ingest(items, finalizer, now_ms) {
+        panic!("try_ingest refused a batch of length {}", batch.len());
+    }
+}
+
+fn try_ingest_report(
+    worker: &mut logsluice_core::worker::ShardWorker<u32>,
+    items: Vec<logsluice_core::worker::IngestItem>,
+    finalizer: u32,
+    now_ms: i64,
+) -> logsluice_core::worker::IngestReport {
+    match worker.try_ingest(items, finalizer, now_ms) {
+        Ok(report) => report,
+        Err(_) => logsluice_core::worker::IngestReport {
+            accepted: 0,
+            replayed: 0,
+            overflowed: 0,
+            backpressure: true,
+        },
+    }
+}
+
 #[test]
 fn test_on_close_single_slice() {
     let mut h = Harness::new(|c| {
@@ -196,7 +224,7 @@ fn flush_failure_allows_retry_and_preserves_resources_and_unwedges_pending_flags
         },
     };
 
-    let r1 = h.worker().ingest(vec![make_item()], 10, 1_000);
+    let r1 = try_ingest_report(h.worker(), vec![make_item()], 10, 1_000);
     assert_eq!(r1.accepted, 1);
     assert_eq!(r1.replayed, 0);
 
@@ -207,7 +235,7 @@ fn flush_failure_allows_retry_and_preserves_resources_and_unwedges_pending_flags
 
     // Re-ingesting the exact same item after FlushFailed must be accepted (not dropped as replay)
     // and must re-capture the exemplar tail.
-    let r2 = h.worker().ingest(vec![make_item()], 11, 10_000);
+    let r2 = try_ingest_report(h.worker(), vec![make_item()], 11, 10_000);
     assert_eq!(r2.accepted, 1);
     assert_eq!(r2.replayed, 0);
 
@@ -544,7 +572,8 @@ fn worker_poll_performs_no_filesystem_io_for_spill() {
         epoch_ms: 0,
         digest: 1,
     };
-    worker.ingest(
+    must_try_ingest(
+        &mut worker,
         vec![IngestItem {
             key,
             resource: res,
@@ -839,12 +868,22 @@ fn deferred_flushes_swap_active_buffer_when_inflight_flush_completes() {
         let (mut worker, res, res_hash, _dir) = make_worker(|c| {
             c.window.duration = Duration::from_secs(60);
         });
-        worker.ingest(vec![make_item(0, 1, 1_000, &res, res_hash)], 1, 1_000);
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 1, 1_000, &res, res_hash)],
+            1,
+            1_000,
+        );
         let out = worker.flush_l1(1_000);
         assert_eq!(out.commands.len(), 1);
         assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
 
-        worker.ingest(vec![make_item(0, 2, 2_000, &res, res_hash)], 2, 2_000);
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 2, 2_000, &res, res_hash)],
+            2,
+            2_000,
+        );
         let out = worker.begin_drain(10_000);
         assert!(out.commands.is_empty());
 
@@ -884,7 +923,12 @@ fn deferred_flushes_swap_active_buffer_when_inflight_flush_completes() {
             c.window.emit.close_jitter_max = Duration::ZERO;
             c.window.max_close_delay = Duration::ZERO;
         });
-        worker.ingest(vec![make_item(0, 1, 1_000, &res, res_hash)], 1, 1_000);
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 1, 1_000, &res, res_hash)],
+            1,
+            1_000,
+        );
         let out = worker.flush_l1(1_000);
         assert_eq!(out.commands.len(), 1);
         assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
@@ -892,7 +936,12 @@ fn deferred_flushes_swap_active_buffer_when_inflight_flush_completes() {
         let out = worker.poll(Some(60_000), 60_000);
         assert!(out.commands.is_empty());
 
-        worker.ingest(vec![make_item(0, 2, 2_000, &res, res_hash)], 2, 60_000);
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 2, 2_000, &res, res_hash)],
+            2,
+            60_000,
+        );
 
         let out = worker.on_event(
             StoreEvent::FlushDone {
@@ -930,7 +979,12 @@ fn deferred_flushes_swap_active_buffer_when_inflight_flush_completes() {
             c.window.emit.strategy = EmitStrategy::Periodic;
             c.window.emit.interval = Some(Duration::from_millis(500));
         });
-        worker.ingest(vec![make_item(0, 1, 1_000, &res, res_hash)], 1, 0);
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 1, 1_000, &res, res_hash)],
+            1,
+            0,
+        );
         let out = worker.flush_l1(0);
         assert_eq!(out.commands.len(), 1);
         assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
@@ -938,7 +992,12 @@ fn deferred_flushes_swap_active_buffer_when_inflight_flush_completes() {
         let out = worker.poll(None, 500);
         assert!(out.commands.is_empty());
 
-        worker.ingest(vec![make_item(0, 2, 1_500, &res, res_hash)], 2, 500);
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 2, 1_500, &res, res_hash)],
+            2,
+            500,
+        );
 
         let out = worker.on_event(
             StoreEvent::FlushDone {
@@ -977,7 +1036,12 @@ fn deferred_flushes_swap_active_buffer_when_inflight_flush_completes() {
             c.window.max_close_delay = Duration::ZERO;
             c.window.late_emit_interval = Duration::from_millis(500);
         });
-        worker.ingest(vec![make_item(0, 1, 1_000, &res, res_hash)], 1, 1_000);
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 1, 1_000, &res, res_hash)],
+            1,
+            1_000,
+        );
         let _ = worker.flush_l1(1_000);
         let _ = worker.on_event(
             StoreEvent::FlushDone {
@@ -1010,7 +1074,12 @@ fn deferred_flushes_swap_active_buffer_when_inflight_flush_completes() {
         );
 
         // Ingest a late event into window 0
-        worker.ingest(vec![make_item(0, 99, 1_000, &res, res_hash)], 99, 60_100);
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 99, 1_000, &res, res_hash)],
+            99,
+            60_100,
+        );
 
         // Poll at 60_600ms (late_emit_interval elapsed): swaps active buffer (line 829)
         let out = worker.poll(None, 60_600);
@@ -1018,7 +1087,12 @@ fn deferred_flushes_swap_active_buffer_when_inflight_flush_completes() {
         assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
 
         // Ingest another event while late flush is in flight
-        worker.ingest(vec![make_item(0, 100, 1_000, &res, res_hash)], 100, 60_600);
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 100, 1_000, &res, res_hash)],
+            100,
+            60_600,
+        );
 
         // FlushDone triggers swap of active buffer (line 1085)
         let out = worker.on_event(
@@ -1059,7 +1133,12 @@ fn deferred_flushes_swap_active_buffer_when_inflight_flush_completes() {
             c.cardinality.evict_high_water = 0.5;
             c.cardinality.evict_interval = Duration::from_millis(500);
         });
-        worker.ingest(vec![make_item(0, 1, 1_000, &res, res_hash)], 1, 0);
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 1, 1_000, &res, res_hash)],
+            1,
+            0,
+        );
         let out = worker.flush_l1(0);
         assert_eq!(out.commands.len(), 1);
         assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
@@ -1067,7 +1146,12 @@ fn deferred_flushes_swap_active_buffer_when_inflight_flush_completes() {
         let out = worker.poll(None, 500);
         assert!(out.commands.is_empty());
 
-        worker.ingest(vec![make_item(0, 2, 1_500, &res, res_hash)], 2, 500);
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 2, 1_500, &res, res_hash)],
+            2,
+            500,
+        );
 
         let out = worker.on_event(
             StoreEvent::FlushDone {

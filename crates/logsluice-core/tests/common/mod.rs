@@ -273,7 +273,11 @@ impl Harness {
                 exemplar: ExemplarSource::default(),
             })
             .collect();
-        self.worker.ingest(ingest_items, finalizer, self.now_ms)
+        // The harness intentionally does not retry. These tests only assert the
+        // backpressure flag. The library must not drop the batch: `Err` still
+        // owns the events and the finalizer, and dropping it never acks them.
+        // The `Err` payload is dropped only inside this test harness.
+        self.report_without_retry(ingest_items, finalizer)
     }
 
     /// Ingests `(key, event_ms, offset)` pairs with topic "t", partition 0.
@@ -298,7 +302,28 @@ impl Harness {
                 exemplar: ExemplarSource::default(),
             })
             .collect();
-        self.worker.ingest(ingest_items, 0, self.now_ms)
+        // The harness intentionally does not retry. These tests only assert the
+        // backpressure flag. The library must not drop the batch: `Err` still
+        // owns the events and the finalizer, and dropping it never acks them.
+        // The `Err` payload is dropped only inside this test harness.
+        self.report_without_retry(ingest_items, 0)
+    }
+
+    // `ingest_with_finalizer` and `ingest_at_offsets` intentionally do not retry.
+    // Those tests only assert the backpressure flag. The library must not drop
+    // the batch: `try_ingest`'s `Err` still owns the events and the finalizer,
+    // and dropping it never acks them. The `Err` payload is dropped only inside
+    // this test harness.
+    fn report_without_retry(&mut self, items: Vec<IngestItem>, finalizer: u32) -> IngestReport {
+        match self.worker.try_ingest(items, finalizer, self.now_ms) {
+            Ok(report) => report,
+            Err(_) => IngestReport {
+                accepted: 0,
+                replayed: 0,
+                overflowed: 0,
+                backpressure: true,
+            },
+        }
     }
 
     /// Advances simulated clock and watermark, pumping all resulting commands and events synchronously.

@@ -515,20 +515,11 @@ impl<F> ShardWorker<F> {
             && self.double_buf.flush_in_flight())
     }
 
-    /// Ingests a batch of items, applying deduplication, cardinality control, and L1 aggregation.
-    pub fn ingest(&mut self, items: Vec<IngestItem>, finalizer: F, now_ms: i64) -> IngestReport {
-        match self.try_ingest(items, finalizer, now_ms) {
-            Ok(report) => report,
-            Err(_) => IngestReport {
-                accepted: 0,
-                replayed: 0,
-                overflowed: 0,
-                backpressure: true,
-            },
-        }
-    }
-
-    /// Attempts to ingest items, returning the original unconsumed items and finalizer if backpressured.
+    /// Attempts to ingest a batch, applying deduplication, cardinality control, and L1 aggregation.
+    ///
+    /// `Err` means L1 is full while a flush is in flight, or disk-full [`OnDiskFull::Block`]
+    /// rejected a new key. The [`Vec`] and finalizer are unchanged and must be retried or
+    /// explicitly nacked by the caller. Dropping `Err` drops the events and never acks them.
     pub fn try_ingest(
         &mut self,
         items: Vec<IngestItem>,

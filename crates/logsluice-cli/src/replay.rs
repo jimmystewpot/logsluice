@@ -385,8 +385,31 @@ pub fn run_replay(opts: ReplayOptions) -> AggResult<()> {
         if is_batch_boundary || is_crash_boundary {
             for s in 0..opts.shards as usize {
                 if !items_per_shard[s].is_empty() {
-                    let batch = std::mem::take(&mut items_per_shard[s]);
-                    let _ = drivers[s].worker.ingest(batch, 0, current_now_ms);
+                    // Replay is the crash-exact harness. A discarded batch would
+                    // under-count `totals_match` with no error. `try_ingest` gives
+                    // the batch back; `flush_l1` drains the Flush queued while a
+                    // swap is in flight, and `pump` runs it to completion so the
+                    // next attempt can accept the events.
+                    let mut batch = std::mem::take(&mut items_per_shard[s]);
+                    let mut attempts = 0;
+                    const MAX_INGEST_ATTEMPTS: usize = 8;
+                    loop {
+                        match drivers[s].worker.try_ingest(batch, 0, current_now_ms) {
+                            Ok(_) => break,
+                            Err((returned, _)) => {
+                                attempts += 1;
+                                if attempts == MAX_INGEST_ATTEMPTS {
+                                    return Err(AggError::Channel(format!(
+                                        "replay refused to drop a backpressured batch of length {}",
+                                        returned.len()
+                                    )));
+                                }
+                                batch = returned;
+                                let flush_out = drivers[s].worker.flush_l1(current_now_ms);
+                                drivers[s].pump(flush_out, &mut downstream, current_now_ms)?;
+                            }
+                        }
+                    }
                     drivers[s].pump(WorkerOutput::default(), &mut downstream, current_now_ms)?;
 
                     if !opts.stop_before_close {

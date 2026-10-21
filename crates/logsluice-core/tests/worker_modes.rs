@@ -20,6 +20,17 @@ use std::{sync::Arc, time::Duration};
 const DAY: i64 = 86_400_000;
 const M15: i64 = 900_000;
 
+fn must_try_ingest(
+    worker: &mut ShardWorker<u32>,
+    items: Vec<IngestItem>,
+    finalizer: u32,
+    now_ms: i64,
+) {
+    if let Err((batch, _)) = worker.try_ingest(items, finalizer, now_ms) {
+        panic!("try_ingest refused a batch of length {}", batch.len());
+    }
+}
+
 #[test]
 fn test_periodic_delta_sum_exact() {
     let mut h = Harness::new(|c| {
@@ -282,7 +293,7 @@ fn evicted_key_with_inflight_flush_keeps_exemplar() {
             attrs: Vec::new(),
         },
     };
-    worker.ingest(vec![item1], 0, 1_000);
+    must_try_ingest(&mut worker, vec![item1], 0, 1_000);
     let out = worker.flush_l1(1_000);
     assert_eq!(out.commands.len(), 1);
     let StoreCommand::Flush(buf) = out.commands.into_iter().next().unwrap() else {
@@ -358,7 +369,7 @@ fn evicted_key_with_inflight_flush_keeps_exemplar() {
             attrs: Vec::new(),
         },
     };
-    worker.ingest(vec![item2], 1, 12_500);
+    must_try_ingest(&mut worker, vec![item2], 1, 12_500);
     let out = worker.flush_l1(12_500);
     assert_eq!(out.commands.len(), 1);
     let StoreCommand::Flush(swapped_buf) = out.commands.into_iter().next().unwrap() else {
@@ -424,7 +435,7 @@ fn evicted_key_with_inflight_flush_keeps_exemplar() {
             attrs: Vec::new(),
         },
     };
-    worker.ingest(vec![item3], 2, 13_000);
+    must_try_ingest(&mut worker, vec![item3], 2, 13_000);
     let out = worker.flush_l1(13_000);
     assert_eq!(out.commands.len(), 1);
     let StoreCommand::Flush(batch3_buf) = out.commands.into_iter().next().unwrap() else {
@@ -522,7 +533,7 @@ fn pending_commands_stays_bounded_with_stalled_store() {
                 minmax_values: vec![now_ms, now_ms],
                 exemplar: ExemplarSource::default(),
             };
-            let _ = worker.ingest(vec![item], tick as u32, now_ms);
+            must_try_ingest(worker, vec![item], tick as u32, now_ms);
         }
 
         let out = worker.poll(watermark, now_ms);

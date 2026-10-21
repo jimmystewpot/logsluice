@@ -215,6 +215,8 @@ pub struct WorkerStats {
     pub spill_files: usize,
     /// Number of storage commands currently queued or deferred awaiting dispatch.
     pub store_cmd_queue_depth: usize,
+    /// Total corrupt spill files quarantined during replay scans.
+    pub spill_quarantined_total: u64,
 }
 
 /// Shard aggregation worker managing in-memory buffering, state machines, and lifecycle transitions.
@@ -1344,7 +1346,7 @@ impl<F> ShardWorker<F> {
                 {
                     for (digest, scope_id) in evicted_keys {
                         let key = StorageKey24 { epoch_ms, digest };
-                        if !self.double_buf.active().contains_key(&key) {
+                        if !self.double_buf.contains_key_active_or_inflight(&key) {
                             window.dirty_keys.remove(&key);
                             window.guard.forget(&mut window.known, digest, scope_id);
                             self.stats.keys_evicted_total += 1;
@@ -1547,9 +1549,11 @@ impl<F> ShardWorker<F> {
             StoreEvent::SpillReplay {
                 entries,
                 spill_files,
+                quarantined,
             } => {
                 self.replay_spill_in_flight = false;
                 self.cached_spill_files = spill_files;
+                self.stats.spill_quarantined_total += quarantined;
                 for (ticket_id, records) in entries {
                     self.spilled_tickets.insert(ticket_id);
                     output.emit.push(EmitBatch { ticket_id, records });
@@ -1641,6 +1645,7 @@ impl<F> ShardWorker<F> {
             dropped_events_total: self.stats.dropped_events_total,
             spill_files: self.spill_files(),
             store_cmd_queue_depth: self.pending_commands.len(),
+            spill_quarantined_total: self.stats.spill_quarantined_total,
         }
     }
 

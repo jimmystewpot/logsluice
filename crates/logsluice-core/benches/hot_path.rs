@@ -5,13 +5,21 @@ use std::sync::Arc;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use logsluice_core::{
-    codec::plan::AggregationPlan,
+    codec::{
+        plan::AggregationPlan,
+        tail::ExemplarTail,
+        ticket::{EmitReason, Ticket, TicketEntry},
+    },
     config::{AggregationKind, AggregationSpec, EngineConfig},
     key::{KeyBuilder, StorageKey24},
     l1::L1Buffer,
     resource::ResourceScopePayload,
     simd::{SimdKernelTable, SimdMode},
-    store::{meta::PodMeta, shard_store::FlushStats, thread::StoreEvent},
+    store::{
+        meta::PodMeta,
+        shard_store::{FlushBatch, FlushEntry, FlushStats, HeaderLayout, ShardStore, StoreOptions},
+        thread::StoreEvent,
+    },
     window::WindowClock,
     worker::{
         ExemplarSource, IngestItem, PurgeHorizon, RecoveredState, ShardWorker, WorkerContext,
@@ -203,11 +211,136 @@ fn bench_ingest_batch_256(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_apply_flush_known_keys_100k(c: &mut Criterion) {
+    let d = tempfile::tempdir().expect("tempdir");
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"schema").expect("meta");
+    let k = SimdKernelTable::detect(SimdMode::Auto);
+    let opts = StoreOptions {
+        shard_dir: d.path().join("shard_0"),
+        cache_bytes: 64 << 20,
+        hdr_memtable_bytes: 32 << 20,
+        tail_memtable_bytes: 32 << 20,
+        sync_wal: true,
+        layout: HeaderLayout {
+            banks: 1,
+            minmax_slots: 2,
+        },
+        worker_threads: 2,
+        max_write_buffer_bytes: None,
+        max_cached_files: None,
+    };
+    let mut store = ShardStore::open(opts, &meta).expect("store");
+
+    const NUM_KEYS: usize = 100_000;
+    let initial_entries: Vec<FlushEntry> = (0..NUM_KEYS)
+        .map(|i| FlushEntry {
+            key: StorageKey24 {
+                epoch_ms: 0,
+                digest: i as u128,
+            },
+            is_new: true,
+            resource_scope_id: 1,
+            delta: vec![[1, 0, 0, 0]],
+            minmax: vec![(1000, 1000), (1000, 1000)],
+            last_update_s: 1,
+            tail: Some(ExemplarTail {
+                severity: 9,
+                body: None,
+                dims: vec![],
+                attrs: vec![],
+            }),
+        })
+        .collect();
+
+    let initial_batch = FlushBatch {
+        entries: initial_entries,
+        offsets: vec![],
+        new_resources: vec![],
+        resource_refs: vec![],
+    };
+    store.apply_flush(initial_batch, &k).expect("initial flush");
+
+    let known_entries: Vec<FlushEntry> = (0..NUM_KEYS)
+        .map(|i| FlushEntry {
+            key: StorageKey24 {
+                epoch_ms: 0,
+                digest: i as u128,
+            },
+            is_new: false,
+            resource_scope_id: 1,
+            delta: vec![[1, 0, 0, 0]],
+            minmax: vec![(1000, 1000), (1000, 1000)],
+            last_update_s: 2,
+            tail: None,
+        })
+        .collect();
+
+    let known_batch = FlushBatch {
+        entries: known_entries,
+        offsets: vec![],
+        new_resources: vec![],
+        resource_refs: vec![],
+    };
+
+    c.bench_function("apply_flush_known_keys_100k", |b| {
+        b.iter(|| {
+            store.apply_flush_ref(&known_batch, &k).expect("flush");
+        });
+    });
+}
+
+fn bench_put_tickets_many_commands(c: &mut Criterion) {
+    let d = tempfile::tempdir().expect("tempdir");
+    let meta = PodMeta::load_or_init(d.path(), "pod-0", 1, b"schema").expect("meta");
+    let opts = StoreOptions {
+        shard_dir: d.path().join("shard_0"),
+        cache_bytes: 8 << 20,
+        hdr_memtable_bytes: 1 << 20,
+        tail_memtable_bytes: 1 << 20,
+        sync_wal: true,
+        layout: HeaderLayout {
+            banks: 1,
+            minmax_slots: 2,
+        },
+        worker_threads: 2,
+        max_write_buffer_bytes: None,
+        max_cached_files: None,
+    };
+    let mut store = ShardStore::open(opts, &meta).expect("store");
+
+    const NUM_COMMANDS: usize = 50;
+    let commands: Vec<Vec<Ticket>> = (0..NUM_COMMANDS)
+        .map(|i| {
+            vec![Ticket {
+                id: (i + 1) as u64,
+                window_epoch_ms: 0,
+                reason: EmitReason::Close,
+                entries: vec![TicketEntry {
+                    digest: i as u128,
+                    slice_seq: 1,
+                    delta: vec![[1, 0, 0, 0]],
+                    minmax: vec![(1000, 1000), (1000, 1000)],
+                }],
+            }]
+        })
+        .collect();
+
+    c.bench_function("put_tickets_many_commands", |b| {
+        b.iter(|| {
+            for cmd in &commands {
+                store.put_tickets(cmd).expect("put_tickets");
+            }
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_kernels,
     bench_key_digest,
     bench_l1_accumulate,
-    bench_ingest_batch_256
+    bench_ingest_batch_256,
+    bench_apply_flush_known_keys_100k,
+    bench_put_tickets_many_commands
 );
 criterion_main!(benches);

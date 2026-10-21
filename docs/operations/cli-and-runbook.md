@@ -57,6 +57,8 @@ logsluice drain \
 2. Emits any previously spilled NDJSON records from `shard_{n}/spill/*.ndjson`.
 3. Iterates every live window in `shard_{0..shards-1}` in paged batches of 500 keys using sequential merge-join over `w{epoch}_hdr` and `w{epoch}_tail`, emitting all keys with pending $\Delta > 0$ as `SliceRecord` NDJSON lines with deterministic `slice_id`s.
 
+Upon completion, `logsluice drain` prints diagnostic verification telemetry to `stderr` of the form `drain: scan_point_gets=<count>`. Because both in-flight ticket replay and live-window close scans operate strictly via sequential merge-join range iterators (`ShardStore::rows` and `ShardStore::rows_for_sorted`), `scan_point_gets` remains `0` even across large PVC backlogs, guaranteeing zero random I/O on `_tail` during offline drain.
+
 ---
 
 ## 2. Capacity Planning & Sizing Formulas

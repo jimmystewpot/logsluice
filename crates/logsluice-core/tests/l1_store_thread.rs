@@ -456,3 +456,141 @@ fn try_send_returns_command_when_queue_full() {
     h.send(StoreCommand::Shutdown).unwrap();
     j.join().unwrap();
 }
+
+#[test]
+fn double_buffer_tracks_active_and_inflight_keys_across_swap_and_completion() {
+    let mut db: DoubleBuffer<()> = DoubleBuffer::new(16);
+    let k1 = StorageKey24 {
+        epoch_ms: 1_000,
+        digest: 1,
+    };
+    let k2 = StorageKey24 {
+        epoch_ms: 1_000,
+        digest: 2,
+    };
+    let kernels = SimdKernelTable::scalar();
+
+    assert!(!db.contains_key_active_or_inflight(&k1));
+    db.active_mut()
+        .accumulate(k1, true, 0, &[[1, 0, 0, 0]], &[], 1, None, &kernels);
+    assert!(db.contains_key_active_or_inflight(&k1));
+
+    let swapped = db.try_swap().expect("first swap succeeds");
+    assert_eq!(swapped.len(), 1);
+    assert!(db.active().is_empty());
+    assert!(db.contains_key_active_or_inflight(&k1));
+
+    db.active_mut()
+        .accumulate(k2, true, 0, &[[1, 0, 0, 0]], &[], 1, None, &kernels);
+    assert!(db.contains_key_active_or_inflight(&k1));
+    assert!(db.contains_key_active_or_inflight(&k2));
+
+    db.flush_completed();
+    assert!(!db.contains_key_active_or_inflight(&k1));
+    assert!(db.contains_key_active_or_inflight(&k2));
+}
+
+#[test]
+fn store_thread_emits_spill_failed_on_io_errors() {
+    let (store, k, _d) = common::store_with_layout();
+    let shard_dir = store.shard_dir().to_path_buf();
+    let (h, mut ev, j) = StoreThread::spawn::<u32>(store, k).unwrap();
+
+    let spill_dir = shard_dir.join("spill");
+    std::fs::create_dir_all(spill_dir.join(format!("{:020}.ndjson", 1u64))).unwrap();
+
+    h.send(StoreCommand::RemoveSpill { ticket_id: 1 }).unwrap();
+    match common::recv(&mut ev, Duration::from_secs(5)) {
+        StoreEvent::SpillFailed {
+            ticket_id: Some(1), ..
+        } => {}
+        other => panic!("expected StoreEvent::SpillFailed for RemoveSpill, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&spill_dir).unwrap();
+    std::fs::write(&spill_dir, b"not-a-dir").unwrap();
+
+    h.send(StoreCommand::ReplaySpill).unwrap();
+    match common::recv(&mut ev, Duration::from_secs(5)) {
+        StoreEvent::SpillFailed {
+            ticket_id: None, ..
+        } => {}
+        other => panic!("expected StoreEvent::SpillFailed for ReplaySpill, got {other:?}"),
+    }
+
+    h.send(StoreCommand::Spill {
+        ticket_id: 2,
+        records: Vec::new(),
+    })
+    .unwrap();
+    match common::recv(&mut ev, Duration::from_secs(5)) {
+        StoreEvent::SpillFailed {
+            ticket_id: Some(2), ..
+        } => {}
+        other => panic!("expected StoreEvent::SpillFailed for Spill, got {other:?}"),
+    }
+
+    h.send(StoreCommand::Shutdown).unwrap();
+    j.join().unwrap();
+}
+
+#[test]
+fn store_handle_exposes_scan_point_gets() {
+    let (store, k, _d) = common::store_with_layout();
+    let (h, _ev, j) = StoreThread::spawn::<u32>(store, k).unwrap();
+    assert_eq!(h.scan_point_gets(), 0);
+    h.send(StoreCommand::Shutdown).unwrap();
+    j.join().unwrap();
+}
+
+#[test]
+fn store_thread_keyed_rows_do_no_point_reads() {
+    let all_keys: Vec<u128> = (1..=2000).collect();
+    let (store, k, _d) = common::store_with_keys(&all_keys);
+    let (h, mut ev, j) = StoreThread::spawn::<u32>(store, k).unwrap();
+
+    // Pick 500 unsorted keys (e.g., reversed order).
+    let query_keys: Vec<StorageKey24> = (1..=500)
+        .rev()
+        .map(|digest| StorageKey24 {
+            epoch_ms: 0,
+            digest,
+        })
+        .collect();
+
+    h.send(StoreCommand::Rows {
+        epoch_ms: 0,
+        reason: EmitReason::Periodic,
+        after: None,
+        keys: Some(query_keys),
+        limit: 1000,
+        recovery_ticket: Some(1),
+    })
+    .unwrap();
+
+    match common::recv(&mut ev, Duration::from_secs(5)) {
+        StoreEvent::Rows {
+            epoch_ms,
+            reason,
+            rows,
+            next_after,
+            recovery_ticket,
+        } => {
+            assert_eq!(epoch_ms, 0);
+            assert_eq!(reason, EmitReason::Periodic);
+            assert_eq!(rows.len(), 500);
+            let mut returned_digests: Vec<u128> = rows.iter().map(|r| r.key.digest).collect();
+            returned_digests.sort_unstable();
+            let expected_digests: Vec<u128> = (1..=500).collect();
+            assert_eq!(returned_digests, expected_digests);
+            assert_eq!(next_after, None);
+            assert_eq!(recovery_ticket, Some(1));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    assert_eq!(h.scan_point_gets(), 0);
+
+    h.send(StoreCommand::Shutdown).unwrap();
+    j.join().unwrap();
+}

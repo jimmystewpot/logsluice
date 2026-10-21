@@ -752,3 +752,349 @@ fn spill_files_update_worker_disk_bytes_and_trigger_disk_full_policy() {
     assert_eq!(h.spill_files(), 0);
     assert_eq!(h.worker().effective_disk_bytes(), before_spill);
 }
+
+#[test]
+fn deferred_flushes_swap_active_buffer_when_inflight_flush_completes() {
+    use logsluice_core::{
+        codec::plan::AggregationPlan,
+        config::{EmitStrategy, EngineConfig, OnCap},
+        key::StorageKey24,
+        resource::ResourceScopePayload,
+        simd::{SimdKernelTable, SimdMode},
+        store::thread::{StoreCommand, StoreEvent},
+        window::WindowClock,
+        worker::{
+            ExemplarSource, IngestItem, PurgeHorizon, RecoveredState, ShardWorker, WorkerContext,
+        },
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn make_worker(
+        modify_cfg: impl FnOnce(&mut EngineConfig),
+    ) -> (
+        ShardWorker<u32>,
+        Arc<ResourceScopePayload>,
+        u64,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = EngineConfig::default();
+        cfg.output.emitter_id = "pod-0".to_string();
+        cfg.storage.data_dir = dir.path().to_path_buf();
+        cfg.storage.l1_coalesce_max_keys = 100;
+        cfg.storage.l1_flush_interval = Duration::from_secs(3600);
+        cfg.aggregations = common::spec_example();
+        modify_cfg(&mut cfg);
+        let cfg = Arc::new(cfg);
+
+        let plan = Arc::new(AggregationPlan::new(&cfg.aggregations).expect("plan"));
+        let kernels = SimdKernelTable::detect(SimdMode::Scalar);
+        let clock = WindowClock::new(cfg.window.duration, cfg.window.offset).expect("clock");
+        let ctx = WorkerContext {
+            cfg: Arc::clone(&cfg),
+            shard: 0,
+            emitter_id: Arc::from("pod-0"),
+            kernels,
+            plan,
+            clock,
+        };
+        let worker = ShardWorker::new(ctx, RecoveredState::empty(), PurgeHorizon::new(0));
+
+        let res = Arc::new(ResourceScopePayload {
+            resource: [(
+                "service.name".to_string(),
+                serde_json::json!("test-service"),
+            )]
+            .into(),
+            scope_name: "test-scope".to_string(),
+            scope_version: "1.0.0".to_string(),
+            scope_attrs: Default::default(),
+        });
+        let res_hash = res.canonical_hash();
+        (worker, res, res_hash, dir)
+    }
+
+    fn make_item(
+        epoch_ms: u64,
+        digest: u128,
+        event_ms: i64,
+        res: &Arc<ResourceScopePayload>,
+        res_hash: u64,
+    ) -> IngestItem {
+        IngestItem {
+            key: StorageKey24 { epoch_ms, digest },
+            resource: Arc::clone(res),
+            resource_hash: res_hash,
+            position: None,
+            event_ms,
+            counters: vec![[1, 0, 0, 0]],
+            minmax_values: vec![event_ms, event_ms],
+            exemplar: ExemplarSource::default(),
+        }
+    }
+
+    // 1. drain_in_progress with active buffer non-empty on FlushDone (line 1003)
+    {
+        let (mut worker, res, res_hash, _dir) = make_worker(|c| {
+            c.window.duration = Duration::from_secs(60);
+        });
+        worker.ingest(vec![make_item(0, 1, 1_000, &res, res_hash)], 1, 1_000);
+        let out = worker.flush_l1(1_000);
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
+
+        worker.ingest(vec![make_item(0, 2, 2_000, &res, res_hash)], 2, 2_000);
+        let out = worker.begin_drain(10_000);
+        assert!(out.commands.is_empty());
+
+        let out = worker.on_event(
+            StoreEvent::FlushDone {
+                finalizers: vec![1],
+                stats: Default::default(),
+                disk_bytes: 0,
+            },
+            2_000,
+        );
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
+
+        let out = worker.on_event(
+            StoreEvent::FlushDone {
+                finalizers: vec![2],
+                stats: Default::default(),
+                disk_bytes: 0,
+            },
+            2_000,
+        );
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(
+            out.commands[0],
+            StoreCommand::Rows {
+                reason: EmitReason::Drain,
+                ..
+            }
+        ));
+    }
+
+    // 2. Closing window with active buffer non-empty on FlushDone (line 1032)
+    {
+        let (mut worker, res, res_hash, _dir) = make_worker(|c| {
+            c.window.duration = Duration::from_secs(60);
+            c.window.emit.close_jitter_max = Duration::ZERO;
+            c.window.max_close_delay = Duration::ZERO;
+        });
+        worker.ingest(vec![make_item(0, 1, 1_000, &res, res_hash)], 1, 1_000);
+        let out = worker.flush_l1(1_000);
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
+
+        let out = worker.poll(Some(60_000), 60_000);
+        assert!(out.commands.is_empty());
+
+        worker.ingest(vec![make_item(0, 2, 2_000, &res, res_hash)], 2, 60_000);
+
+        let out = worker.on_event(
+            StoreEvent::FlushDone {
+                finalizers: vec![1],
+                stats: Default::default(),
+                disk_bytes: 0,
+            },
+            60_000,
+        );
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
+
+        let out = worker.on_event(
+            StoreEvent::FlushDone {
+                finalizers: vec![2],
+                stats: Default::default(),
+                disk_bytes: 0,
+            },
+            60_000,
+        );
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(
+            out.commands[0],
+            StoreCommand::Rows {
+                reason: EmitReason::Close,
+                ..
+            }
+        ));
+    }
+
+    // 3. periodic_flush_pending with active buffer non-empty on FlushDone (line 1058)
+    {
+        let (mut worker, res, res_hash, _dir) = make_worker(|c| {
+            c.window.duration = Duration::from_secs(60);
+            c.window.emit.strategy = EmitStrategy::Periodic;
+            c.window.emit.interval = Some(Duration::from_millis(500));
+        });
+        worker.ingest(vec![make_item(0, 1, 1_000, &res, res_hash)], 1, 0);
+        let out = worker.flush_l1(0);
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
+
+        let out = worker.poll(None, 500);
+        assert!(out.commands.is_empty());
+
+        worker.ingest(vec![make_item(0, 2, 1_500, &res, res_hash)], 2, 500);
+
+        let out = worker.on_event(
+            StoreEvent::FlushDone {
+                finalizers: vec![1],
+                stats: Default::default(),
+                disk_bytes: 0,
+            },
+            500,
+        );
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
+
+        let out = worker.on_event(
+            StoreEvent::FlushDone {
+                finalizers: vec![2],
+                stats: Default::default(),
+                disk_bytes: 0,
+            },
+            500,
+        );
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(
+            out.commands[0],
+            StoreCommand::Rows {
+                reason: EmitReason::Periodic,
+                ..
+            }
+        ));
+    }
+
+    // 4. poll() late emission flush swap (line 829) and late_flush_pending on FlushDone (line 1085)
+    {
+        let (mut worker, res, res_hash, _dir) = make_worker(|c| {
+            c.window.duration = Duration::from_secs(60);
+            c.window.emit.close_jitter_max = Duration::ZERO;
+            c.window.max_close_delay = Duration::ZERO;
+            c.window.late_emit_interval = Duration::from_millis(500);
+        });
+        worker.ingest(vec![make_item(0, 1, 1_000, &res, res_hash)], 1, 1_000);
+        let _ = worker.flush_l1(1_000);
+        let _ = worker.on_event(
+            StoreEvent::FlushDone {
+                finalizers: vec![1],
+                stats: Default::default(),
+                disk_bytes: 0,
+            },
+            1_000,
+        );
+        let out = worker.poll(Some(60_000), 60_000);
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(
+            out.commands[0],
+            StoreCommand::Rows {
+                reason: EmitReason::Close,
+                ..
+            }
+        ));
+
+        // Close the window completely via StoreEvent::Rows
+        let _ = worker.on_event(
+            StoreEvent::Rows {
+                epoch_ms: 0,
+                reason: EmitReason::Close,
+                rows: Vec::new(),
+                next_after: None,
+                recovery_ticket: None,
+            },
+            60_000,
+        );
+
+        // Ingest a late event into window 0
+        worker.ingest(vec![make_item(0, 99, 1_000, &res, res_hash)], 99, 60_100);
+
+        // Poll at 60_600ms (late_emit_interval elapsed): swaps active buffer (line 829)
+        let out = worker.poll(None, 60_600);
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
+
+        // Ingest another event while late flush is in flight
+        worker.ingest(vec![make_item(0, 100, 1_000, &res, res_hash)], 100, 60_600);
+
+        // FlushDone triggers swap of active buffer (line 1085)
+        let out = worker.on_event(
+            StoreEvent::FlushDone {
+                finalizers: vec![99],
+                stats: Default::default(),
+                disk_bytes: 0,
+            },
+            60_600,
+        );
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
+
+        let out = worker.on_event(
+            StoreEvent::FlushDone {
+                finalizers: vec![100],
+                stats: Default::default(),
+                disk_bytes: 0,
+            },
+            60_600,
+        );
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(
+            out.commands[0],
+            StoreCommand::Rows {
+                reason: EmitReason::LateRevision,
+                ..
+            }
+        ));
+    }
+
+    // 5. evict_flush_pending with active buffer non-empty on FlushDone (line 1113)
+    {
+        let (mut worker, res, res_hash, _dir) = make_worker(|c| {
+            c.window.duration = Duration::from_secs(60);
+            c.cardinality.on_cap = OnCap::EvictCold;
+            c.cardinality.max_keys_per_window = 2;
+            c.cardinality.evict_high_water = 0.5;
+            c.cardinality.evict_interval = Duration::from_millis(500);
+        });
+        worker.ingest(vec![make_item(0, 1, 1_000, &res, res_hash)], 1, 0);
+        let out = worker.flush_l1(0);
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
+
+        let out = worker.poll(None, 500);
+        assert!(out.commands.is_empty());
+
+        worker.ingest(vec![make_item(0, 2, 1_500, &res, res_hash)], 2, 500);
+
+        let out = worker.on_event(
+            StoreEvent::FlushDone {
+                finalizers: vec![1],
+                stats: Default::default(),
+                disk_bytes: 0,
+            },
+            500,
+        );
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
+
+        let out = worker.on_event(
+            StoreEvent::FlushDone {
+                finalizers: vec![2],
+                stats: Default::default(),
+                disk_bytes: 0,
+            },
+            500,
+        );
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(
+            out.commands[0],
+            StoreCommand::Rows {
+                reason: EmitReason::Evict,
+                ..
+            }
+        ));
+    }
+}

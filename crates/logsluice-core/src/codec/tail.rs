@@ -111,6 +111,13 @@ impl ExemplarTail {
 
         // Dims
         let dims_count = read_u32_le(bytes, &mut offset)? as usize;
+        let remaining_bytes = bytes.len() - offset;
+        // Each dim element needs at least 1 byte (tag 0 or tag 1 + len + data)
+        if dims_count > remaining_bytes {
+            return Err(AggError::Codec(format!(
+                "invalid dims_count {dims_count}: exceeds remaining bytes {remaining_bytes}"
+            )));
+        }
         let mut dims = Vec::with_capacity(dims_count);
         for _ in 0..dims_count {
             let dim_tag = read_u8(bytes, &mut offset)?;
@@ -132,6 +139,13 @@ impl ExemplarTail {
 
         // Attrs
         let attrs_count = read_u32_le(bytes, &mut offset)? as usize;
+        let remaining_bytes = bytes.len() - offset;
+        // Each attr needs at least 8 bytes (u32 k_len + u32 v_len)
+        if attrs_count > remaining_bytes / 8 {
+            return Err(AggError::Codec(format!(
+                "invalid attrs_count {attrs_count}: exceeds remaining bytes {remaining_bytes}"
+            )));
+        }
         let mut attrs = Vec::with_capacity(attrs_count);
         for _ in 0..attrs_count {
             let k_len = read_u32_le(bytes, &mut offset)? as usize;

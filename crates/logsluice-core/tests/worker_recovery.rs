@@ -444,3 +444,25 @@ fn recovery_releases_unreferenced_resources() {
     assert!(recovered.resources.is_empty());
     assert!(store.resources().unwrap().is_empty());
 }
+
+#[test]
+fn corrupt_spill_file_increments_quarantine_counter() {
+    let h = Harness::new(|_| {});
+    let spill_dir = h.data_dir().join("shard_0").join("spill");
+    std::fs::create_dir_all(&spill_dir).unwrap();
+
+    let corrupt_orig = spill_dir.join(format!("{:020}.ndjson", 42));
+    let corrupt_quarantined = spill_dir.join(format!("{:020}.ndjson.corrupt", 42));
+    std::fs::write(&corrupt_orig, b"{\"broken\": json\n").unwrap();
+
+    let mut h = h.restart();
+    assert_eq!(h.spill_files(), 1);
+
+    // Advance time past SPILL_RETRY_INTERVAL_MS (60s) to trigger periodic spill replay
+    h.advance(60_000, None);
+
+    assert_eq!(h.stats().spill_quarantined_total, 1);
+    assert!(!corrupt_orig.exists());
+    assert!(corrupt_quarantined.exists());
+    assert_eq!(h.spill_files(), 0);
+}

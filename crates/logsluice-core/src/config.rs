@@ -140,6 +140,12 @@ pub struct StorageConfig {
     /// Background compaction and flush worker threads per shard database.
     #[serde(default = "default_storage_worker_threads")]
     pub worker_threads: usize,
+    /// Maximum size of all memtables in bytes across keyspaces for this shard database (`None` = unlimited).
+    #[serde(default)]
+    pub max_write_buffer_bytes: Option<u64>,
+    /// Upper limit of cached file descriptors per shard database (`None` = engine default).
+    #[serde(default)]
+    pub max_cached_files: Option<usize>,
 }
 
 fn default_storage_worker_threads() -> usize {
@@ -161,6 +167,8 @@ impl Default for StorageConfig {
             on_disk_full: OnDiskFull::OverflowBucket,
             sync_wal: true,
             worker_threads: default_storage_worker_threads(),
+            max_write_buffer_bytes: None,
+            max_cached_files: None,
         }
     }
 }
@@ -400,6 +408,22 @@ impl EngineConfig {
             return Err(AggError::Config(
                 "storage.worker_threads must be >= 1".to_string(),
             ));
+        }
+
+        if let Some(bytes) = self.storage.max_write_buffer_bytes {
+            if bytes < 1024 * 1024 {
+                return Err(AggError::Config(
+                    "storage.max_write_buffer_bytes must be >= 1048576 (1 MiB)".to_string(),
+                ));
+            }
+        }
+
+        if let Some(files) = self.storage.max_cached_files {
+            if files == 0 {
+                return Err(AggError::Config(
+                    "storage.max_cached_files must be >= 1".to_string(),
+                ));
+            }
         }
 
         if !(self.cardinality.max_resource_share > 0.0

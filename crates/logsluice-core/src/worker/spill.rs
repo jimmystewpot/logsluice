@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use crate::emission::SliceRecord;
 use crate::error::{AggError, AggResult};
 
+/// Spill entry consisting of delivery ticket ID and associated slice records.
+pub type SpillEntry = (u64, Vec<SliceRecord>);
+
 /// Spill writer handling atomic disk persistence and replay of unacknowledged slices.
 #[derive(Clone, Debug)]
 pub struct SpillWriter {
@@ -67,7 +70,8 @@ impl SpillWriter {
         Ok(())
     }
 
-    /// Reads all pending spill files, returning them sorted by ticket ID.
+    /// Reads all pending spill files, returning them sorted by ticket ID along with
+    /// the count of corrupt spill files quarantined during this scan.
     ///
     /// Corrupt `.ndjson` files are quarantined by renaming them to
     /// `<id>.ndjson.corrupt` and skipped so valid spill files can still be replayed.
@@ -75,13 +79,14 @@ impl SpillWriter {
     /// # Errors
     /// Returns [`AggError::Io`] if reading the spill directory, reading a spill file, or
     /// quarantining a corrupt file fails.
-    pub fn pending(&self) -> AggResult<Vec<(u64, Vec<SliceRecord>)>> {
+    pub fn pending_with_quarantined(&self) -> AggResult<(Vec<SpillEntry>, u64)> {
         if !self.spill_dir.exists() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
 
         let entries = fs::read_dir(&self.spill_dir).map_err(AggError::Io)?;
         let mut results = Vec::new();
+        let mut quarantined = 0u64;
 
         for entry in entries {
             let entry = entry.map_err(AggError::Io)?;
@@ -110,18 +115,32 @@ impl SpillWriter {
                     Err(AggError::Codec(_)) => {
                         let corrupt_path = path.with_extension("ndjson.corrupt");
                         fs::rename(&path, corrupt_path).map_err(AggError::Io)?;
+                        quarantined += 1;
                     }
                     Err(err) => return Err(err),
                 },
                 None => {
                     let corrupt_path = path.with_extension("ndjson.corrupt");
                     fs::rename(&path, corrupt_path).map_err(AggError::Io)?;
+                    quarantined += 1;
                 }
             }
         }
 
         results.sort_by_key(|(id, _)| *id);
-        Ok(results)
+        Ok((results, quarantined))
+    }
+
+    /// Reads all pending spill files, returning them sorted by ticket ID.
+    ///
+    /// Corrupt `.ndjson` files are quarantined by renaming them to
+    /// `<id>.ndjson.corrupt` and skipped so valid spill files can still be replayed.
+    ///
+    /// # Errors
+    /// Returns [`AggError::Io`] if reading the spill directory, reading a spill file, or
+    /// quarantining a corrupt file fails.
+    pub fn pending(&self) -> AggResult<Vec<SpillEntry>> {
+        self.pending_with_quarantined().map(|(entries, _)| entries)
     }
 
     fn read_spill_file(path: &Path) -> AggResult<Vec<SliceRecord>> {
@@ -291,20 +310,30 @@ mod tests {
             .join(format!("{:020}.ndjson.corrupt", 10));
         fs::write(&corrupt_orig, b"{broken json\n").expect("write corrupt file");
 
-        assert_eq!(writer.count_files(), 2);
+        let bad_stem_orig = writer.spill_dir().join("bad_stem.ndjson");
+        let bad_stem_quarantined = writer.spill_dir().join("bad_stem.ndjson.corrupt");
+        fs::write(&bad_stem_orig, b"{\"not\":\"valid_id\"}\n").expect("write bad stem file");
 
-        let first = writer
-            .pending()
+        assert_eq!(writer.count_files(), 3);
+
+        let (first, quarantined) = writer
+            .pending_with_quarantined()
             .expect("pending should skip corrupt file instead of failing");
+        assert_eq!(quarantined, 2);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].0, 20);
         assert_eq!(first[0].1, vec![valid_record]);
 
         assert!(!corrupt_orig.exists());
         assert!(corrupt_quarantined.exists());
+        assert!(!bad_stem_orig.exists());
+        assert!(bad_stem_quarantined.exists());
         assert_eq!(writer.count_files(), 1);
 
-        let second = writer.pending().expect("second pending call");
+        let (second, second_quarantined) = writer
+            .pending_with_quarantined()
+            .expect("second pending call");
+        assert_eq!(second_quarantined, 0);
         assert_eq!(second, first);
         assert_eq!(writer.count_files(), 1);
     }

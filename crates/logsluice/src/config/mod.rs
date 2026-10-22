@@ -1,8 +1,7 @@
 //! Pipeline configuration, YAML/JSON schema, and validation.
 //!
 //! [`EmitMode`], [`OnDiskFull`], [`OnCap`], [`EmitStrategy`], [`OnShutdown`], and [`SimdMode`]
-//! are the core policy enums. These names used to be a second copy with a manual `From` impl,
-//! which could drift from the core serde spellings. The adapter structs are still the YAML schema.
+//! are re-exported from `logsluice-core`. The adapter structs below are the YAML schema.
 
 mod compile;
 

@@ -13,7 +13,7 @@ use crate::config::{AggregationDefinition, NormalizerConfig, SluiceConfig};
 use crate::event::FieldPath;
 
 impl SluiceConfig {
-    pub(super) fn compile_engine(&self) -> AggResult<EngineConfig> {
+    pub(crate) fn compile_engine(&self) -> AggResult<EngineConfig> {
         let _ = FieldPath::parse(&self.window.timestamp_field).map_err(AggError::Config)?;
         let _ = FieldPath::parse(&self.window.source_id_field).map_err(AggError::Config)?;
         if !self.output.route_field.is_empty() {
@@ -64,41 +64,29 @@ impl SluiceConfig {
                         )));
                     }
 
-                    let mut found = false;
+                    // Every non-empty map entry is either a known kind or an
+                    // error, so a later "nothing matched" check cannot run.
+                    // `count` ignores its target field. Parsing that field
+                    // rejected `{ count: "" }` and silently dropped `{ count: "foo" }`.
                     for (kind_str, field_str) in map {
-                        let _ = FieldPath::parse(field_str).map_err(AggError::Config)?;
                         match kind_str.as_str() {
-                            "count" => {
+                            "count" => specs.push(AggregationSpec {
+                                name: name.clone(),
+                                kind: AggregationKind::Count,
+                                field: None,
+                            }),
+                            "sum" | "min" | "max" => {
+                                let _ = FieldPath::parse(field_str).map_err(AggError::Config)?;
+                                let kind = match kind_str.as_str() {
+                                    "sum" => AggregationKind::Sum,
+                                    "min" => AggregationKind::Min,
+                                    _ => AggregationKind::Max,
+                                };
                                 specs.push(AggregationSpec {
                                     name: name.clone(),
-                                    kind: AggregationKind::Count,
-                                    field: None,
-                                });
-                                found = true;
-                            }
-                            "sum" => {
-                                specs.push(AggregationSpec {
-                                    name: name.clone(),
-                                    kind: AggregationKind::Sum,
+                                    kind,
                                     field: Some(field_str.clone()),
                                 });
-                                found = true;
-                            }
-                            "min" => {
-                                specs.push(AggregationSpec {
-                                    name: name.clone(),
-                                    kind: AggregationKind::Min,
-                                    field: Some(field_str.clone()),
-                                });
-                                found = true;
-                            }
-                            "max" => {
-                                specs.push(AggregationSpec {
-                                    name: name.clone(),
-                                    kind: AggregationKind::Max,
-                                    field: Some(field_str.clone()),
-                                });
-                                found = true;
                             }
                             other => {
                                 return Err(AggError::Config(format!(
@@ -106,12 +94,6 @@ impl SluiceConfig {
                                 )));
                             }
                         }
-                    }
-
-                    if !found {
-                        return Err(AggError::Config(format!(
-                            "no valid aggregation kind found for metric '{name}'"
-                        )));
                     }
                 }
             }

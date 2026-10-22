@@ -51,6 +51,14 @@ impl ShardMicroBatch {
 #[derive(Clone, Debug)]
 pub struct SluicePipeline {
     cfg: SluiceConfig,
+    /// One-shot flush failure for the test that owns this pipeline.
+    ///
+    /// Cloned into every shard task. The store thread used to keep a
+    /// process-global `AtomicBool`, so the first shard to wake consumed it.
+    /// The flag lives here, and it is swapped only when that shard sends a
+    /// `StoreCommand::Flush`.
+    #[cfg(test)]
+    fail_next_flush: Arc<AtomicBool>,
 }
 
 /// Compatibility type alias for [`SluicePipeline`].
@@ -63,7 +71,22 @@ impl SluicePipeline {
     /// Returns [`AggError`](logsluice_core::error::AggError) if configuration validation or engine compilation fails.
     pub fn new(cfg: SluiceConfig) -> AggResult<Self> {
         let _ = cfg.engine()?;
-        Ok(Self { cfg })
+        Ok(Self {
+            cfg,
+            #[cfg(test)]
+            fail_next_flush: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Arms a one-shot `apply_flush` error on the next flush this pipeline sends.
+    ///
+    /// The arm can happen after [`SluicePipeline::transform_stream`] has spawned
+    /// the shard tasks. The flag is shared through [`Arc`] and read when the
+    /// `Flush` command is sent, so a shard already parked in `select!` still
+    /// observes it. Another pipeline in the process has its own flag.
+    #[cfg(test)]
+    pub(crate) fn arm_fail_next_flush(&self) {
+        self.fail_next_flush.store(true, Ordering::SeqCst);
     }
 
     /// Transforms an asynchronous input stream of [`LogEvent`]s into an output stream of summary,
@@ -77,10 +100,14 @@ impl SluicePipeline {
     {
         let (output_tx, output_rx) = futures_mpsc::channel::<LogEvent>(4096);
         let cfg = self.cfg;
+        #[cfg(test)]
+        let fail_next_flush = Some(Arc::clone(&self.fail_next_flush));
+        #[cfg(not(test))]
+        let fail_next_flush: Option<Arc<AtomicBool>> = None;
         let boxed_input: Pin<Box<dyn Stream<Item = LogEvent> + Send>> = Box::pin(input_rx);
 
         tokio::spawn(async move {
-            let _ = run_pipeline(cfg, boxed_input, output_tx).await;
+            let _ = run_pipeline(cfg, boxed_input, output_tx, fail_next_flush).await;
         });
 
         Box::pin(output_rx)
@@ -105,9 +132,18 @@ async fn emit_worker_output(
     cfg: &SluiceConfig,
     plan: &AggregationPlan,
     detected_otlp: &AtomicBool,
+    fail_next_flush: Option<&AtomicBool>,
 ) -> bool {
     let mut cmds = out.commands.into_iter();
     while let Some(cmd) = cmds.next() {
+        // Swap only on Flush. Sampling at the top of the shard loop let the
+        // first idle shard take the flag, and a task already inside `select!`
+        // flushed once before it looked again.
+        if matches!(cmd, StoreCommand::Flush(_))
+            && fail_next_flush.is_some_and(|flag| flag.swap(false, Ordering::SeqCst))
+        {
+            store_handle.fail_next_flush();
+        }
         if let Err(unsent) = store_handle.try_send(cmd) {
             worker.defer_command(unsent);
             worker.requeue_commands(cmds);
@@ -187,20 +223,6 @@ async fn emit_worker_output(
     true
 }
 
-/// Arms a one-shot flush failure on the shard that owns the store handle.
-///
-/// The store thread must not own a process-global, and the test arms the
-/// injection after spawn but before the flush command is processed. Applying
-/// it on the shard task that owns the handle closes that window without a
-/// cross-shard static.
-#[cfg(test)]
-pub(crate) fn arm_fail_next_flush() {
-    FAIL_NEXT_FLUSH.store(true, Ordering::SeqCst);
-}
-
-#[cfg(test)]
-static FAIL_NEXT_FLUSH: AtomicBool = AtomicBool::new(false);
-
 #[allow(clippy::too_many_arguments)]
 async fn shard_loop(
     shard_idx: u16,
@@ -216,6 +238,7 @@ async fn shard_loop(
     plan: Arc<AggregationPlan>,
     router_stats: Arc<std::sync::Mutex<RouterStats>>,
     detected_otlp: Arc<AtomicBool>,
+    fail_next_flush: Option<Arc<AtomicBool>>,
 ) {
     // 1. Initial recovery output
     let rec_out = worker.recovery_output();
@@ -228,6 +251,7 @@ async fn shard_loop(
         &cfg,
         &plan,
         &detected_otlp,
+        fail_next_flush.as_deref(),
     )
     .await;
 
@@ -238,22 +262,13 @@ async fn shard_loop(
     let mut last_watermark: Option<i64> = None;
 
     loop {
-        // Once per wake, before ingest or flush. The test arms the flag after
-        // `transform_stream` returns, which may be while this task is already
-        // inside the loop; copying it here lands on this shard's handle before
-        // the flush command is sent.
-        #[cfg(test)]
-        if FAIL_NEXT_FLUSH.swap(false, Ordering::SeqCst) {
-            store_handle.fail_next_flush();
-        }
-
         tokio::select! {
             biased;
 
             Some(store_ev) = store_events.next() => {
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 let out = worker.on_event(store_ev, now_ms);
-                if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &control_tx, &cfg, &plan, &detected_otlp).await {
+                if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &control_tx, &cfg, &plan, &detected_otlp, fail_next_flush.as_deref()).await {
                     break;
                 }
 
@@ -280,7 +295,7 @@ async fn shard_loop(
                 match msg {
                     ControlMessage::Ack { ticket_id, delivered } => {
                         let out = worker.on_ack(ticket_id, delivered, now_ms);
-                        if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &control_tx, &cfg, &plan, &detected_otlp).await {
+                        if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &control_tx, &cfg, &plan, &detected_otlp, fail_next_flush.as_deref()).await {
                             break;
                         }
 
@@ -291,7 +306,7 @@ async fn shard_loop(
                     ControlMessage::Poll { watermark, now_ms } => {
                         last_watermark = watermark;
                         let out = worker.poll(watermark, now_ms);
-                        if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &control_tx, &cfg, &plan, &detected_otlp).await {
+                        if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &control_tx, &cfg, &plan, &detected_otlp, fail_next_flush.as_deref()).await {
                             break;
                         }
                         let r_stats = {
@@ -311,7 +326,7 @@ async fn shard_loop(
                         draining = true;
                         drain_deadline = Some(deadline_ms);
                         let out = worker.begin_drain(deadline_ms);
-                        if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &control_tx, &cfg, &plan, &detected_otlp).await {
+                        if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &control_tx, &cfg, &plan, &detected_otlp, fail_next_flush.as_deref()).await {
                             break;
                         }
 
@@ -330,7 +345,7 @@ async fn shard_loop(
                     pending_ingest = Some(batch);
                 }
                 let out = worker.poll(last_watermark, now_ms);
-                if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &control_tx, &cfg, &plan, &detected_otlp).await {
+                if !emit_worker_output(out, &mut worker, &store_handle, &mut output_tx, &control_tx, &cfg, &plan, &detected_otlp, fail_next_flush.as_deref()).await {
                     break;
                 }
 
@@ -388,6 +403,7 @@ async fn run_pipeline(
     cfg: SluiceConfig,
     mut input: Pin<Box<dyn Stream<Item = LogEvent> + Send>>,
     mut output_tx: futures_mpsc::Sender<LogEvent>,
+    fail_next_flush: Option<Arc<AtomicBool>>,
 ) -> AggResult<()> {
     let data_dir = cfg.storage.data_dir.clone();
     let shards = cfg.shards;
@@ -559,6 +575,7 @@ async fn run_pipeline(
             plan.clone(),
             router_stats_shared.clone(),
             detected_otlp.clone(),
+            fail_next_flush.clone(),
         ));
         shard_handles.push(handle);
     }
@@ -806,10 +823,12 @@ shutdown:
 
         let cfg: SluiceConfig = serde_yaml_ng::from_str(&yaml).unwrap();
         let pipeline = SluicePipeline::new(cfg).unwrap();
+        let armed = pipeline.clone();
         let (tx, rx) = futures_mpsc::unbounded();
         let _out = Box::new(pipeline).transform_stream(rx);
-
-        arm_fail_next_flush();
+        // Arm after spawn. The flag is read when the flush is sent, so the
+        // shard can already be parked in `select!`.
+        armed.arm_fail_next_flush();
 
         let mut log = LogEvent::default();
         let rfc = chrono::DateTime::from_timestamp_millis(1_728_000_000_000)
@@ -1036,6 +1055,7 @@ shutdown:
             plan,
             router_stats,
             detected_otlp,
+            None,
         ));
 
         let resource = Arc::new(ResourceScopePayload {
@@ -1305,6 +1325,7 @@ shutdown:
             &cfg,
             &plan,
             &detected_otlp,
+            None,
         )
         .await;
         assert!(!output_open);
@@ -1347,6 +1368,7 @@ shutdown:
             Arc::new(plan),
             Arc::new(std::sync::Mutex::new(RouterStats::default())),
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         let item = IngestItem {
@@ -1535,6 +1557,7 @@ shutdown:
             plan,
             router_stats,
             detected_otlp,
+            None,
         ));
 
         let now_wall = chrono::Utc::now().timestamp_millis();
@@ -1745,6 +1768,7 @@ shutdown:
             plan,
             router_stats,
             detected_otlp,
+            None,
         ));
 
         let resource = empty_resource();
@@ -1994,6 +2018,7 @@ shutdown:
             Arc::clone(&plan),
             Arc::new(std::sync::Mutex::new(RouterStats::default())),
             Arc::new(AtomicBool::new(false)),
+            None,
         )
         .await;
 
@@ -2028,6 +2053,7 @@ shutdown:
             plan,
             Arc::new(std::sync::Mutex::new(RouterStats::default())),
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         let (notifier_b1, ack_rx_b1) = AckNotifier::new_with_receiver();

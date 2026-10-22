@@ -1,5 +1,6 @@
 //! Slice record rendering to native [`LogEvent`] and OpenTelemetry Logs envelopes.
 
+use std::cell::RefCell;
 use std::sync::LazyLock;
 
 use chrono::SecondsFormat;
@@ -131,6 +132,28 @@ fn parse_dynamic_path(formatted: &str) -> FieldPath {
     FieldPath::parse_or_literal(formatted)
 }
 
+/// Inserts `value` at `raw`, reusing the last parsed [`FieldPath`] when the
+/// path string is unchanged. Route and aggregation names are fixed for the
+/// pipeline, and `parse_or_literal` allocates a `String` plus a segment vec.
+fn insert_parsed_path(event: &mut LogEvent, raw: &str, value: Value) {
+    thread_local! {
+        static CACHED: RefCell<Option<(String, FieldPath)>> = const { RefCell::new(None) };
+    }
+    CACHED.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let stale = match slot.as_ref() {
+            Some((prev, _)) => prev != raw,
+            None => true,
+        };
+        if stale {
+            *slot = Some((raw.to_owned(), FieldPath::parse_or_literal(raw)));
+        }
+        if let Some((_, path)) = slot.as_ref() {
+            let _ = event.insert(path, value);
+        }
+    });
+}
+
 fn route_field_name(cfg: &SluiceConfig) -> &str {
     if cfg.output.route_field.is_empty() {
         RENDER_PATHS.default_route.as_str()
@@ -162,7 +185,6 @@ struct SummaryFields<'a> {
     severity_number: Option<i64>,
     severity_text: Option<&'static str>,
     body: Option<SummaryBody<'a>>,
-    aggregations: Vec<SummaryAgg<'a>>,
 }
 
 enum SummaryBody<'a> {
@@ -175,17 +197,15 @@ enum SummaryAgg<'a> {
     Timestamp { name: &'a str, value: String },
 }
 
-/// Formats window metadata, severity text, body or template text, and aggregation values.
+/// Formats window metadata, severity text, and body or template text.
 ///
-/// `render_native` and `render_otlp` had started to format window fields independently,
-/// so a new `EmitReason` or timestamp precision had to be updated twice. Encoding stays
+/// Aggregation values stay an iterator (`summary_aggregations`) so a slice does
+/// not allocate a `Vec` that each renderer walks once. `render_native` and
+/// `render_otlp` had started to format window fields independently, so a new
+/// `EmitReason` or timestamp precision had to be updated twice. Encoding stays
 /// split because native events and OTLP envelopes are different JSON shapes.
 #[must_use]
-fn build_summary<'a>(
-    rec: &'a SliceRecord,
-    cfg: &'a SluiceConfig,
-    plan: &'a AggregationPlan,
-) -> SummaryFields<'a> {
+fn build_summary<'a>(rec: &'a SliceRecord, cfg: &'a SluiceConfig) -> SummaryFields<'a> {
     let (severity_number, severity_text) = if rec.tail.severity > 0 {
         (
             Some(i64::from(rec.tail.severity)),
@@ -206,7 +226,6 @@ fn build_summary<'a>(
         severity_number,
         severity_text,
         body: summary_body(rec, cfg),
-        aggregations: summary_aggregations(rec, plan),
     }
 }
 
@@ -228,41 +247,52 @@ fn summary_body<'a>(rec: &SliceRecord, cfg: &'a SluiceConfig) -> Option<SummaryB
     }
 }
 
-fn summary_aggregations<'a>(rec: &SliceRecord, plan: &'a AggregationPlan) -> Vec<SummaryAgg<'a>> {
-    let mut aggregations = Vec::with_capacity(plan.specs().len());
-    for (idx, spec) in plan.specs().iter().enumerate() {
-        if let Some((bank, lane)) = plan.counter_slot(idx) {
-            let val = rec.counters.get(bank).map_or(0, |b| b[lane]);
-            let i_val = i64::try_from(val).unwrap_or(i64::MAX);
-            aggregations.push(SummaryAgg::Int {
-                name: spec.name.as_str(),
-                value: i_val,
-            });
-        } else if let Some(slot) = plan.minmax_slot(idx) {
-            let (min_val, max_val) = rec.minmax.get(slot).copied().unwrap_or((0, 0));
-            let val = match spec.kind {
-                AggregationKind::Min => min_val,
-                _ => max_val,
-            };
-            let is_timestamp = spec
-                .field
-                .as_deref()
-                .is_some_and(|f| f.contains("time") || f == "@timestamp")
-                || spec.name.contains("time");
-            if is_timestamp && val > 0 {
-                aggregations.push(SummaryAgg::Timestamp {
+fn summary_aggregations<'a>(
+    rec: &'a SliceRecord,
+    plan: &'a AggregationPlan,
+) -> impl Iterator<Item = SummaryAgg<'a>> + 'a {
+    plan.specs()
+        .iter()
+        .enumerate()
+        .filter_map(move |(idx, spec)| {
+            if let Some((bank, lane)) = plan.counter_slot(idx) {
+                let val = rec
+                    .counters
+                    .get(bank)
+                    .and_then(|b| b.get(lane))
+                    .copied()
+                    .unwrap_or(0);
+                let i_val = i64::try_from(val).unwrap_or(i64::MAX);
+                Some(SummaryAgg::Int {
                     name: spec.name.as_str(),
-                    value: format_rfc3339_millis(val),
-                });
+                    value: i_val,
+                })
+            } else if let Some(slot) = plan.minmax_slot(idx) {
+                let (min_val, max_val) = rec.minmax.get(slot).copied().unwrap_or((0, 0));
+                let val = match spec.kind {
+                    AggregationKind::Min => min_val,
+                    _ => max_val,
+                };
+                let is_timestamp = spec
+                    .field
+                    .as_deref()
+                    .is_some_and(|f| f.contains("time") || f == "@timestamp")
+                    || spec.name.contains("time");
+                if is_timestamp && val > 0 {
+                    Some(SummaryAgg::Timestamp {
+                        name: spec.name.as_str(),
+                        value: format_rfc3339_millis(val),
+                    })
+                } else {
+                    Some(SummaryAgg::Int {
+                        name: spec.name.as_str(),
+                        value: val,
+                    })
+                }
             } else {
-                aggregations.push(SummaryAgg::Int {
-                    name: spec.name.as_str(),
-                    value: val,
-                });
+                None
             }
-        }
-    }
-    aggregations
+        })
 }
 
 /// Renders a single [`SliceRecord`] into native [`LogEvent`] format following the output contract.
@@ -270,14 +300,15 @@ fn summary_aggregations<'a>(rec: &SliceRecord, plan: &'a AggregationPlan) -> Vec
 pub fn render_native(rec: &SliceRecord, cfg: &SluiceConfig, plan: &AggregationPlan) -> LogEvent {
     let mut event = LogEvent::default();
     let paths = &*RENDER_PATHS;
-    let summary = build_summary(rec, cfg, plan);
+    let summary = build_summary(rec, cfg);
 
     // 1. Route field
     if cfg.output.route_field.is_empty() {
         let _ = event.insert(&paths.default_route, Value::from("summary"));
     } else {
-        let _ = event.insert(
-            &FieldPath::parse_or_literal(route_field_name(cfg)),
+        insert_parsed_path(
+            &mut event,
+            cfg.output.route_field.as_str(),
             Value::from("summary"),
         );
     }
@@ -346,10 +377,10 @@ pub fn render_native(rec: &SliceRecord, cfg: &SluiceConfig, plan: &AggregationPl
             let _ = event.insert(&paths.body, Value::from(text));
         }
         Some(SummaryBody::Template { field, value }) => {
-            if cfg.attributes_policy.template_target_field.is_empty() {
+            if field == paths.log_template.as_str() {
                 let _ = event.insert(&paths.log_template, Value::from(value));
             } else {
-                let _ = event.insert(&FieldPath::parse_or_literal(field), Value::from(value));
+                insert_parsed_path(&mut event, field, Value::from(value));
             }
         }
         None => {}
@@ -368,15 +399,12 @@ pub fn render_native(rec: &SliceRecord, cfg: &SluiceConfig, plan: &AggregationPl
     }
 
     // 5. Aggregations from plan
-    for agg in summary.aggregations {
-        match agg {
-            SummaryAgg::Int { name, value } => {
-                let _ = event.insert(&FieldPath::parse_or_literal(name), Value::from(value));
-            }
-            SummaryAgg::Timestamp { name, value } => {
-                let _ = event.insert(&FieldPath::parse_or_literal(name), Value::from(value));
-            }
-        }
+    for agg in summary_aggregations(rec, plan) {
+        let (name, val) = match agg {
+            SummaryAgg::Int { name, value } => (name, Value::from(value)),
+            SummaryAgg::Timestamp { name, value } => (name, Value::from(value)),
+        };
+        insert_parsed_path(&mut event, name, val);
     }
 
     event
@@ -473,7 +501,7 @@ pub fn render_otlp(
 
             let mut log_records = Vec::with_capacity(records.len());
             for rec in records {
-                let summary = build_summary(rec, cfg, plan);
+                let summary = build_summary(rec, cfg);
                 let mut lr_obj = ObjectMap::new();
                 let time_nano = rec.window_start_ms.saturating_mul(1_000_000);
                 lr_obj.insert("timeUnixNano".into(), Value::from(time_nano));
@@ -488,8 +516,10 @@ pub fn render_otlp(
                     lr_obj.insert("severityText".into(), Value::from(text));
                 }
 
-                // Attributes
-                let mut lr_attrs = Vec::new();
+                // Route, seven window fields, then dimensions, exemplar attrs, and aggs.
+                let mut lr_attrs = Vec::with_capacity(
+                    8 + plan.specs().len() + rec.tail.attrs.len() + cfg.group_by.len(),
+                );
 
                 match summary.body {
                     Some(SummaryBody::Exemplar(text)) => {
@@ -547,7 +577,7 @@ pub fn render_otlp(
                 }
 
                 // Aggregations
-                for agg in summary.aggregations {
+                for agg in summary_aggregations(rec, plan) {
                     match agg {
                         SummaryAgg::Int { name, value } => {
                             lr_attrs.push(otlp_attr_int(name, value));

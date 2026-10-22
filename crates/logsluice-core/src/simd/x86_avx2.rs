@@ -108,25 +108,13 @@ unsafe fn chunk_contains_digit_or_token_marker(chunk: &[u8; 32]) -> bool {
 
 #[target_feature(enable = "avx2")]
 unsafe fn fingerprint_log_bytes_avx2_inner(input: &[u8], out: &mut Vec<u8>) {
-    out.reserve(input.len());
-    let mut pos = 0;
-    while pos + 32 <= input.len() {
-        let chunk: &[u8; 32] = match input[pos..pos + 32].try_into() {
-            Ok(c) => c,
-            Err(_) => break,
-        };
-        // SAFETY: AVX2 is enabled on this function.
-        let has_marker = unsafe { chunk_contains_digit_or_token_marker(chunk) };
-        if !has_marker && !chunk[31].is_ascii_hexdigit() {
-            out.extend_from_slice(chunk);
-            pos += 32;
-        } else {
-            crate::simd::scalar::step_scalar(input, &mut pos, out);
-        }
-    }
-    while pos < input.len() {
-        crate::simd::scalar::step_scalar(input, &mut pos, out);
-    }
+    // `fingerprint_scan` is `#[inline(always)]` into this AVX2 function, so the
+    // closure inherits `+avx2` and receives `&[u8; 32]` directly.
+    crate::simd::scalar::fingerprint_scan::<32>(input, out, |chunk| {
+        // SAFETY: AVX2 is enabled on this function. This closure inherits that
+        // feature and only runs while the AVX2 kernel is executing.
+        unsafe { chunk_contains_digit_or_token_marker(chunk) }
+    });
 }
 
 /// Fingerprints log bytes using AVX2-accelerated chunk scanning with scalar fallback.

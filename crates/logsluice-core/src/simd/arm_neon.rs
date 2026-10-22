@@ -117,25 +117,13 @@ unsafe fn chunk_contains_digit_or_token_marker_neon(chunk: &[u8; 16]) -> bool {
 
 #[target_feature(enable = "neon")]
 unsafe fn fingerprint_log_bytes_neon_inner(input: &[u8], out: &mut Vec<u8>) {
-    out.reserve(input.len());
-    let mut pos = 0;
-    while pos + 16 <= input.len() {
-        let chunk: &[u8; 16] = match input[pos..pos + 16].try_into() {
-            Ok(c) => c,
-            Err(_) => break,
-        };
-        // SAFETY: NEON is enabled on this function.
-        let has_marker = unsafe { chunk_contains_digit_or_token_marker_neon(chunk) };
-        if !has_marker && !chunk[15].is_ascii_hexdigit() {
-            out.extend_from_slice(chunk);
-            pos += 16;
-        } else {
-            crate::simd::scalar::step_scalar(input, &mut pos, out);
-        }
-    }
-    while pos < input.len() {
-        crate::simd::scalar::step_scalar(input, &mut pos, out);
-    }
+    // `fingerprint_scan` is `#[inline(always)]` into this NEON function, so the
+    // closure inherits `+neon` and receives `&[u8; 16]` directly.
+    crate::simd::scalar::fingerprint_scan::<16>(input, out, |chunk| {
+        // SAFETY: NEON is enabled on this function. This closure inherits that
+        // feature and only runs while the NEON kernel is executing.
+        unsafe { chunk_contains_digit_or_token_marker_neon(chunk) }
+    });
 }
 
 /// Fingerprints log bytes using NEON-accelerated chunk scanning with scalar fallback.

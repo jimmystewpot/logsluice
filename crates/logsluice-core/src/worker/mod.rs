@@ -302,6 +302,20 @@ impl<F> ShardWorker<F> {
         self.pending_commands.len()
     }
 
+    /// Takes commands `try_ingest` queued when it swapped L1.
+    ///
+    /// A successful ingest can leave `StoreCommand::Flush` here and set
+    /// `flush_in_flight` without waiting for the store thread. Callers that
+    /// skip `poll` (replay's `--stop-before-close` path) have to pump this
+    /// output before the next ingest or before shutdown. This does not swap
+    /// the active buffer: the batch just accepted stays coalesced until
+    /// `flush_l1` or `poll`.
+    pub fn drain_pending_commands(&mut self) -> WorkerOutput<F> {
+        let mut output = WorkerOutput::default();
+        output.commands.extend(self.pending_commands.drain(..));
+        output
+    }
+
     /// Returns the effective database disk usage in bytes, respecting any test override.
     #[must_use]
     pub fn effective_disk_bytes(&self) -> u64 {
@@ -515,37 +529,20 @@ impl<F> ShardWorker<F> {
             && self.double_buf.flush_in_flight())
     }
 
-    /// Ingests a batch of items, applying deduplication, cardinality control, and L1 aggregation.
-    pub fn ingest(&mut self, items: Vec<IngestItem>, finalizer: F, now_ms: i64) -> IngestReport {
-        match self.try_ingest(items, finalizer, now_ms) {
-            Ok(report) => report,
-            Err(_) => IngestReport {
-                accepted: 0,
-                replayed: 0,
-                overflowed: 0,
-                backpressure: true,
-            },
-        }
-    }
-
-    /// Attempts to ingest items, returning the original unconsumed items and finalizer if backpressured.
+    /// Attempts to ingest a batch, applying deduplication, cardinality control, and L1 aggregation.
+    ///
+    /// `Err` means L1 is full while a flush is in flight, or disk-full [`OnDiskFull::Block`]
+    /// rejected a new key. The [`Vec`] and finalizer are unchanged and must be retried or
+    /// explicitly nacked by the caller. Dropping `Err` drops the events and never acks them.
     pub fn try_ingest(
         &mut self,
         items: Vec<IngestItem>,
         finalizer: F,
         now_ms: i64,
     ) -> Result<IngestReport, (Vec<IngestItem>, F)> {
-        // Check L1 capacity and backpressure before consuming items
-        if self.double_buf.active().len() >= self.ctx.cfg.storage.l1_coalesce_max_keys {
-            if let Some(swapped) = self.double_buf.try_swap() {
-                self.last_flush_ms = now_ms;
-                self.pending_commands
-                    .push_back(StoreCommand::Flush(swapped));
-            } else {
-                return Err((items, finalizer));
-            }
-        }
-
+        // `Err` must leave the worker unchanged. A capacity swap queues a
+        // flush and sets `flush_in_flight`, so the disk-full rejection has to
+        // win before that mutation. A known key is still admitted under Block.
         if self.disk_full && self.ctx.cfg.storage.on_disk_full == OnDiskFull::Block {
             let has_new_key = items.iter().any(|item| {
                 if let Some(ref pos) = item.position
@@ -560,6 +557,17 @@ impl<F> ShardWorker<F> {
                 }
             });
             if has_new_key {
+                return Err((items, finalizer));
+            }
+        }
+
+        // Check L1 capacity and backpressure before consuming items.
+        if self.double_buf.active().len() >= self.ctx.cfg.storage.l1_coalesce_max_keys {
+            if let Some(swapped) = self.double_buf.try_swap() {
+                self.last_flush_ms = now_ms;
+                self.pending_commands
+                    .push_back(StoreCommand::Flush(swapped));
+            } else {
                 return Err((items, finalizer));
             }
         }

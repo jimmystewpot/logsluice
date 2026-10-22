@@ -273,7 +273,11 @@ impl Harness {
                 exemplar: ExemplarSource::default(),
             })
             .collect();
-        self.worker.ingest(ingest_items, finalizer, self.now_ms)
+        // The harness intentionally does not retry. These tests only assert the
+        // backpressure flag. The library must not drop the batch: `Err` still
+        // owns the events and the finalizer, and dropping it never acks them.
+        // The `Err` payload is dropped only inside this test harness.
+        self.report_without_retry(ingest_items, finalizer)
     }
 
     /// Ingests `(key, event_ms, offset)` pairs with topic "t", partition 0.
@@ -298,7 +302,56 @@ impl Harness {
                 exemplar: ExemplarSource::default(),
             })
             .collect();
-        self.worker.ingest(ingest_items, 0, self.now_ms)
+        // The harness intentionally does not retry. These tests only assert the
+        // backpressure flag. The library must not drop the batch: `Err` still
+        // owns the events and the finalizer, and dropping it never acks them.
+        // The `Err` payload is dropped only inside this test harness.
+        self.report_without_retry(ingest_items, 0)
+    }
+
+    // `ingest_with_finalizer` and `ingest_at_offsets` intentionally do not retry.
+    // Those tests only assert the backpressure flag. The library must not drop
+    // the batch: `try_ingest`'s `Err` still owns the events and the finalizer,
+    // and dropping it never acks them. The `Err` payload is dropped only inside
+    // this test harness.
+    fn report_without_retry(&mut self, items: Vec<IngestItem>, finalizer: u32) -> IngestReport {
+        match self.worker.try_ingest(items, finalizer, self.now_ms) {
+            Ok(report) => report,
+            Err(_) => IngestReport {
+                accepted: 0,
+                replayed: 0,
+                overflowed: 0,
+                backpressure: true,
+            },
+        }
+    }
+
+    /// Builds one ingest item with the harness resource. Tests that must see the
+    /// `Err` payload use this instead of [`Harness::ingest`], which drops it.
+    pub fn item(&self, digest: u128, event_ms: i64) -> IngestItem {
+        IngestItem {
+            key: StorageKey24 {
+                epoch_ms: self.clock.start_of(event_ms) as u64,
+                digest,
+            },
+            resource: Arc::clone(&self.default_resource),
+            resource_hash: self.default_resource_hash,
+            position: None,
+            event_ms,
+            counters: vec![[1, 0, 0, 0]],
+            minmax_values: vec![event_ms, event_ms],
+            exemplar: ExemplarSource::default(),
+        }
+    }
+
+    /// `try_ingest` without mapping `Err` onto a flag. The returned batch and
+    /// finalizer are the caller's to retry.
+    pub fn try_ingest_owned(
+        &mut self,
+        items: Vec<IngestItem>,
+        finalizer: u32,
+    ) -> Result<IngestReport, (Vec<IngestItem>, u32)> {
+        self.worker.try_ingest(items, finalizer, self.now_ms)
     }
 
     /// Advances simulated clock and watermark, pumping all resulting commands and events synchronously.

@@ -193,7 +193,8 @@ fn bench_ingest_batch_256(c: &mut Criterion) {
         b.iter_batched(
             || batch.clone(),
             |items| {
-                let _ = worker.ingest(items, 0, 1000);
+                let ingested = std::hint::black_box(worker.try_ingest(items, 0, 1000));
+                std::hint::black_box(&ingested);
                 let _ = worker.flush_l1(1000);
                 let _ = worker.on_event(
                     StoreEvent::FlushDone {

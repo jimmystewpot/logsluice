@@ -1501,3 +1501,35 @@ async fn pipeline_failure_emits_one_quarantine_event() {
         .expect("timed out waiting for the output stream to end");
     assert!(next.is_none(), "expected exactly one output event");
 }
+
+#[tokio::test]
+async fn pipeline_failure_nacks_buffered_input() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let blocker = dir.path().join("not-a-directory");
+    std::fs::File::create(&blocker).unwrap();
+
+    let mut cfg = test_config(dir.path());
+    cfg.storage.data_dir = blocker;
+    let pipeline = SluicePipeline::new(cfg).unwrap();
+
+    let (tx, rx) = futures_mpsc::unbounded();
+    let (event, ack_rx) = LogEvent::default().with_ack_notifier();
+    tx.unbounded_send(event).unwrap();
+
+    let mut out = Box::new(pipeline).transform_stream(rx);
+    let failure = tokio::time::timeout(Duration::from_secs(2), out.next())
+        .await
+        .expect("timed out waiting for pipeline failure event")
+        .expect("stream ended without an event");
+    let route = failure
+        .get_path("_wa_route")
+        .map(crate::event::value_to_string_lossy);
+    assert_eq!(route.as_deref(), Some("quarantine"));
+
+    let status = tokio::time::timeout(Duration::from_secs(2), ack_rx)
+        .await
+        .expect("timed out waiting for the unread event ack")
+        .expect("ack channel closed");
+    assert_eq!(status, AckStatus::Errored);
+    drop(tx);
+}

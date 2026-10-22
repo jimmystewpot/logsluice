@@ -6,9 +6,11 @@
 //! those arms share one method. This is a structure change; the shard
 //! state machine is unchanged.
 
+use std::future::poll_fn;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use futures::channel::mpsc as futures_mpsc;
@@ -433,12 +435,36 @@ async fn run_pipeline(
     mut output_tx: futures_mpsc::Sender<LogEvent>,
 ) -> AggResult<()> {
     let route_field = cfg.output.route_field.clone();
-    if let Err(err) = run_pipeline_inner(cfg, input, &mut output_tx).await {
+    let mut input = input;
+    if let Err(err) = run_pipeline_inner(cfg, &mut input, &mut output_tx).await {
+        // `AckInner` defaults to Delivered. Events still sitting in the input
+        // channel were never routed, and dropping the stream would ack them
+        // as delivered. Nack the ones already buffered, then emit the
+        // quarantine event. Do not wait for the sender to close.
+        nack_buffered_input(&mut input).await;
         emit_pipeline_failure(&route_field, &mut output_tx, &err).await;
         drop(output_tx);
         return Err(err);
     }
     Ok(())
+}
+
+/// Marks finalizers on events already queued in `input` as [`AckStatus::Errored`].
+///
+/// A pending poll stops the walk. Startup failure used to return before the
+/// read loop, and the unread `LogEvent`s dropped with the default Delivered ack.
+async fn nack_buffered_input(input: &mut Pin<Box<dyn Stream<Item = LogEvent> + Send>>) {
+    loop {
+        let item = poll_fn(|cx| match input.as_mut().poll_next(cx) {
+            Poll::Ready(value) => Poll::Ready(value),
+            Poll::Pending => Poll::Ready(None),
+        })
+        .await;
+        let Some(mut event) = item else {
+            break;
+        };
+        event.take_finalizers().update_status(AckStatus::Errored);
+    }
 }
 
 /// One terminal quarantine event so a storage or config failure stays visible
@@ -468,7 +494,7 @@ async fn emit_pipeline_failure(
 
 async fn run_pipeline_inner(
     cfg: SluiceConfig,
-    mut input: Pin<Box<dyn Stream<Item = LogEvent> + Send>>,
+    input: &mut Pin<Box<dyn Stream<Item = LogEvent> + Send>>,
     output_tx: &mut futures_mpsc::Sender<LogEvent>,
 ) -> AggResult<()> {
     let data_dir = cfg.storage.data_dir.clone();
@@ -725,7 +751,10 @@ async fn run_pipeline_inner(
         }
     }
 
-    drop(input);
+    // Drop the input receiver before drain, same as when `input` was owned.
+    // Replace it with an empty stream so a startup-failure return can still
+    // nack whatever was buffered. This line only runs after the read loop ends.
+    drop(std::mem::replace(input, Box::pin(futures::stream::empty())));
 
     // Flush remaining items across all micro-batches
     for s_idx in 0..shards_count {

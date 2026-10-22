@@ -101,6 +101,106 @@ fn backpressure_when_l1_full_and_flush_busy() {
 }
 
 #[test]
+fn try_ingest_err_returns_the_same_batch_and_retry_counts_once() {
+    let mut h = Harness::new(|c| {
+        c.storage.l1_coalesce_max_keys = 2;
+        c.window.emit.close_jitter_max = std::time::Duration::ZERO;
+    });
+    h.ingest(&[(1, 1), (2, 2)]);
+    h.hold_store();
+    assert!(!h.ingest(&[(3, 3), (4, 4)]).backpressure);
+    assert_eq!(h.worker().pending_commands_len(), 1);
+
+    let refused = match h.try_ingest_owned(vec![h.item(5, 5), h.item(6, 6)], 77) {
+        Err(payload) => payload,
+        Ok(_) => panic!("in-flight L1 flush must return the batch"),
+    };
+    let (returned, finalizer) = refused;
+    assert_eq!(finalizer, 77);
+    assert_eq!(returned.len(), 2);
+    assert_eq!(returned[0].key.digest, 5);
+    assert_eq!(returned[0].event_ms, 5);
+    assert_eq!(returned[1].key.digest, 6);
+    assert_eq!(returned[1].event_ms, 6);
+    // The refusal itself must not queue a second flush.
+    assert_eq!(h.worker().pending_commands_len(), 1);
+
+    h.release_store();
+    h.advance(1, None);
+    let report = match h.try_ingest_owned(returned, finalizer) {
+        Ok(report) => report,
+        Err((batch, _)) => panic!("retry after FlushDone refused {} items", batch.len()),
+    };
+    assert_eq!(report.accepted, 2);
+    assert!(!report.backpressure);
+
+    // The retry swapped the previous buffer into `pending_commands` and left
+    // finalizer 77 in the new active buffer with `flush_in_flight` set. One
+    // poll drains that deferred flush and cannot also swap the active buffer.
+    // `advance(1)` stamped `last_flush_ms`, so the following poll is one
+    // millisecond past the 30s interval and is the flush that commits 77.
+    h.advance(31_000, None);
+    h.advance(31_000, None);
+    let released = h.released();
+    assert_eq!(
+        released.iter().filter(|&&token| token == 77).count(),
+        1,
+        "released {released:?}"
+    );
+
+    h.advance(DAY + 31_000, Some(DAY));
+    h.ack_all();
+    let out = h.all_emitted();
+    assert_eq!(h.count_for(&out, 5), 1);
+    assert_eq!(h.count_for(&out, 6), 1);
+    assert_eq!(h.count_for(&out, 1), 1);
+    assert_eq!(h.count_for(&out, 3), 1);
+}
+
+#[test]
+fn block_err_does_not_swap_l1_and_retry_accepts_the_same_item() {
+    use logsluice_core::config::OnDiskFull;
+    let mut h = Harness::new(|c| {
+        c.storage.l1_coalesce_max_keys = 2;
+        c.storage.max_disk_bytes = 1_000;
+        c.storage.control_reserve_bytes = 100;
+        c.storage.on_disk_full = OnDiskFull::Block;
+        c.window.emit.close_jitter_max = std::time::Duration::ZERO;
+    });
+    h.ingest(&[(1, 1_000), (2, 1_000)]);
+    assert_eq!(h.worker().pending_commands_len(), 0);
+    h.worker().set_disk_override(Some(950));
+
+    let (returned, finalizer) = match h.try_ingest_owned(vec![h.item(3, 2_000)], 11) {
+        Err(payload) => payload,
+        Ok(_) => panic!("Block must refuse a new key"),
+    };
+    assert_eq!(finalizer, 11);
+    assert_eq!(returned.len(), 1);
+    assert_eq!(returned[0].key.digest, 3);
+    assert_eq!(returned[0].event_ms, 2_000);
+    assert_eq!(returned[0].counters, vec![[1, 0, 0, 0]]);
+    // Full L1 plus Block used to swap and queue Flush before returning Err.
+    assert_eq!(h.worker().pending_commands_len(), 0);
+
+    h.worker().set_disk_override(Some(800));
+    let report = match h.try_ingest_owned(returned, finalizer) {
+        Ok(report) => report,
+        Err((batch, _)) => panic!(
+            "retry below the disk threshold refused {} items",
+            batch.len()
+        ),
+    };
+    assert_eq!(report.accepted, 1);
+
+    h.advance(DAY + 31_000, Some(DAY));
+    h.ack_all();
+    let out = h.all_emitted();
+    assert_eq!(h.count_for(&out, 3), 1);
+    assert_eq!(h.count_for(&out, 1), 1);
+}
+
+#[test]
 fn poll_purges_out_of_order_windows_keep_max_horizon() {
     let mut h = Harness::new(|c| {
         c.window.emit.close_jitter_max = std::time::Duration::ZERO;

@@ -302,6 +302,20 @@ impl<F> ShardWorker<F> {
         self.pending_commands.len()
     }
 
+    /// Takes commands `try_ingest` queued when it swapped L1.
+    ///
+    /// A successful ingest can leave `StoreCommand::Flush` here and set
+    /// `flush_in_flight` without waiting for the store thread. Callers that
+    /// skip `poll` (replay's `--stop-before-close` path) have to pump this
+    /// output before the next ingest or before shutdown. This does not swap
+    /// the active buffer: the batch just accepted stays coalesced until
+    /// `flush_l1` or `poll`.
+    pub fn drain_pending_commands(&mut self) -> WorkerOutput<F> {
+        let mut output = WorkerOutput::default();
+        output.commands.extend(self.pending_commands.drain(..));
+        output
+    }
+
     /// Returns the effective database disk usage in bytes, respecting any test override.
     #[must_use]
     pub fn effective_disk_bytes(&self) -> u64 {
@@ -526,17 +540,9 @@ impl<F> ShardWorker<F> {
         finalizer: F,
         now_ms: i64,
     ) -> Result<IngestReport, (Vec<IngestItem>, F)> {
-        // Check L1 capacity and backpressure before consuming items
-        if self.double_buf.active().len() >= self.ctx.cfg.storage.l1_coalesce_max_keys {
-            if let Some(swapped) = self.double_buf.try_swap() {
-                self.last_flush_ms = now_ms;
-                self.pending_commands
-                    .push_back(StoreCommand::Flush(swapped));
-            } else {
-                return Err((items, finalizer));
-            }
-        }
-
+        // `Err` must leave the worker unchanged. A capacity swap queues a
+        // flush and sets `flush_in_flight`, so the disk-full rejection has to
+        // win before that mutation. A known key is still admitted under Block.
         if self.disk_full && self.ctx.cfg.storage.on_disk_full == OnDiskFull::Block {
             let has_new_key = items.iter().any(|item| {
                 if let Some(ref pos) = item.position
@@ -551,6 +557,17 @@ impl<F> ShardWorker<F> {
                 }
             });
             if has_new_key {
+                return Err((items, finalizer));
+            }
+        }
+
+        // Check L1 capacity and backpressure before consuming items.
+        if self.double_buf.active().len() >= self.ctx.cfg.storage.l1_coalesce_max_keys {
+            if let Some(swapped) = self.double_buf.try_swap() {
+                self.last_flush_ms = now_ms;
+                self.pending_commands
+                    .push_back(StoreCommand::Flush(swapped));
+            } else {
                 return Err((items, finalizer));
             }
         }

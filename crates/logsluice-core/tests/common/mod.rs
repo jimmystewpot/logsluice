@@ -326,6 +326,34 @@ impl Harness {
         }
     }
 
+    /// Builds one ingest item with the harness resource. Tests that must see the
+    /// `Err` payload use this instead of [`Harness::ingest`], which drops it.
+    pub fn item(&self, digest: u128, event_ms: i64) -> IngestItem {
+        IngestItem {
+            key: StorageKey24 {
+                epoch_ms: self.clock.start_of(event_ms) as u64,
+                digest,
+            },
+            resource: Arc::clone(&self.default_resource),
+            resource_hash: self.default_resource_hash,
+            position: None,
+            event_ms,
+            counters: vec![[1, 0, 0, 0]],
+            minmax_values: vec![event_ms, event_ms],
+            exemplar: ExemplarSource::default(),
+        }
+    }
+
+    /// `try_ingest` without mapping `Err` onto a flag. The returned batch and
+    /// finalizer are the caller's to retry.
+    pub fn try_ingest_owned(
+        &mut self,
+        items: Vec<IngestItem>,
+        finalizer: u32,
+    ) -> Result<IngestReport, (Vec<IngestItem>, u32)> {
+        self.worker.try_ingest(items, finalizer, self.now_ms)
+    }
+
     /// Advances simulated clock and watermark, pumping all resulting commands and events synchronously.
     pub fn advance(&mut self, now_ms: i64, watermark: Option<i64>) {
         self.now_ms = now_ms;

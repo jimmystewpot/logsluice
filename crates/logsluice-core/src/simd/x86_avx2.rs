@@ -108,13 +108,9 @@ unsafe fn chunk_contains_digit_or_token_marker(chunk: &[u8; 32]) -> bool {
 
 #[target_feature(enable = "avx2")]
 unsafe fn fingerprint_log_bytes_avx2_inner(input: &[u8], out: &mut Vec<u8>) {
-    crate::simd::scalar::fingerprint_scan(input, out, 32, |chunk| {
-        let chunk: &[u8; 32] = match chunk.try_into() {
-            Ok(c) => c,
-            // Wrong width: treat the chunk as marked so the scalar tokenizer
-            // consumes it. `fingerprint_scan` only passes `width` bytes.
-            Err(_) => return true,
-        };
+    // `fingerprint_scan` is `#[inline(always)]` into this AVX2 function, so the
+    // closure inherits `+avx2` and receives `&[u8; 32]` directly.
+    crate::simd::scalar::fingerprint_scan::<32>(input, out, |chunk| {
         // SAFETY: AVX2 is enabled on this function. This closure inherits that
         // feature and only runs while the AVX2 kernel is executing.
         unsafe { chunk_contains_digit_or_token_marker(chunk) }

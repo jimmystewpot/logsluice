@@ -225,8 +225,14 @@ pub(crate) fn fingerprint_log_bytes_scalar(input: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// Scans log bytes in `width`-byte chunks, copying a chunk only when it cannot
+/// Scans log bytes in `WIDTH`-byte chunks, copying a chunk only when it cannot
 /// start or continue a replaced token.
+///
+/// AVX2 uses 32 and NEON uses 16. `WIDTH` is a const so this loop inlines into
+/// the `#[target_feature]` caller under `codegen-units = 16`. A runtime width
+/// would compile the scan in this module's codegen unit, and LLVM will not
+/// inline an AVX2 closure into that non-AVX2 function. The chunk stays
+/// `[u8; WIDTH]`, so the caller does not `try_into` on every iteration.
 ///
 /// AVX2 and NEON only prefilter chunks. Token replacement (UUID, IPv4, hex,
 /// numbers) is scalar so the three backends stay bit-identical. The last byte
@@ -234,21 +240,20 @@ pub(crate) fn fingerprint_log_bytes_scalar(input: &[u8], out: &mut Vec<u8>) {
 /// can straddle the chunk boundary; skipping that check would let the vector
 /// path disagree with scalar. `tests/simd_parity.rs` is the gate.
 ///
-/// `width` is the chunk size (32 for AVX2, 16 for NEON) and must be non-zero.
 /// `chunk_has_marker` reports whether that chunk contains a digit or `'-'`.
-pub(crate) fn fingerprint_scan(
+#[inline(always)]
+pub(crate) fn fingerprint_scan<const WIDTH: usize>(
     input: &[u8],
     out: &mut Vec<u8>,
-    width: usize,
-    mut chunk_has_marker: impl FnMut(&[u8]) -> bool,
+    mut chunk_has_marker: impl FnMut(&[u8; WIDTH]) -> bool,
 ) {
+    const { assert!(WIDTH > 0, "SIMD chunk width must be non-zero") };
     out.reserve(input.len());
     let mut pos = 0;
-    while pos + width <= input.len() {
-        let chunk = &input[pos..pos + width];
-        if !chunk_has_marker(chunk) && !chunk[width - 1].is_ascii_hexdigit() {
+    while let Some(chunk) = input.get(pos..).and_then(<[u8]>::first_chunk::<WIDTH>) {
+        if !chunk_has_marker(chunk) && !chunk[WIDTH - 1].is_ascii_hexdigit() {
             out.extend_from_slice(chunk);
-            pos += width;
+            pos += WIDTH;
         } else {
             step_scalar(input, &mut pos, out);
         }

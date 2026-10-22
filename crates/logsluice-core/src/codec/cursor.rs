@@ -103,27 +103,29 @@ impl<'a> Cursor<'a> {
     #[inline]
     pub(crate) fn read_bytes(&mut self, len: usize) -> AggResult<&'a [u8]> {
         let offset = self.offset;
-        let next = offset + len;
-        if next > self.bytes.len() {
+        // `get` rejects a wrapping `offset + len` instead of slicing a wrapped
+        // range. A wire `u32` cannot wrap `usize` on 64-bit, and a short slice
+        // still returns the same EOF text as the old cursor.
+        let Some(slice) = self.bytes.get(offset..).and_then(|rem| rem.get(..len)) else {
             return Err(AggError::Codec(format!(
                 "unexpected EOF reading {len} bytes: offset {offset}, total {}",
                 self.bytes.len()
             )));
-        }
-        self.offset = next;
-        Ok(&self.bytes[offset..next])
+        };
+        self.offset = offset + len;
+        Ok(slice)
     }
 
     #[inline]
     fn read_array<const N: usize>(&mut self, eof: &'static str) -> AggResult<[u8; N]> {
-        let start = self.offset;
-        let end = start + N;
-        if end > self.bytes.len() {
+        let Some(chunk) = self
+            .bytes
+            .get(self.offset..)
+            .and_then(<[u8]>::first_chunk::<N>)
+        else {
             return Err(AggError::Codec(eof.to_string()));
-        }
-        let mut arr = [0u8; N];
-        arr.copy_from_slice(&self.bytes[start..end]);
-        self.offset = end;
-        Ok(arr)
+        };
+        self.offset += N;
+        Ok(*chunk)
     }
 }

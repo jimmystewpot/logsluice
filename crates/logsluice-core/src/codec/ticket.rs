@@ -148,7 +148,16 @@ impl Ticket {
         let reason = EmitReason::from_u8(reason_tag)?;
         let entries_count = cur.read_u32()? as usize;
 
-        let expected_total_len = 21 + entries_count * entry_len;
+        // `entries_count` is an untrusted wire value. Wrapping the product
+        // would accept a short buffer or panic in debug before `with_capacity`.
+        let Some(expected_total_len) = entries_count
+            .checked_mul(entry_len)
+            .and_then(|n| n.checked_add(21))
+        else {
+            return Err(AggError::Codec(format!(
+                "invalid Ticket length: {entries_count} entries overflow the length check"
+            )));
+        };
         if bytes.len() != expected_total_len {
             return Err(AggError::Codec(format!(
                 "invalid Ticket length: expected {expected_total_len} bytes for {entries_count} entries, got {}",

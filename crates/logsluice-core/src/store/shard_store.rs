@@ -136,17 +136,24 @@ impl TailCursor {
     /// next header). A missing tail is not an error. Decode and storage failures
     /// surface as [`AggError`].
     ///
+    /// `header_key` must be non-decreasing across calls on the same cursor.
+    /// `rows` and `rows_for_sorted` both walk header keys in ascending order.
+    /// A key that sorts before the previous one would stay behind the cursor.
+    ///
     /// `reseek_if` is called with the number of strictly-lesser tail entries
-    /// dropped since this call began, and only when the peek is empty, before
-    /// the next entry is loaded. Return `Some(iter)` to replace the iterator;
-    /// the skip count then resets. `rows` passes a closure that always returns
-    /// `None` — a dense forward scan must not re-seek. `rows_for_sorted` re-seeks
-    /// after [`ShardStore::RESEED_AFTER_SKIPPED`] consecutive misses so a sparse
-    /// key list does not walk the whole keyspace between hits.
+    /// dropped since this call began. It runs only when the peek is empty and
+    /// that count is already non-zero, before the next entry is loaded. The
+    /// first load of a call has nothing to skip, so the closure is not invoked.
+    /// Return `Some(iter)` to replace the iterator; the skip count then resets.
+    /// `rows` passes a closure that always returns `None` — a dense forward
+    /// scan must not re-seek. `rows_for_sorted` re-seeks after
+    /// [`ShardStore::RESEED_AFTER_SKIPPED`] consecutive misses so a sparse key
+    /// list does not walk the whole keyspace between hits.
     ///
     /// # Errors
     /// Returns [`AggError::Storage`] if the iterator fails to read, or
     /// [`AggError::Codec`] if the matched tail bytes do not decode.
+    #[inline]
     fn take_equal(
         &mut self,
         header_key: &[u8],
@@ -157,7 +164,12 @@ impl TailCursor {
             let pair = if let Some(pair) = self.peeked.take() {
                 pair
             } else {
-                if let Some(iter) = reseek_if(skipped) {
+                // `skipped == 0` is the first load. `rows_for_sorted` only
+                // re-seeks after RESEED_AFTER_SKIPPED misses, so calling the
+                // closure here cannot replace the iterator.
+                if skipped > 0
+                    && let Some(iter) = reseek_if(skipped)
+                {
                     self.iter = iter;
                     skipped = 0;
                 }

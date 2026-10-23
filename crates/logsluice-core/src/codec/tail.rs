@@ -19,6 +19,22 @@ pub struct ExemplarTail {
 }
 
 impl ExemplarTail {
+    /// Tail used when a header row has no exemplar payload.
+    ///
+    /// Severity is `0` and body, dimensions, and attributes are empty.
+    /// Live close and `logsluice drain` both substitute this through
+    /// [`crate::emission::SliceRecord::from_parts`] so a missing tail key
+    /// cannot drift between the two emitters.
+    #[must_use]
+    pub const fn missing() -> Self {
+        Self {
+            severity: 0,
+            body: None,
+            dims: Vec::new(),
+            attrs: Vec::new(),
+        }
+    }
+
     /// Serializes the exemplar tail into a versioned TLV byte buffer.
     ///
     /// Version byte is always `1u8`.

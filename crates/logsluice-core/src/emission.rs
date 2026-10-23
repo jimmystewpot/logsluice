@@ -242,6 +242,56 @@ pub struct SliceRecord {
     pub minmax: Vec<(i64, i64)>,
 }
 
+impl SliceRecord {
+    /// Builds the emitted record for one ticket entry or drain row.
+    ///
+    /// `tail == None` becomes [`ExemplarTail::missing`]. `slice_id` is
+    /// `"{emitter_id}:{window_epoch}:{digest_hex}:{slice_seq}"` via the
+    /// existing [`slice_id`] helper. `window_epoch_ms` is that identifier's
+    /// window epoch, which callers also supply as `window_start_ms` once it
+    /// fits in `i64`. Callers still decide counters (delta vs cumulative vs
+    /// diff) and what to do when the row or resource is absent. This function
+    /// does not look at the store.
+    ///
+    /// [`records_for`] and `logsluice drain` each assembled this same record
+    /// literal, and each invented an empty [`ExemplarTail`] when the tail key
+    /// was absent. Drain did that twice: once while replaying unspilled
+    /// tickets and once while scanning live windows. Those copies had drifted;
+    /// a mismatch would make `logsluice drain` emit different slices than a
+    /// live close. Drain's `next_seq` walk stays in the CLI because it
+    /// compensates for `apply_ack` not having advanced the stored `slice_seq`
+    /// between tickets in the same window.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn from_parts(
+        window_start_ms: i64,
+        window_end_ms: i64,
+        emit_reason: EmitReason,
+        emitter_id: &str,
+        window_epoch_ms: u64,
+        digest: u128,
+        slice_seq: u32,
+        resource: Arc<ResourceScopePayload>,
+        tail: Option<ExemplarTail>,
+        counters: Vec<[u64; 4]>,
+        minmax: Vec<(i64, i64)>,
+    ) -> Self {
+        Self {
+            window_start_ms,
+            window_end_ms,
+            emit_reason,
+            emitter_id: emitter_id.to_string(),
+            digest,
+            slice_seq,
+            slice_id: slice_id(emitter_id, window_epoch_ms, digest, slice_seq),
+            resource,
+            tail: tail.unwrap_or_else(ExemplarTail::missing),
+            counters,
+            minmax,
+        }
+    }
+}
+
 /// Constructs `SliceRecord` instances corresponding to an emission `ticket`.
 ///
 /// # Errors
@@ -278,38 +328,24 @@ pub fn records_for(
             })?
             .clone();
 
-        let tail = row.tail.clone().unwrap_or_else(|| ExemplarTail {
-            severity: 0,
-            body: None,
-            dims: Vec::new(),
-            attrs: Vec::new(),
-        });
-
         let counters = match mode {
             EmitMode::DeltaSlice => entry.delta.clone(),
             EmitMode::Cumulative => row.header.total.clone(),
         };
 
-        let sid = slice_id(
+        records.push(SliceRecord::from_parts(
+            window_start_ms,
+            window_end_ms,
+            ticket.reason,
             emitter_id,
             ticket.window_epoch_ms,
             entry.digest,
             entry.slice_seq,
-        );
-
-        records.push(SliceRecord {
-            window_start_ms,
-            window_end_ms,
-            emit_reason: ticket.reason,
-            emitter_id: emitter_id.to_string(),
-            digest: entry.digest,
-            slice_seq: entry.slice_seq,
-            slice_id: sid,
             resource,
-            tail,
+            row.tail.clone(),
             counters,
-            minmax: entry.minmax.clone(),
-        });
+            entry.minmax.clone(),
+        ));
     }
 
     Ok(records)

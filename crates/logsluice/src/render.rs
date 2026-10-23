@@ -132,24 +132,27 @@ fn parse_dynamic_path(formatted: &str) -> FieldPath {
     FieldPath::parse_or_literal(formatted)
 }
 
-/// Inserts `value` at `raw`, reusing the last parsed [`FieldPath`] when the
-/// path string is unchanged. Route and aggregation names are fixed for the
-/// pipeline, and `parse_or_literal` allocates a `String` plus a segment vec.
+/// Inserts `value` at `raw`, reusing a parsed [`FieldPath`] for that string.
+///
+/// One record carries the route, the template field, every aggregation name,
+/// and each `group_by` dimension. A single cached path is overwritten by the
+/// next name on that record, so the lookup never hits. The list stops at 64
+/// entries so a thread does not retain every path it has ever rendered.
 fn insert_parsed_path(event: &mut LogEvent, raw: &str, value: Value) {
+    const MAX_CACHED_PATHS: usize = 64;
     thread_local! {
-        static CACHED: RefCell<Option<(String, FieldPath)>> = const { RefCell::new(None) };
+        static CACHED: RefCell<Vec<FieldPath>> = const { RefCell::new(Vec::new()) };
     }
-    CACHED.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let stale = match slot.as_ref() {
-            Some((prev, _)) => prev != raw,
-            None => true,
-        };
-        if stale {
-            *slot = Some((raw.to_owned(), FieldPath::parse_or_literal(raw)));
+    CACHED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(index) = cache.iter().position(|path| path.as_str() == raw) {
+            let _ = event.insert(&cache[index], value);
+            return;
         }
-        if let Some((_, path)) = slot.as_ref() {
-            let _ = event.insert(path, value);
+        let parsed = FieldPath::parse_or_literal(raw);
+        let _ = event.insert(&parsed, value);
+        if cache.len() < MAX_CACHED_PATHS {
+            cache.push(parsed);
         }
     });
 }
@@ -350,8 +353,9 @@ pub fn render_native(rec: &SliceRecord, cfg: &SluiceConfig, plan: &AggregationPl
     // 4. Dimensions and exemplar tail
     for (i, dim_name) in cfg.group_by.iter().enumerate() {
         if let Some(Some(b)) = rec.tail.dims.get(i) {
-            let _ = event.insert(
-                &FieldPath::parse_or_literal(dim_name.as_str()),
+            insert_parsed_path(
+                &mut event,
+                dim_name.as_str(),
                 Value::from(String::from_utf8_lossy(b).into_owned()),
             );
         }

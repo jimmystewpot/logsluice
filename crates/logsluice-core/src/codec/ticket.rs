@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::codec::cursor::Cursor;
 use crate::codec::plan::HeaderLayout;
 use crate::error::{AggError, AggResult};
 
@@ -139,15 +140,24 @@ impl Ticket {
         }
 
         let entry_len = 16 + 4 + layout.banks * 32 + layout.minmax_slots * 16;
-        let mut offset = 0;
+        let mut cur = Cursor::new(bytes);
 
-        let id = read_u64_le(bytes, &mut offset)?;
-        let window_epoch_ms = read_u64_le(bytes, &mut offset)?;
-        let reason_tag = read_u8(bytes, &mut offset)?;
+        let id = cur.read_u64()?;
+        let window_epoch_ms = cur.read_u64()?;
+        let reason_tag = cur.read_u8()?;
         let reason = EmitReason::from_u8(reason_tag)?;
-        let entries_count = read_u32_le(bytes, &mut offset)? as usize;
+        let entries_count = cur.read_u32()? as usize;
 
-        let expected_total_len = 21 + entries_count * entry_len;
+        // `entries_count` is an untrusted wire value. Wrapping the product
+        // would accept a short buffer or panic in debug before `with_capacity`.
+        let Some(expected_total_len) = entries_count
+            .checked_mul(entry_len)
+            .and_then(|n| n.checked_add(21))
+        else {
+            return Err(AggError::Codec(format!(
+                "invalid Ticket length: {entries_count} entries overflow the length check"
+            )));
+        };
         if bytes.len() != expected_total_len {
             return Err(AggError::Codec(format!(
                 "invalid Ticket length: expected {expected_total_len} bytes for {entries_count} entries, got {}",
@@ -157,23 +167,17 @@ impl Ticket {
 
         let mut entries = Vec::with_capacity(entries_count);
         for _ in 0..entries_count {
-            let digest = read_u128_le(bytes, &mut offset)?;
-            let slice_seq = read_u32_le(bytes, &mut offset)?;
+            let digest = cur.read_u128()?;
+            let slice_seq = cur.read_u32()?;
 
             let mut delta = Vec::with_capacity(layout.banks);
             for _ in 0..layout.banks {
-                let l0 = read_u64_le(bytes, &mut offset)?;
-                let l1 = read_u64_le(bytes, &mut offset)?;
-                let l2 = read_u64_le(bytes, &mut offset)?;
-                let l3 = read_u64_le(bytes, &mut offset)?;
-                delta.push([l0, l1, l2, l3]);
+                delta.push(cur.read_bank()?);
             }
 
             let mut minmax = Vec::with_capacity(layout.minmax_slots);
             for _ in 0..layout.minmax_slots {
-                let min_val = read_i64_le(bytes, &mut offset)?;
-                let max_val = read_i64_le(bytes, &mut offset)?;
-                minmax.push((min_val, max_val));
+                minmax.push(cur.read_minmax()?);
             }
 
             entries.push(TicketEntry {
@@ -191,66 +195,4 @@ impl Ticket {
             entries,
         })
     }
-}
-
-#[inline]
-fn read_u8(bytes: &[u8], offset: &mut usize) -> AggResult<u8> {
-    if *offset >= bytes.len() {
-        return Err(AggError::Codec("unexpected EOF reading u8".to_string()));
-    }
-    let val = bytes[*offset];
-    *offset += 1;
-    Ok(val)
-}
-
-#[inline]
-fn read_u32_le(bytes: &[u8], offset: &mut usize) -> AggResult<u32> {
-    let next = *offset + 4;
-    if next > bytes.len() {
-        return Err(AggError::Codec("unexpected EOF reading u32".to_string()));
-    }
-    let slice = &bytes[*offset..next];
-    *offset = next;
-    let mut arr = [0u8; 4];
-    arr.copy_from_slice(slice);
-    Ok(u32::from_le_bytes(arr))
-}
-
-#[inline]
-fn read_u64_le(bytes: &[u8], offset: &mut usize) -> AggResult<u64> {
-    let next = *offset + 8;
-    if next > bytes.len() {
-        return Err(AggError::Codec("unexpected EOF reading u64".to_string()));
-    }
-    let slice = &bytes[*offset..next];
-    *offset = next;
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(slice);
-    Ok(u64::from_le_bytes(arr))
-}
-
-#[inline]
-fn read_u128_le(bytes: &[u8], offset: &mut usize) -> AggResult<u128> {
-    let next = *offset + 16;
-    if next > bytes.len() {
-        return Err(AggError::Codec("unexpected EOF reading u128".to_string()));
-    }
-    let slice = &bytes[*offset..next];
-    *offset = next;
-    let mut arr = [0u8; 16];
-    arr.copy_from_slice(slice);
-    Ok(u128::from_le_bytes(arr))
-}
-
-#[inline]
-fn read_i64_le(bytes: &[u8], offset: &mut usize) -> AggResult<i64> {
-    let next = *offset + 8;
-    if next > bytes.len() {
-        return Err(AggError::Codec("unexpected EOF reading i64".to_string()));
-    }
-    let slice = &bytes[*offset..next];
-    *offset = next;
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(slice);
-    Ok(i64::from_le_bytes(arr))
 }

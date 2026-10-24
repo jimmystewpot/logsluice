@@ -1,0 +1,65 @@
+name: Coverage & Reports
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  reports:
+    name: Generate Reports & Coverage
+    runs-on: arc-runner-logsluice
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # Shallow clones should be disabled for a better relevancy of analysis
+      - name: Install C linker and build tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential curl unzip dirmngr gnupg ca-certificates
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview, clippy
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate Clippy report
+        run: cargo clippy --workspace --all-targets --all-features --message-format=json > clippy-report.json
+      - name: Generate LCOV coverage report
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false
+      - name: Save Sonar analysis metadata
+        run: |
+          mkdir -p sonar-metadata
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "true" > sonar-metadata/is_pr
+            echo "${{ github.event.pull_request.number }}" > sonar-metadata/pr_number
+            echo "${{ github.event.pull_request.head.sha }}" > sonar-metadata/head_sha
+            echo "${{ github.event.pull_request.head.ref }}" > sonar-metadata/head_ref
+            echo "${{ github.event.pull_request.base.ref }}" > sonar-metadata/base_ref
+          else
+            echo "false" > sonar-metadata/is_pr
+            echo "${{ github.sha }}" > sonar-metadata/head_sha
+            echo "${{ github.ref_name }}" > sonar-metadata/head_ref
+          fi
+      - name: Upload Sonar analysis inputs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sonar-reports
+          path: |
+            lcov.info
+            clippy-report.json
+            sonar-metadata/
+          retention-days: 1

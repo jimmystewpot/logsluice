@@ -30,7 +30,7 @@ fn ev(fields: &[(&str, Value)]) -> LogEvent {
 
 fn test_router(cfg: AdapterConfig) -> Router {
     let cfg = Arc::new(cfg);
-    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode);
     let horizons = (0..cfg.shards).map(|_| PurgeHorizon::new(0)).collect();
     let watermark_cfg = WatermarkConfig {
         allowed_skew_ms: cfg.window.allowed_skew.as_millis() as i64,
@@ -46,7 +46,7 @@ fn test_router(cfg: AdapterConfig) -> Router {
 
 fn test_router_with_watermark(cfg: AdapterConfig, watermark_ms: i64) -> Router {
     let cfg = Arc::new(cfg);
-    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode);
     let horizons = (0..cfg.shards).map(|_| PurgeHorizon::new(0)).collect();
     let allowed_skew_ms = cfg.window.allowed_skew.as_millis() as i64;
     let watermark_cfg = WatermarkConfig {
@@ -64,7 +64,7 @@ fn test_router_with_watermark(cfg: AdapterConfig, watermark_ms: i64) -> Router {
 
 fn test_router_with_horizon(cfg: AdapterConfig, horizon_ms: i64) -> Router {
     let cfg = Arc::new(cfg);
-    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode);
     let horizons = (0..cfg.shards)
         .map(|_| PurgeHorizon::new(horizon_ms))
         .collect();
@@ -240,7 +240,7 @@ fn source_position_extracted_and_shard_deterministic() {
 #[test]
 fn test_per_shard_horizon_independence() {
     let cfg = Arc::new(cfg());
-    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode);
     let watermark_cfg = WatermarkConfig {
         allowed_skew_ms: cfg.window.allowed_skew.as_millis() as i64,
         max_future_drift_ms: cfg.window.max_future_drift.as_millis() as i64,
@@ -382,7 +382,7 @@ fn otlp_mixed_batch_routes_valid_records_and_attaches_position_per_shard() {
     cfg.shards = 2;
     cfg.attributes_policy.unmatched_log_attributes = UnmatchedLogAttributes::KeepFirst;
     let cfg = Arc::new(cfg);
-    let kernels = SimdKernelTable::detect(SimdMode::Scalar.into());
+    let kernels = SimdKernelTable::detect(SimdMode::Scalar);
     let horizons = vec![PurgeHorizon::new(i64::MIN), PurgeHorizon::new(i64::MIN)];
     let wm = WatermarkTracker::new(
         WatermarkConfig {

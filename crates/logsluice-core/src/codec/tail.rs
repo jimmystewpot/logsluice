@@ -151,8 +151,9 @@ impl ExemplarTail {
         for _ in 0..attrs_count {
             let k_len = cur.read_u32()? as usize;
             let k_bytes = cur.read_bytes(k_len)?;
-            let key = String::from_utf8(k_bytes.to_vec())
-                .map_err(|e| AggError::Codec(format!("invalid UTF-8 in attr key: {e}")))?;
+            let key = std::str::from_utf8(k_bytes)
+                .map_err(|e| AggError::Codec(format!("invalid UTF-8 in attr key: {e}")))?
+                .to_owned();
 
             let v_len = cur.read_u32()? as usize;
             let v_bytes = cur.read_bytes(v_len)?;

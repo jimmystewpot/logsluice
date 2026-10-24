@@ -94,27 +94,17 @@ impl NumericHeader {
 
         let mut total = Vec::with_capacity(layout.banks);
         for _ in 0..layout.banks {
-            let l0 = cur.read_u64()?;
-            let l1 = cur.read_u64()?;
-            let l2 = cur.read_u64()?;
-            let l3 = cur.read_u64()?;
-            total.push([l0, l1, l2, l3]);
+            total.push(cur.read_bank()?);
         }
 
         let mut emitted = Vec::with_capacity(layout.banks);
         for _ in 0..layout.banks {
-            let l0 = cur.read_u64()?;
-            let l1 = cur.read_u64()?;
-            let l2 = cur.read_u64()?;
-            let l3 = cur.read_u64()?;
-            emitted.push([l0, l1, l2, l3]);
+            emitted.push(cur.read_bank()?);
         }
 
         let mut minmax = Vec::with_capacity(layout.minmax_slots);
         for _ in 0..layout.minmax_slots {
-            let min_val = cur.read_i64()?;
-            let max_val = cur.read_i64()?;
-            minmax.push((min_val, max_val));
+            minmax.push(cur.read_minmax()?);
         }
 
         Ok(Self {

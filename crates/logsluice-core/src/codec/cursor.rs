@@ -9,8 +9,9 @@ use crate::error::{AggError, AggResult};
 
 /// Offset into one encoded slice.
 ///
-/// Integer reads fail with `unexpected EOF reading u8`, `u32`, `u64`, `u128`,
-/// or `i64`. [`Cursor::read_bytes`] keeps the tail reader's length-and-offset
+/// Integer reads fail with `unexpected EOF reading u8`, `u32`, `u64`, or
+/// `u128`; [`Cursor::read_bank`] and [`Cursor::read_minmax`] fail with
+/// `unexpected EOF reading bank` / `minmax`. [`Cursor::read_bytes`] keeps the tail reader's length-and-offset
 /// message.
 pub(crate) struct Cursor<'a> {
     bytes: &'a [u8],
@@ -82,15 +83,35 @@ impl<'a> Cursor<'a> {
         ))
     }
 
-    /// Reads a little-endian `i64`.
+    /// Reads one 32-byte bank as four little-endian `u64` lanes.
+    ///
+    /// One bounds check covers all four lanes, so callers that already
+    /// validated the total length do not pay four checks per bank.
     ///
     /// # Errors
-    /// Returns `AggError::Codec("unexpected EOF reading i64")` when fewer than 8 bytes remain.
+    /// Returns `AggError::Codec("unexpected EOF reading bank")` when fewer than 32 bytes remain.
     #[inline]
-    pub(crate) fn read_i64(&mut self) -> AggResult<i64> {
-        Ok(i64::from_le_bytes(
-            self.read_array("unexpected EOF reading i64")?,
-        ))
+    pub(crate) fn read_bank(&mut self) -> AggResult<[u64; 4]> {
+        let raw: [u8; 32] = self.read_array("unexpected EOF reading bank")?;
+        Ok(std::array::from_fn(|i| {
+            let mut lane = [0u8; 8];
+            lane.copy_from_slice(&raw[i * 8..i * 8 + 8]);
+            u64::from_le_bytes(lane)
+        }))
+    }
+
+    /// Reads one 16-byte min/max slot as two little-endian `i64` values.
+    ///
+    /// # Errors
+    /// Returns `AggError::Codec("unexpected EOF reading minmax")` when fewer than 16 bytes remain.
+    #[inline]
+    pub(crate) fn read_minmax(&mut self) -> AggResult<(i64, i64)> {
+        let raw: [u8; 16] = self.read_array("unexpected EOF reading minmax")?;
+        let mut min = [0u8; 8];
+        let mut max = [0u8; 8];
+        min.copy_from_slice(&raw[..8]);
+        max.copy_from_slice(&raw[8..]);
+        Ok((i64::from_le_bytes(min), i64::from_le_bytes(max)))
     }
 
     /// Reads the next `len` bytes without copying them.
@@ -155,8 +176,25 @@ mod tests {
         assert_eq!(message, "unexpected EOF reading u64");
         let message = codec_message(Cursor::new(&[0; 15]).read_u128());
         assert_eq!(message, "unexpected EOF reading u128");
-        let message = codec_message(Cursor::new(&[0; 7]).read_i64());
-        assert_eq!(message, "unexpected EOF reading i64");
+    }
+
+    #[test]
+    fn bank_and_minmax_read_little_endian_and_report_eof() {
+        let mut bytes = Vec::new();
+        for lane in [1u64, 2, 3, u64::MAX] {
+            bytes.extend_from_slice(&lane.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(-5i64).to_le_bytes());
+        bytes.extend_from_slice(&7i64.to_le_bytes());
+        let mut cursor = Cursor::new(&bytes);
+        assert_eq!(cursor.read_bank().ok(), Some([1, 2, 3, u64::MAX]));
+        assert_eq!(cursor.read_minmax().ok(), Some((-5, 7)));
+        assert_eq!(cursor.remaining(), 0);
+
+        let message = codec_message(Cursor::new(&[0; 31]).read_bank());
+        assert_eq!(message, "unexpected EOF reading bank");
+        let message = codec_message(Cursor::new(&[0; 15]).read_minmax());
+        assert_eq!(message, "unexpected EOF reading minmax");
     }
 
     #[test]

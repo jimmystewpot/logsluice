@@ -1,7 +1,4 @@
 //! Pipeline configuration, YAML/JSON schema, and validation.
-//!
-//! [`EmitMode`], [`OnDiskFull`], [`OnCap`], [`EmitStrategy`], [`OnShutdown`], and [`SimdMode`]
-//! are re-exported from `logsluice-core`. The adapter structs below are the YAML schema.
 
 mod compile;
 
@@ -20,8 +17,8 @@ use logsluice_core::error::AggResult;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-// These names used to be a second copy with a manual `From` impl, which could drift from the
-// core serde spellings. The adapter structs are still the YAML schema.
+// Re-exported from `logsluice-core` so the YAML spellings cannot drift from the core serde
+// spellings (these used to be a second copy with a manual `From` impl).
 pub use logsluice_core::config::{EmitMode, EmitStrategy, OnCap, OnDiskFull, OnShutdown};
 pub use logsluice_core::simd::SimdMode;
 

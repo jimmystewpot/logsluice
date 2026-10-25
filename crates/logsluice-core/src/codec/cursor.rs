@@ -210,25 +210,21 @@ mod tests {
     #![allow(missing_docs)]
 
     use super::Cursor;
-    use crate::error::AggError;
 
     fn codec_message(result: crate::error::AggResult<impl Sized>) -> String {
-        match result {
-            Err(AggError::Codec(message)) => message,
-            _ => String::new(),
-        }
+        result.err().map(|e| e.to_string()).unwrap_or_default()
     }
 
     #[test]
     fn short_slice_returns_each_integer_eof_string() {
         let message = codec_message(Cursor::new(&[]).read_u8());
-        assert_eq!(message, "unexpected EOF reading u8");
+        assert_eq!(message, "codec error: unexpected EOF reading u8");
         let message = codec_message(Cursor::new(&[1, 2, 3]).read_u32());
-        assert_eq!(message, "unexpected EOF reading u32");
+        assert_eq!(message, "codec error: unexpected EOF reading u32");
         let message = codec_message(Cursor::new(&[0; 7]).read_u64());
-        assert_eq!(message, "unexpected EOF reading u64");
+        assert_eq!(message, "codec error: unexpected EOF reading u64");
         let message = codec_message(Cursor::new(&[0; 15]).read_u128());
-        assert_eq!(message, "unexpected EOF reading u128");
+        assert_eq!(message, "codec error: unexpected EOF reading u128");
     }
 
     #[test]
@@ -245,16 +241,16 @@ mod tests {
         assert_eq!(cursor.remaining(), 0);
 
         let message = codec_message(Cursor::new(&[0; 31]).read_bank());
-        assert_eq!(message, "unexpected EOF reading bank");
+        assert_eq!(message, "codec error: unexpected EOF reading bank");
         let message = codec_message(Cursor::new(&[0; 15]).read_minmax());
-        assert_eq!(message, "unexpected EOF reading minmax");
+        assert_eq!(message, "codec error: unexpected EOF reading minmax");
     }
 
     #[test]
     fn failed_read_leaves_the_offset_unchanged() {
         let mut cursor = Cursor::new(&[1, 2, 3]);
         let message = codec_message(cursor.read_u32());
-        assert_eq!(message, "unexpected EOF reading u32");
+        assert_eq!(message, "codec error: unexpected EOF reading u32");
         assert_eq!(cursor.offset(), 0);
         assert_eq!(cursor.read_u8().ok(), Some(1));
         assert_eq!(cursor.offset(), 1);
@@ -265,7 +261,10 @@ mod tests {
         let mut cursor = Cursor::new(&[9, 8, 7]);
         assert_eq!(cursor.read_u8().ok(), Some(9));
         let message = codec_message(cursor.read_bytes(4));
-        assert_eq!(message, "unexpected EOF reading 4 bytes: offset 1, total 3");
+        assert_eq!(
+            message,
+            "codec error: unexpected EOF reading 4 bytes: offset 1, total 3"
+        );
         assert_eq!(cursor.offset(), 1);
         assert_eq!(cursor.remaining(), 2);
     }

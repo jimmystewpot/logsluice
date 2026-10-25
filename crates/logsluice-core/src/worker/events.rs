@@ -20,10 +20,32 @@ use std::sync::Arc;
 use crate::config::OnShutdown;
 use crate::emission::{EmitReason, SliceRecord, records_for};
 use crate::key::StorageKey24;
+use crate::l1::DoubleBuffer;
 use crate::store::shard_store::{FlushBatch, JoinedRow};
 use crate::store::thread::{StoreCommand, StoreEvent};
 use crate::worker::lifecycle::WindowPhase;
 use crate::worker::{EmitBatch, ShardWorker, UnackedTicket, WorkerOutput};
+
+/// Starts a flush of the active L1 buffer if it has data and no flush is in
+/// flight, then reports whether any buffered data is still not durable.
+///
+/// Returns `true` while either the active buffer is non-empty or a flush is
+/// in flight, so a later waiter in the same `FlushDone` handler doesn't treat
+/// a buffer that was just swapped out by an earlier waiter as committed (#41).
+fn flush_still_pending<F>(
+    double_buf: &mut DoubleBuffer<F>,
+    last_flush_ms: &mut i64,
+    now_ms: i64,
+    commands: &mut Vec<StoreCommand<F>>,
+) -> bool {
+    if !double_buf.active().is_empty()
+        && let Some(swapped) = double_buf.try_swap()
+    {
+        *last_flush_ms = now_ms;
+        commands.push(StoreCommand::Flush(swapped));
+    }
+    !double_buf.active().is_empty() || double_buf.flush_in_flight()
+}
 
 impl<F> ShardWorker<F> {
     /// Handles an asynchronous event emitted by the shard storage thread.
@@ -110,11 +132,13 @@ impl<F> ShardWorker<F> {
         self.set_disk_bytes(disk_bytes);
 
         if self.drain_in_progress {
-            if !self.double_buf.active().is_empty() {
-                if let Some(swapped) = self.double_buf.try_swap() {
-                    self.last_flush_ms = now_ms;
-                    output.commands.push(StoreCommand::Flush(swapped));
-                }
+            if flush_still_pending(
+                &mut self.double_buf,
+                &mut self.last_flush_ms,
+                now_ms,
+                &mut output.commands,
+            ) {
+                // Wait for the in-flight flush's FlushDone before proceeding.
             } else {
                 self.drain_in_progress = false;
                 if self.ctx.cfg.shutdown.on_shutdown == OnShutdown::EmitPartial {
@@ -139,11 +163,13 @@ impl<F> ShardWorker<F> {
                 && now_ms >= closing.emission_start_ms
                 && !closing.flush_done
             {
-                if !self.double_buf.active().is_empty() {
-                    if let Some(swapped) = self.double_buf.try_swap() {
-                        self.last_flush_ms = now_ms;
-                        output.commands.push(StoreCommand::Flush(swapped));
-                    }
+                if flush_still_pending(
+                    &mut self.double_buf,
+                    &mut self.last_flush_ms,
+                    now_ms,
+                    &mut output.commands,
+                ) {
+                    // Wait for the in-flight flush's FlushDone before proceeding.
                 } else {
                     closing.flush_done = true;
                     if !closing.scan_started {
@@ -162,11 +188,13 @@ impl<F> ShardWorker<F> {
             }
 
             if window.periodic_flush_pending {
-                if !self.double_buf.active().is_empty() {
-                    if let Some(swapped) = self.double_buf.try_swap() {
-                        self.last_flush_ms = now_ms;
-                        output.commands.push(StoreCommand::Flush(swapped));
-                    }
+                if flush_still_pending(
+                    &mut self.double_buf,
+                    &mut self.last_flush_ms,
+                    now_ms,
+                    &mut output.commands,
+                ) {
+                    // Wait for the in-flight flush's FlushDone before proceeding.
                 } else {
                     window.periodic_flush_pending = false;
                     let mut keys: Vec<StorageKey24> = window.dirty_keys.drain().collect();
@@ -186,11 +214,13 @@ impl<F> ShardWorker<F> {
             }
 
             if window.late_flush_pending {
-                if !self.double_buf.active().is_empty() {
-                    if let Some(swapped) = self.double_buf.try_swap() {
-                        self.last_flush_ms = now_ms;
-                        output.commands.push(StoreCommand::Flush(swapped));
-                    }
+                if flush_still_pending(
+                    &mut self.double_buf,
+                    &mut self.last_flush_ms,
+                    now_ms,
+                    &mut output.commands,
+                ) {
+                    // Wait for the in-flight flush's FlushDone before proceeding.
                 } else {
                     window.late_flush_pending = false;
                     let mut keys: Vec<StorageKey24> = window.late_dirty_keys.drain().collect();
@@ -210,11 +240,13 @@ impl<F> ShardWorker<F> {
             }
 
             if window.evict_flush_pending {
-                if !self.double_buf.active().is_empty() {
-                    if let Some(swapped) = self.double_buf.try_swap() {
-                        self.last_flush_ms = now_ms;
-                        output.commands.push(StoreCommand::Flush(swapped));
-                    }
+                if flush_still_pending(
+                    &mut self.double_buf,
+                    &mut self.last_flush_ms,
+                    now_ms,
+                    &mut output.commands,
+                ) {
+                    // Wait for the in-flight flush's FlushDone before proceeding.
                 } else {
                     window.evict_flush_pending = false;
                     self.store_queries_inflight += 1;
@@ -245,43 +277,35 @@ impl<F> ShardWorker<F> {
         self.store_queries_inflight = self.store_queries_inflight.saturating_sub(1);
 
         if let Some(ticket_id) = recovery_ticket {
-            if let Some(ticket) = self.ledger.get(ticket_id).cloned() {
-                match records_for(
-                    &ticket,
+            let records = self.ledger.get(ticket_id).map(|ticket| {
+                records_for(
+                    ticket,
                     &rows,
                     &self.resources,
                     &self.ctx.emitter_id,
                     &self.ctx.clock,
                     self.ctx.cfg.emit_mode,
-                ) {
-                    Ok(records) => {
-                        self.stats.slices_reemitted_total += records.len() as u64;
-                        self.unacked_tickets.insert(
-                            ticket.id,
-                            UnackedTicket {
-                                ticket_id: ticket.id,
-                                first_emitted_ms: now_ms,
-                                records: records.clone(),
-                                backoff_ms: 5_000,
-                                next_retry_ms: None,
-                                spill_in_flight: false,
-                            },
-                        );
-                        self.enqueue_or_emit_paced(
-                            EmitBatch {
-                                ticket_id: ticket.id,
-                                records,
-                            },
-                            now_ms,
-                            output,
-                        );
-                    }
-                    Err(_) => {
-                        self.stats.recovery_failures_total += 1;
-                    }
+                )
+            });
+            match records {
+                Some(Ok(records)) => {
+                    self.stats.slices_reemitted_total += records.len() as u64;
+                    self.unacked_tickets.insert(
+                        ticket_id,
+                        UnackedTicket {
+                            ticket_id,
+                            first_emitted_ms: now_ms,
+                            records: records.clone(),
+                            backoff_ms: 5_000,
+                            next_retry_ms: None,
+                            spill_in_flight: false,
+                        },
+                    );
+                    self.enqueue_or_emit_paced(EmitBatch { ticket_id, records }, now_ms, output);
                 }
-            } else {
-                self.stats.recovery_failures_total += 1;
+                Some(Err(_)) | None => {
+                    self.stats.recovery_failures_total += 1;
+                }
             }
         } else if reason == EmitReason::Evict {
             if let Some(window) = self.windows.get_mut(&epoch_ms) {
@@ -418,37 +442,38 @@ impl<F> ShardWorker<F> {
 
         let mut close_epochs = Vec::new();
         for ticket_id in ticket_ids {
-            if let Some(ticket) = self.ledger.get(ticket_id).cloned() {
-                if ticket.reason == EmitReason::Close
-                    && !close_epochs.contains(&ticket.window_epoch_ms)
-                {
-                    close_epochs.push(ticket.window_epoch_ms);
-                }
-                if let Some(rows) = self.pending_rows.get(&ticket_id)
-                    && let Ok(records) = records_for(
-                        &ticket,
-                        rows,
-                        &self.resources,
-                        &self.ctx.emitter_id,
-                        &self.ctx.clock,
-                        self.ctx.cfg.emit_mode,
-                    )
-                {
-                    self.pending_rows.remove(&ticket_id);
-                    self.unacked_tickets.insert(
-                        ticket_id,
-                        UnackedTicket {
-                            ticket_id,
-                            first_emitted_ms: now_ms,
-                            records: records.clone(),
-                            backoff_ms: 5_000,
-                            next_retry_ms: None,
-                            spill_in_flight: false,
-                        },
-                    );
-                    self.enqueue_or_emit_paced(EmitBatch { ticket_id, records }, now_ms, output);
-                }
+            let Some(ticket) = self.ledger.get(ticket_id) else {
+                continue;
+            };
+            if ticket.reason == EmitReason::Close && !close_epochs.contains(&ticket.window_epoch_ms)
+            {
+                close_epochs.push(ticket.window_epoch_ms);
             }
+            let Some(rows) = self.pending_rows.remove(&ticket_id) else {
+                continue;
+            };
+            let Ok(records) = records_for(
+                ticket,
+                &rows,
+                &self.resources,
+                &self.ctx.emitter_id,
+                &self.ctx.clock,
+                self.ctx.cfg.emit_mode,
+            ) else {
+                continue;
+            };
+            self.unacked_tickets.insert(
+                ticket_id,
+                UnackedTicket {
+                    ticket_id,
+                    first_emitted_ms: now_ms,
+                    records: records.clone(),
+                    backoff_ms: 5_000,
+                    next_retry_ms: None,
+                    spill_in_flight: false,
+                },
+            );
+            self.enqueue_or_emit_paced(EmitBatch { ticket_id, records }, now_ms, output);
         }
 
         for epoch_ms in close_epochs {

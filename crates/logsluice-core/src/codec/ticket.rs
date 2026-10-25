@@ -139,7 +139,18 @@ impl Ticket {
             )));
         }
 
-        let entry_len = 16 + 4 + layout.banks * 32 + layout.minmax_slots * 16;
+        // A corrupt layout can overflow `entry_len` itself (e.g. on 32-bit),
+        // so it shares the entries-count overflow guard below.
+        let entry_len = layout
+            .banks
+            .checked_mul(32)
+            .and_then(|b| {
+                layout
+                    .minmax_slots
+                    .checked_mul(16)
+                    .and_then(|m| b.checked_add(m))
+            })
+            .and_then(|bm| bm.checked_add(20));
         let mut cur = Cursor::new(bytes);
 
         let id = cur.read_u64()?;
@@ -150,8 +161,8 @@ impl Ticket {
 
         // `entries_count` is an untrusted wire value. Wrapping the product
         // would accept a short buffer or panic in debug before `with_capacity`.
-        let Some(expected_total_len) = entries_count
-            .checked_mul(entry_len)
+        let Some(expected_total_len) = entry_len
+            .and_then(|len| entries_count.checked_mul(len))
             .and_then(|n| n.checked_add(21))
         else {
             return Err(AggError::Codec(format!(

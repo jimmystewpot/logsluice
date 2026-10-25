@@ -262,6 +262,7 @@ impl SliceRecord {
     /// compensates for `apply_ack` not having advanced the stored `slice_seq`
     /// between tickets in the same window.
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     #[must_use]
     pub fn from_parts(
         window_start_ms: i64,
@@ -276,6 +277,11 @@ impl SliceRecord {
         counters: Vec<[u64; 4]>,
         minmax: Vec<(i64, i64)>,
     ) -> Self {
+        debug_assert_eq!(
+            u64::try_from(window_start_ms).ok(),
+            Some(window_epoch_ms),
+            "window_start_ms and window_epoch_ms must name the same window"
+        );
         Self {
             window_start_ms,
             window_end_ms,
@@ -285,7 +291,7 @@ impl SliceRecord {
             slice_seq,
             slice_id: slice_id(emitter_id, window_epoch_ms, digest, slice_seq),
             resource,
-            tail: tail.unwrap_or_else(ExemplarTail::missing),
+            tail: tail.unwrap_or_default(),
             counters,
             minmax,
         }

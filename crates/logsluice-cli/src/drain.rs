@@ -216,6 +216,9 @@ pub fn run_drain(data_dir: &Path, format: &str) -> AggResult<()> {
         }
 
         for epoch_ms in store.live_windows() {
+            let window_start_ms = i64::try_from(epoch_ms)
+                .map_err(|_| AggError::Codec("window_epoch_ms exceeds i64".to_string()))?;
+            let window_end_ms = clock.end_of(window_start_ms);
             let mut after = None;
             loop {
                 let rows = store.rows(epoch_ms, after, 500)?;
@@ -240,9 +243,6 @@ pub fn run_drain(data_dir: &Path, format: &str) -> AggResult<()> {
                             .cloned()
                             .unwrap_or_else(|| Arc::clone(&default_res));
 
-                        let window_start_ms = epoch_ms as i64;
-                        let window_end_ms = clock.end_of(window_start_ms);
-
                         let record = SliceRecord::from_parts(
                             window_start_ms,
                             window_end_ms,
@@ -252,9 +252,9 @@ pub fn run_drain(data_dir: &Path, format: &str) -> AggResult<()> {
                             row.key.digest,
                             row.header.slice_seq,
                             resource,
-                            row.tail.clone(),
+                            row.tail,
                             delta,
-                            row.header.minmax.clone(),
+                            row.header.minmax,
                         );
 
                         let line = serde_json::to_string(&record)

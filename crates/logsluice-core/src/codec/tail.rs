@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AggError, AggResult};
 
+impl Default for ExemplarTail {
+    /// Same as [`ExemplarTail::missing`].
+    #[inline]
+    fn default() -> Self {
+        Self::missing()
+    }
+}
+
 /// Tail payload storing exemplar log message body, grouping dimensions, and unmatched attributes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExemplarTail {
@@ -25,6 +33,7 @@ impl ExemplarTail {
     /// Live close and `logsluice drain` both substitute this through
     /// [`crate::emission::SliceRecord::from_parts`] so a missing tail key
     /// cannot drift between the two emitters.
+    #[inline]
     #[must_use]
     pub const fn missing() -> Self {
         Self {

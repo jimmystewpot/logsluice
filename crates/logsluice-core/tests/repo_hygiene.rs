@@ -18,6 +18,7 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
     let required_files = [
         ".github/dependabot.yml",
         ".github/workflows/ci.yml",
+        ".github/workflows/coverage.yml",
         ".github/workflows/sonarcloud.yml",
         ".github/workflows/benchmarks.yml",
         ".github/workflows/release.yml",
@@ -104,6 +105,7 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
 
     for wf_rel in [
         ".github/workflows/ci.yml",
+        ".github/workflows/coverage.yml",
         ".github/workflows/sonarcloud.yml",
         ".github/workflows/benchmarks.yml",
         ".github/workflows/release.yml",

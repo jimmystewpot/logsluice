@@ -209,17 +209,16 @@ fn multi_resource_overflow_buckets_preserve_per_resource_totals() {
 
     // Resource A: h1 admitted (1/1), h2 & h3 overflow for Resource A (3 + 4 = 7).
     // Resource B: h4 admitted (1/1), h5 overflows for Resource B (9).
-    h.worker().ingest(
-        vec![
-            make_res_item(1_000, "svc-a", "h1", 2),
-            make_res_item(1_000, "svc-a", "h2", 3),
-            make_res_item(1_000, "svc-a", "h3", 4),
-            make_res_item(1_000, "svc-b", "h4", 5),
-            make_res_item(1_000, "svc-b", "h5", 9),
-        ],
-        0,
-        1_000,
-    );
+    let batch = vec![
+        make_res_item(1_000, "svc-a", "h1", 2),
+        make_res_item(1_000, "svc-a", "h2", 3),
+        make_res_item(1_000, "svc-a", "h3", 4),
+        make_res_item(1_000, "svc-b", "h4", 5),
+        make_res_item(1_000, "svc-b", "h5", 9),
+    ];
+    if let Err((returned, _)) = h.worker().try_ingest(batch, 0, 1_000) {
+        panic!("try_ingest refused a batch of length {}", returned.len());
+    }
 
     h.advance(DAY + 31_000, Some(DAY));
     let recs = h.drain_emitted();

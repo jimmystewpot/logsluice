@@ -406,13 +406,14 @@ impl<F> StoreWorker<F> {
         match cmd {
             StoreCommand::Flush(buf) => {
                 let (batch, finalizers) = buf.into_flush();
-                let local_fail = std::mem::take(fail_next_flush);
-                let handle_fail = take_armed(thread_fail_next_flush);
-                let flush_res = if local_fail || handle_fail {
-                    Err(AggError::Channel("injected Flush failure".into()))
-                } else {
-                    store.apply_flush_ref(&batch, k)
-                };
+                // Short-circuit: an armed local flag leaves the handle flag
+                // untouched for the next flush.
+                let flush_res =
+                    if std::mem::take(fail_next_flush) || take_armed(thread_fail_next_flush) {
+                        Err(AggError::Channel("injected Flush failure".into()))
+                    } else {
+                        store.apply_flush_ref(&batch, k)
+                    };
                 match flush_res {
                     Ok(stats) => {
                         let fail_disk = take_armed(thread_fail_next_disk_bytes);

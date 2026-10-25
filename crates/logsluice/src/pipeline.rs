@@ -138,12 +138,19 @@ async fn emit_worker_output(
     while let Some(cmd) = cmds.next() {
         // Swap only on Flush. Sampling at the top of the shard loop let the
         // first idle shard take the flag, and a task already inside `select!`
-        // flushed once before it looked again.
+        // flushed once before it looked again. Test-only, so release builds
+        // carry no check even if `None` is not constant-propagated across
+        // the spawned tasks.
+        #[cfg(test)]
         if matches!(cmd, StoreCommand::Flush(_))
-            && fail_next_flush.is_some_and(|flag| flag.swap(false, Ordering::SeqCst))
+            && fail_next_flush.is_some_and(|flag| {
+                flag.load(Ordering::Relaxed) && flag.swap(false, Ordering::AcqRel)
+            })
         {
             store_handle.fail_next_flush();
         }
+        #[cfg(not(test))]
+        let _ = fail_next_flush;
         if let Err(unsent) = store_handle.try_send(cmd) {
             worker.defer_command(unsent);
             worker.requeue_commands(cmds);

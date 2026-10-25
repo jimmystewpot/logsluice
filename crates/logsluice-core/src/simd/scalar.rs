@@ -225,6 +225,44 @@ pub(crate) fn fingerprint_log_bytes_scalar(input: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// Scans log bytes in `WIDTH`-byte chunks, copying a chunk only when it cannot
+/// start or continue a replaced token.
+///
+/// AVX2 uses 32 and NEON uses 16. `WIDTH` is a const so this loop inlines into
+/// the `#[target_feature]` caller under `codegen-units = 16`. A runtime width
+/// would compile the scan in this module's codegen unit, and LLVM will not
+/// inline an AVX2 closure into that non-AVX2 function. The chunk stays
+/// `[u8; WIDTH]`, so the caller does not `try_into` on every iteration.
+///
+/// AVX2 and NEON only prefilter chunks. Token replacement (UUID, IPv4, hex,
+/// numbers) is scalar so the three backends stay bit-identical. The last byte
+/// of a clean chunk is still checked with `is_ascii_hexdigit` because a hex run
+/// can straddle the chunk boundary; skipping that check would let the vector
+/// path disagree with scalar. `tests/simd_parity.rs` is the gate.
+///
+/// `chunk_has_marker` reports whether that chunk contains a digit or `'-'`.
+#[inline(always)]
+pub(crate) fn fingerprint_scan<const WIDTH: usize>(
+    input: &[u8],
+    out: &mut Vec<u8>,
+    mut chunk_has_marker: impl FnMut(&[u8; WIDTH]) -> bool,
+) {
+    const { assert!(WIDTH > 0, "SIMD chunk width must be non-zero") };
+    out.reserve(input.len());
+    let mut pos = 0;
+    while let Some(chunk) = input.get(pos..).and_then(<[u8]>::first_chunk::<WIDTH>) {
+        if !chunk_has_marker(chunk) && !chunk[WIDTH - 1].is_ascii_hexdigit() {
+            out.extend_from_slice(chunk);
+            pos += WIDTH;
+        } else {
+            step_scalar(input, &mut pos, out);
+        }
+    }
+    while pos < input.len() {
+        step_scalar(input, &mut pos, out);
+    }
+}
+
 /// Hashes input bytes with 64-bit seed using XXH3-128.
 pub(crate) fn hash_key_128_scalar(bytes: &[u8], seed: u64) -> u128 {
     xxhash_rust::xxh3::xxh3_128_with_seed(bytes, seed)

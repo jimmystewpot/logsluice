@@ -523,7 +523,7 @@ async fn run_pipeline_inner(
     let engine = Arc::new(engine);
     let plan = Arc::new(plan);
     let clock = WindowClock::new(cfg.window.duration, cfg.window.offset)?;
-    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode);
     let shards_count = usize::from(cfg.shards);
 
     let mut init_handles = Vec::with_capacity(shards_count);

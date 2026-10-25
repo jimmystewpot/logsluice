@@ -1,51 +1,87 @@
-name: Build
+name: SonarCloud Scan
+
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    types: [opened, synchronize, reopened]
+  workflow_run:
+    workflows: ["Coverage & Reports"]
+    types: [completed]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.id || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   sonarqube:
     name: SonarQube
     runs-on: arc-runner-logsluice
+    if: github.event.workflow_run.conclusion == 'success'
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checkout base repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+          fetch-depth: 0
+
       - name: Install C linker and build tools
         run: |
           sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential curl unzip dirmngr gnupg ca-certificates
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download Sonar analysis inputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          components: llvm-tools-preview, clippy
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Generate Clippy report
-        run: cargo clippy --workspace --all-targets --all-features --message-format=json > clippy-report.json
-      - name: Generate LCOV coverage report
-        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v7
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          fail_ci_if_error: false
+          name: sonar-reports
+          path: .sonar-inputs
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare reports and checkout target commit
+        id: meta
+        run: |
+          IS_PR="$(cat .sonar-inputs/sonar-metadata/is_pr)"
+          HEAD_SHA="$(cat .sonar-inputs/sonar-metadata/head_sha)"
+          HEAD_REF="$(cat .sonar-inputs/sonar-metadata/head_ref)"
+          echo "is_pr=${IS_PR}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "head_ref=${HEAD_REF}" >> "$GITHUB_OUTPUT"
+
+          if [ "$IS_PR" = "true" ]; then
+            PR_NUM="$(cat .sonar-inputs/sonar-metadata/pr_number)"
+            BASE_REF="$(cat .sonar-inputs/sonar-metadata/base_ref)"
+            echo "pr_number=${PR_NUM}" >> "$GITHUB_OUTPUT"
+            echo "base_ref=${BASE_REF}" >> "$GITHUB_OUTPUT"
+
+            echo "Fetching PR #${PR_NUM} commit ${HEAD_SHA}..."
+            git fetch origin "pull/${PR_NUM}/head"
+            git checkout --detach FETCH_HEAD
+          fi
+
+          # Place coverage and clippy reports in project root as configured in sonar-project.properties
+          cp .sonar-inputs/lcov.info ./lcov.info
+          cp .sonar-inputs/clippy-report.json ./clippy-report.json
+          rm -rf .sonar-inputs
+
       - name: Cache SonarQube packages
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.sonar/cache
           key: ${{ runner.os }}-sonar
           restore-keys: ${{ runner.os }}-sonar
-      - name: SonarQube Scan
+
+      - name: SonarQube Scan (Pull Request)
+        if: steps.meta.outputs.is_pr == 'true'
+        uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.pullrequest.key=${{ steps.meta.outputs.pr_number }}
+            -Dsonar.pullrequest.branch=${{ steps.meta.outputs.head_ref }}
+            -Dsonar.pullrequest.base=${{ steps.meta.outputs.base_ref }}
+            -Dsonar.scm.revision=${{ steps.meta.outputs.head_sha }}
+
+      - name: SonarQube Scan (Main Branch)
+        if: steps.meta.outputs.is_pr == 'false'
         uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

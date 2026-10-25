@@ -315,7 +315,7 @@ shutdown:
     let engine = Arc::new(engine);
     let plan = Arc::new(plan);
     let clock = WindowClock::new(cfg.window.duration, cfg.window.offset).unwrap();
-    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode);
 
     let store_opts = StoreOptions {
         shard_dir,
@@ -597,7 +597,7 @@ async fn closed_output_channel_nacks_remaining_batches_and_stops_shard_loop() {
         &pod_meta,
     )
     .expect("open shard store");
-    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode);
     let worker_ctx = WorkerContext {
         cfg: Arc::new(engine),
         shard: 0,
@@ -789,7 +789,7 @@ shutdown:
     let engine = Arc::new(engine);
     let plan = Arc::new(plan);
     let clock = WindowClock::new(cfg.window.duration, cfg.window.offset).unwrap();
-    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode);
 
     let store_opts = StoreOptions {
         shard_dir,
@@ -1000,7 +1000,7 @@ shutdown:
     let engine = Arc::new(engine);
     let plan = Arc::new(plan);
     let clock = WindowClock::new(cfg.window.duration, cfg.window.offset).unwrap();
-    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode);
 
     let store_opts = StoreOptions {
         shard_dir,
@@ -1185,7 +1185,7 @@ shutdown:
     let engine = Arc::new(engine);
     let plan = Arc::new(plan);
     let clock = WindowClock::new(cfg.window.duration, cfg.window.offset).unwrap();
-    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode.into());
+    let kernels = SimdKernelTable::detect(cfg.acceleration.simd_mode);
 
     // Part A: Startup with a recovered ticket and closed output_rx drains queued ingest_rx as Errored.
     let store_opts = StoreOptions {

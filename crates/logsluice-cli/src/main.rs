@@ -96,6 +96,7 @@ fn main() -> ExitCode {
                 crash_every: args.crash_every,
                 nack_rate: args.nack_rate,
                 stop_before_close: args.stop_before_close,
+                l1_coalesce_max_keys: 100_000,
             };
 
             match replay::run_replay(opts) {

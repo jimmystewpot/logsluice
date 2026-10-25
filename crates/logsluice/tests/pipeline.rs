@@ -361,7 +361,7 @@ shutdown:
 
         let (_engine, plan) = cfg_clone.into_engine_and_plan().unwrap();
         let kernels =
-            logsluice_core::simd::SimdKernelTable::detect(cfg_clone.acceleration.simd_mode.into());
+            logsluice_core::simd::SimdKernelTable::detect(cfg_clone.acceleration.simd_mode);
 
         for s in 0..cfg_clone.shards {
             let shard_dir = data_dir_clone.join(format!("shard_{s}"));

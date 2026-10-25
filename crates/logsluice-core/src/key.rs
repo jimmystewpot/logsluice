@@ -146,13 +146,30 @@ impl KeyBuilder {
         body: Option<&[u8]>,
         dims: &[Option<&[u8]>],
     ) -> u128 {
+        self.digest_dims(resource_scope_hash, severity, body, dims)
+    }
+
+    /// [`KeyBuilder::digest`] over any byte-like dimension slice.
+    ///
+    /// Lets callers holding `&[Option<Bytes>]` hash in place instead of
+    /// collecting a temporary `Vec<Option<&[u8]>>` per event. The encoding is
+    /// identical to [`KeyBuilder::digest`].
+    #[inline]
+    #[must_use]
+    pub fn digest_dims<D: AsRef<[u8]>>(
+        &self,
+        resource_scope_hash: u64,
+        severity: u8,
+        body: Option<&[u8]>,
+        dims: &[Option<D>],
+    ) -> u128 {
         let mut hasher = xxhash_rust::xxh3::Xxh3::with_seed(self.salt);
         hasher.update(&resource_scope_hash.to_le_bytes());
         hasher.update(&[severity]);
 
         encode_field(&mut hasher, body);
         for dim in dims {
-            encode_field(&mut hasher, *dim);
+            encode_field(&mut hasher, dim.as_ref().map(AsRef::as_ref));
         }
 
         hasher.digest128()

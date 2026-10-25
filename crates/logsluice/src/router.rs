@@ -7,6 +7,7 @@
 //! [`Router::publish_prepared`] assigns the shard. `crates/logsluice/tests/router.rs`
 //! locks the observable behavior.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -117,9 +118,10 @@ pub struct Router {
 /// shard formula. Envelope parsing stays separate because the JSON shapes
 /// differ. `crates/logsluice/tests/router.rs` locks the observable behavior.
 ///
-/// Counter banks and exemplar attrs are filled only after the record is
-/// admitted. Late events therefore do not bump metric coercion or type-error
-/// counters. `position` is the native source position; OTLP leaves it empty
+/// Counter banks and exemplar attrs are not fields here: `on_admit` computes
+/// them only after the record is admitted and they go straight into the
+/// [`IngestItem`]. Late events therefore do not bump metric coercion or
+/// type-error counters. `position` is the native source position; OTLP leaves it empty
 /// and stamps the envelope position onto the last admitted item of each shard
 /// after the `resourceLogs` walk.
 struct PreparedRecord {
@@ -128,9 +130,6 @@ struct PreparedRecord {
     severity: u8,
     body: Option<Bytes>,
     dims: Vec<Option<Bytes>>,
-    counters: Vec<[u64; 4]>,
-    minmax_values: Vec<i64>,
-    attrs: Vec<(String, Bytes)>,
     resource: Arc<ResourceScopePayload>,
     resource_hash: u64,
 }
@@ -338,25 +337,17 @@ impl Router {
     /// `crates/logsluice/tests/router.rs` locks the observable behavior.
     fn publish_prepared(
         &mut self,
-        mut record: PreparedRecord,
+        record: PreparedRecord,
         now_ms: i64,
         out: &mut RouterOutput,
         on_admit: impl FnOnce(&mut Self) -> (Vec<[u64; 4]>, Vec<i64>, Vec<(String, Bytes)>),
     ) -> RecordDisposition {
-        let digest = {
-            let body_bytes_ref = record.body.as_deref();
-            let dim_bytes_refs: Vec<Option<&[u8]>> = record
-                .dims
-                .iter()
-                .map(|dim| dim.as_ref().map(Bytes::as_ref))
-                .collect();
-            self.key_builder.digest(
-                record.resource_hash,
-                record.severity,
-                body_bytes_ref,
-                &dim_bytes_refs,
-            )
-        };
+        let digest = self.key_builder.digest_dims(
+            record.resource_hash,
+            record.severity,
+            record.body.as_deref(),
+            &record.dims,
+        );
         let shard = ((digest as u64) % (self.horizons.len() as u64)) as usize;
         let window_start = self.clock.start_of(record.event_ms);
         let window_end = self.clock.end_of(window_start);
@@ -370,9 +361,6 @@ impl Router {
         }
 
         let (counters, minmax_values, attrs) = on_admit(self);
-        record.counters = counters;
-        record.minmax_values = minmax_values;
-        record.attrs = attrs;
 
         let pushed = shard < out.per_shard.len();
         if pushed {
@@ -385,13 +373,13 @@ impl Router {
                 resource_hash: record.resource_hash,
                 position: record.position,
                 event_ms: record.event_ms,
-                counters: record.counters,
-                minmax_values: record.minmax_values,
+                counters,
+                minmax_values,
                 exemplar: ExemplarSource {
                     severity: record.severity,
                     body: record.body,
                     dims: record.dims,
-                    attrs: record.attrs,
+                    attrs,
                 },
             });
         }
@@ -684,9 +672,6 @@ impl Router {
             severity: self.native_severity(&event),
             body: self.native_body(&event),
             dims: self.native_dims(&event),
-            counters: Vec::new(),
-            minmax_values: Vec::new(),
-            attrs: Vec::new(),
             resource,
             resource_hash,
         };
@@ -700,7 +685,7 @@ impl Router {
                 |idx, _spec| {
                     metric_paths[idx]
                         .as_ref()
-                        .and_then(|path| event.get(path).cloned())
+                        .and_then(|path| event.get(path).map(Cow::Borrowed))
                 },
                 None,
             );
@@ -723,19 +708,12 @@ impl Router {
         let outer_position = self.extract_position(&event);
         let outer_source_key = self.source_key_from(&event, outer_position.as_ref());
 
-        if event
-            .get(&self.resource_logs_path)
-            .and_then(Value::as_array)
-            .is_none()
-        {
-            self.quarantine_event(event, "missing_timestamp", out);
-            return;
-        }
         let Some(resource_logs) = event
             .get(&self.resource_logs_path)
             .and_then(Value::as_array)
             .map(Vec::as_slice)
         else {
+            self.quarantine_event(event, "missing_timestamp", out);
             return;
         };
 
@@ -908,24 +886,27 @@ impl Router {
                         ));
                     }
 
-                    let severity_attr =
-                        extract_value_from_otlp_record(lr_obj, lr_attrs, "severity");
-                    let level_attr = extract_value_from_otlp_record(lr_obj, lr_attrs, "level");
-                    let severity = severity_from([
-                        lr_obj.get("severityNumber"),
-                        lr_obj.get("severityText"),
-                        severity_attr.as_ref(),
-                        level_attr.as_ref(),
-                    ]);
+                    // The attribute scans only run when neither top-level
+                    // field parses, as before the shared record.
+                    let attr_severity = |name: &str| {
+                        extract_value_from_otlp_record(lr_obj, lr_attrs, name)
+                            .as_ref()
+                            .and_then(parse_severity_value)
+                    };
+                    let severity = [lr_obj.get("severityNumber"), lr_obj.get("severityText")]
+                        .into_iter()
+                        .find_map(|value| value.and_then(parse_severity_value))
+                        .or_else(|| attr_severity("severity"))
+                        .or_else(|| attr_severity("level"))
+                        .unwrap_or(0);
 
                     let raw_body = extract_value_from_otlp_record(lr_obj, lr_attrs, "body")
                         .or_else(|| lr_obj.get("body").cloned());
-                    let body_val = raw_body.map(|val| match &val {
-                        Value::Object(map) => map
-                            .get("stringValue")
-                            .cloned()
-                            .unwrap_or_else(|| val.clone()),
-                        other => other.clone(),
+                    let body_val = raw_body.map(|val| match val {
+                        Value::Object(mut map) => {
+                            map.remove("stringValue").unwrap_or(Value::Object(map))
+                        }
+                        other => other,
                     });
                     let policy = self.cfg.attributes_policy.body_policy;
                     let normalizer = self
@@ -952,9 +933,6 @@ impl Router {
                         severity,
                         body: exemplar_body,
                         dims,
-                        counters: Vec::new(),
-                        minmax_values: Vec::new(),
-                        attrs: Vec::new(),
                         resource: Arc::clone(&resource_payload),
                         resource_hash,
                     };
@@ -968,6 +946,7 @@ impl Router {
                                 let field_name =
                                     spec.field.as_deref().unwrap_or(spec.name.as_str());
                                 extract_value_from_otlp_record(lr_obj, lr_attrs, field_name)
+                                    .map(Cow::Owned)
                             },
                             Some(event_ms),
                         );
@@ -1131,11 +1110,14 @@ fn fingerprint_body(kernels: &SimdKernelTable, body_val: &Value) -> Bytes {
 /// min/max field named `@timestamp`, the configured timestamp field, or `time`
 /// then stores that millis value. Native passes `None` so a missing path stays
 /// zero. Coerced min/max values do not increment `field_coercions_total`.
-fn fill_metric_banks(
+///
+/// `lookup` returns a [`Cow`] so the native path can borrow the event's value
+/// while OTLP hands over the value it already had to build.
+fn fill_metric_banks<'v>(
     plan: &AggregationPlan,
     timestamp_field: &str,
     stats: &mut RouterStats,
-    mut lookup: impl FnMut(usize, &AggregationSpec) -> Option<Value>,
+    mut lookup: impl FnMut(usize, &AggregationSpec) -> Option<Cow<'v, Value>>,
     missing_timestamp_ms: Option<i64>,
 ) -> (Vec<[u64; 4]>, Vec<i64>) {
     let mut counters = vec![[0u64; 4]; plan.layout().banks];

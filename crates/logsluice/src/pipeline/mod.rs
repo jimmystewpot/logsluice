@@ -273,7 +273,7 @@ impl ShardRuntime {
         mut control_rx: tokio_mpsc::Receiver<ControlMessage>,
     ) {
         let rec_out = self.worker.recovery_output();
-        let _ = self.emit(rec_out).await;
+        let downstream_open = self.emit(rec_out).await;
 
         let mut draining = false;
         let mut drain_deadline: Option<i64> = None;
@@ -281,93 +281,96 @@ impl ShardRuntime {
         let mut pending_ingest: Option<(Vec<IngestItem>, AckFinalizers)> = None;
         let mut last_watermark: Option<i64> = None;
 
-        loop {
-            tokio::select! {
-                biased;
+        // Downstream already gone during recovery: skip the loop and clean up.
+        if downstream_open {
+            loop {
+                tokio::select! {
+                    biased;
 
-                Some(store_ev) = store_events.next() => {
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-                    let out = self.worker.on_event(store_ev, now_ms);
-                    if self.emit_then_maybe_finish_drain(
-                        out,
-                        draining,
-                        &mut pending_ingest,
-                        drain_deadline,
-                        now_ms,
-                        AfterEmit::RetryPendingIngest,
-                    ).await {
-                        break;
-                    }
-                }
-
-                Some((items, finalizer)) = ingest_rx.recv(), if pending_ingest.is_none() && self.worker.can_ingest() => {
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-                    if let Err(batch) = self.worker.try_ingest(items, finalizer, now_ms) {
-                        pending_ingest = Some(batch);
-                    }
-                }
-
-                Some(msg) = control_rx.recv() => {
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-                    match msg {
-                        ControlMessage::Ack { ticket_id, delivered } => {
-                            let out = self.worker.on_ack(ticket_id, delivered, now_ms);
-                            if self.emit_then_maybe_finish_drain(
-                                out,
-                                draining,
-                                &mut pending_ingest,
-                                drain_deadline,
-                                now_ms,
-                                AfterEmit::Nothing,
-                            ).await {
-                                break;
-                            }
-                        }
-                        ControlMessage::Poll { watermark, now_ms } => {
-                            last_watermark = watermark;
-                            let out = self.worker.poll(watermark, now_ms);
-                            if self.emit_then_maybe_finish_drain(
-                                out,
-                                draining,
-                                &mut pending_ingest,
-                                drain_deadline,
-                                now_ms,
-                                AfterEmit::ExportMetrics,
-                            ).await {
-                                break;
-                            }
-                        }
-                        ControlMessage::Drain { deadline_ms } => {
-                            draining = true;
-                            drain_deadline = Some(deadline_ms);
-                            let out = self.worker.begin_drain(deadline_ms);
-                            if self.emit_then_maybe_finish_drain(
-                                out,
-                                draining,
-                                &mut pending_ingest,
-                                drain_deadline,
-                                now_ms,
-                                AfterEmit::Nothing,
-                            ).await {
-                                break;
-                            }
+                    Some(store_ev) = store_events.next() => {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let out = self.worker.on_event(store_ev, now_ms);
+                        if self.emit_then_maybe_finish_drain(
+                            out,
+                            draining,
+                            &mut pending_ingest,
+                            drain_deadline,
+                            now_ms,
+                            AfterEmit::RetryPendingIngest,
+                        ).await {
+                            break;
                         }
                     }
-                }
 
-                _ = drain_interval.tick(), if draining || self.worker.pending_commands_len() > 0 => {
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-                    retry_pending_ingest(&mut self.worker, &mut pending_ingest, now_ms);
-                    let out = self.worker.poll(last_watermark, now_ms);
-                    if self.emit_then_maybe_finish_drain(
-                        out,
-                        draining,
-                        &mut pending_ingest,
-                        drain_deadline,
-                        now_ms,
-                        AfterEmit::Nothing,
-                    ).await {
-                        break;
+                    Some((items, finalizer)) = ingest_rx.recv(), if pending_ingest.is_none() && self.worker.can_ingest() => {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        if let Err(batch) = self.worker.try_ingest(items, finalizer, now_ms) {
+                            pending_ingest = Some(batch);
+                        }
+                    }
+
+                    Some(msg) = control_rx.recv() => {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        match msg {
+                            ControlMessage::Ack { ticket_id, delivered } => {
+                                let out = self.worker.on_ack(ticket_id, delivered, now_ms);
+                                if self.emit_then_maybe_finish_drain(
+                                    out,
+                                    draining,
+                                    &mut pending_ingest,
+                                    drain_deadline,
+                                    now_ms,
+                                    AfterEmit::Nothing,
+                                ).await {
+                                    break;
+                                }
+                            }
+                            ControlMessage::Poll { watermark, now_ms } => {
+                                last_watermark = watermark;
+                                let out = self.worker.poll(watermark, now_ms);
+                                if self.emit_then_maybe_finish_drain(
+                                    out,
+                                    draining,
+                                    &mut pending_ingest,
+                                    drain_deadline,
+                                    now_ms,
+                                    AfterEmit::ExportMetrics,
+                                ).await {
+                                    break;
+                                }
+                            }
+                            ControlMessage::Drain { deadline_ms } => {
+                                draining = true;
+                                drain_deadline = Some(deadline_ms);
+                                let out = self.worker.begin_drain(deadline_ms);
+                                if self.emit_then_maybe_finish_drain(
+                                    out,
+                                    draining,
+                                    &mut pending_ingest,
+                                    drain_deadline,
+                                    now_ms,
+                                    AfterEmit::Nothing,
+                                ).await {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    _ = drain_interval.tick(), if draining || self.worker.pending_commands_len() > 0 => {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        retry_pending_ingest(&mut self.worker, &mut pending_ingest, now_ms);
+                        let out = self.worker.poll(last_watermark, now_ms);
+                        if self.emit_then_maybe_finish_drain(
+                            out,
+                            draining,
+                            &mut pending_ingest,
+                            drain_deadline,
+                            now_ms,
+                            AfterEmit::Nothing,
+                        ).await {
+                            break;
+                        }
                     }
                 }
             }
@@ -568,16 +571,55 @@ async fn run_pipeline_inner(
     let mut all_known_partitions = Vec::new();
 
     let cfg_arc = Arc::new(cfg.clone());
-    let router_stats_shared = Arc::new(std::sync::Mutex::new(RouterStats::default()));
+    let router_stats_shared = Arc::new(Mutex::new(RouterStats::default()));
 
+    // Await every shard open before spawning any store thread. Returning on the
+    // first error used to drop the remaining `spawn_blocking` opens and the
+    // already-spawned store threads, so the failure event could reach
+    // `output_rx` while those threads still held fjall locks.
+    let mut opened = Vec::with_capacity(shards_count);
+    let mut first_err = None;
     for (s, handle) in init_handles {
-        let (store, recovered) = handle
+        match handle
             .await
-            .map_err(|e| AggError::Io(std::io::Error::other(e.to_string())))??;
+            .map_err(|e| AggError::Io(std::io::Error::other(e.to_string())))
+            .and_then(|res| res)
+        {
+            Ok(pair) => opened.push((s, pair)),
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+
+    for (s, (store, recovered)) in opened {
         all_known_partitions.extend(recovered.known_partitions.clone());
 
         let (store_handle, store_events, store_thread) =
-            StoreThread::spawn::<AckFinalizers>(store, kernels)?;
+            match StoreThread::spawn::<AckFinalizers>(store, kernels) {
+                Ok(spawned) => spawned,
+                Err(e) => {
+                    // Stop and join the threads spawned for earlier shards.
+                    for shard in prepared_shards {
+                        let (_, _, handle, _, thread, _, _, _): (
+                            _,
+                            _,
+                            StoreHandle<AckFinalizers>,
+                            _,
+                            std::thread::JoinHandle<()>,
+                            _,
+                            _,
+                            _,
+                        ) = shard;
+                        let _ = handle.send(StoreCommand::Shutdown);
+                        let _ = thread.join();
+                    }
+                    return Err(e);
+                }
+            };
         let worker_ctx = WorkerContext {
             cfg: engine.clone(),
             shard: s,

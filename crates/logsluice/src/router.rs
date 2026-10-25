@@ -1099,7 +1099,7 @@ fn apply_body_policy(
 
 fn fingerprint_body(kernels: &SimdKernelTable, body_val: &Value) -> Bytes {
     let input = value_to_bytes(body_val);
-    let mut out_bytes = Vec::new();
+    let mut out_bytes = Vec::with_capacity(input.len());
     (kernels.fingerprint_log_bytes)(&input, &mut out_bytes);
     Bytes::from(out_bytes)
 }

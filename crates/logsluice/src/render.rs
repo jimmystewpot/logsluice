@@ -145,8 +145,8 @@ fn insert_parsed_path(event: &mut LogEvent, raw: &str, value: Value) {
     }
     CACHED.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(index) = cache.iter().position(|path| path.as_str() == raw) {
-            let _ = event.insert(&cache[index], value);
+        if let Some(path) = cache.iter().find(|path| path.as_str() == raw) {
+            let _ = event.insert(path, value);
             return;
         }
         let parsed = FieldPath::parse_or_literal(raw);
@@ -520,9 +520,16 @@ pub fn render_otlp(
                     lr_obj.insert("severityText".into(), Value::from(text));
                 }
 
-                // Route, seven window fields, then dimensions, exemplar attrs, and aggs.
+                // Optional template attr, route, seven window fields, then
+                // dimensions, exemplar attrs, and aggs.
+                let template_attr =
+                    usize::from(matches!(summary.body, Some(SummaryBody::Template { .. })));
                 let mut lr_attrs = Vec::with_capacity(
-                    8 + plan.specs().len() + rec.tail.attrs.len() + cfg.group_by.len(),
+                    template_attr
+                        + 8
+                        + plan.specs().len()
+                        + rec.tail.attrs.len()
+                        + cfg.group_by.len(),
                 );
 
                 match summary.body {

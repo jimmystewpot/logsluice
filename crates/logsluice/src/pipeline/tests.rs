@@ -1536,3 +1536,58 @@ async fn pipeline_failure_nacks_buffered_input() {
     assert_eq!(status, AckStatus::Errored);
     drop(tx);
 }
+
+#[tokio::test]
+async fn startup_failure_on_one_shard_releases_other_shard_locks() {
+    let _serial = TEST_SERIAL.lock().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    // A regular file where shard_1's directory should go makes its open fail,
+    // while shard_0 opens fine and takes its fjall lock.
+    let blocker = dir.path().join("shard_1");
+    std::fs::File::create(&blocker).unwrap();
+
+    let mut cfg = test_config(dir.path());
+    cfg.shards = 2;
+    let pipeline = SluicePipeline::new(cfg.clone()).unwrap();
+    let (tx, rx) = futures_mpsc::unbounded::<LogEvent>();
+    let mut out = Box::new(pipeline).transform_stream(rx);
+
+    let failure = tokio::time::timeout(Duration::from_secs(5), out.next())
+        .await
+        .expect("timed out waiting for pipeline failure event")
+        .expect("stream ended without an event");
+    let route = failure
+        .get_path("_wa_route")
+        .map(crate::event::value_to_string_lossy);
+    assert_eq!(route.as_deref(), Some("quarantine"));
+    let next = tokio::time::timeout(Duration::from_secs(5), out.next())
+        .await
+        .expect("timed out waiting for the output stream to end");
+    assert!(next.is_none(), "expected exactly one output event");
+    drop(tx);
+
+    // The failure event is only sent after every init handle was awaited, so
+    // shard_0's store has already been dropped. Reopening both shards must
+    // succeed and the pipeline must shut down without a failure event.
+    std::fs::remove_file(&blocker).unwrap();
+    let pipeline = SluicePipeline::new(cfg).unwrap();
+    let (tx, rx) = futures_mpsc::unbounded::<LogEvent>();
+    let mut out = Box::new(pipeline).transform_stream(rx);
+    drop(tx);
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(ev) = out.next().await {
+            events.push(ev);
+        }
+    })
+    .await
+    .expect("timed out waiting for the reopened pipeline to shut down");
+    assert!(
+        events.iter().all(|ev| ev
+            .get_path("_wa_route")
+            .map(crate::event::value_to_string_lossy)
+            .as_deref()
+            != Some("quarantine")),
+        "reopening shard_0 failed; its lock was not released"
+    );
+}

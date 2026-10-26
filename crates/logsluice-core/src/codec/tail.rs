@@ -6,6 +6,14 @@ use serde::{Deserialize, Serialize};
 use crate::codec::cursor::Cursor;
 use crate::error::{AggError, AggResult};
 
+impl Default for ExemplarTail {
+    /// Same as [`ExemplarTail::missing`].
+    #[inline]
+    fn default() -> Self {
+        Self::missing()
+    }
+}
+
 /// Tail payload storing exemplar log message body, grouping dimensions, and unmatched attributes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExemplarTail {
@@ -20,6 +28,23 @@ pub struct ExemplarTail {
 }
 
 impl ExemplarTail {
+    /// Tail used when a header row has no exemplar payload.
+    ///
+    /// Severity is `0` and body, dimensions, and attributes are empty.
+    /// Live close and `logsluice drain` both substitute this through
+    /// [`crate::emission::SliceRecord::from_parts`] so a missing tail key
+    /// cannot drift between the two emitters.
+    #[inline]
+    #[must_use]
+    pub const fn missing() -> Self {
+        Self {
+            severity: 0,
+            body: None,
+            dims: Vec::new(),
+            attrs: Vec::new(),
+        }
+    }
+
     /// Serializes the exemplar tail into a versioned TLV byte buffer.
     ///
     /// Version byte is always `1u8`.

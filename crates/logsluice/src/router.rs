@@ -1,6 +1,13 @@
 //! Router component mapping events to shards, checking watermarks and horizons,
 //! and routing late/quarantined records to passthrough.
+//!
+//! Native flat JSON and OTLP batches used to carry two copies of timestamp,
+//! severity, normalizer, and shard logic. Envelope parsing stays separate
+//! because the JSON shapes differ. Both paths fill one [`PreparedRecord`] and
+//! [`Router::publish_prepared`] assigns the shard. `crates/logsluice/tests/router.rs`
+//! locks the observable behavior.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use bytes::Bytes;
 use indexmap::IndexMap;
 use logsluice_core::codec::plan::AggregationPlan;
-use logsluice_core::config::AggregationKind;
+use logsluice_core::config::{AggregationKind, AggregationSpec};
 use logsluice_core::error::AggResult;
 use logsluice_core::key::{KeyBuilder, StorageKey24};
 use logsluice_core::position::SourcePosition;
@@ -24,6 +31,12 @@ use crate::extract::{
     MetricValue, NormalizerExecutor, SourcePositionPaths, extract_otlp_time_nano_ms,
     extract_timestamp_ms, metric_value,
 };
+
+/// OTLP log records keyed by `(resourceLogs index, scopeLogs index)`.
+type OtlpIndexedRecords = BTreeMap<(usize, usize), Vec<Value>>;
+
+/// Quarantined OTLP records grouped by the unchanged reason string, then by scope.
+type OtlpQuarantineGroups = BTreeMap<&'static str, OtlpIndexedRecords>;
 
 /// Router performance counters and error metrics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -94,6 +107,39 @@ pub struct Router {
     attributes_path: FieldPath,
     default_resource: Arc<ResourceScopePayload>,
     default_resource_hash: u64,
+}
+
+/// Shared middle between a native flat JSON event and one OTLP log record.
+///
+/// Native flat JSON and OTLP batches used to carry two copies of timestamp,
+/// severity, normalizer, and shard logic. This record is that shared middle:
+/// each envelope parser fills one (OTLP once per log record) and
+/// [`Router::publish_prepared`] turns it into an [`IngestItem`] with the same
+/// shard formula. Envelope parsing stays separate because the JSON shapes
+/// differ. `crates/logsluice/tests/router.rs` locks the observable behavior.
+///
+/// Counter banks and exemplar attrs are not fields here: `on_admit` computes
+/// them only after the record is admitted and they go straight into the
+/// [`IngestItem`]. Late events therefore do not bump metric coercion or
+/// type-error counters. `position` is the native source position; OTLP leaves it empty
+/// and stamps the envelope position onto the last admitted item of each shard
+/// after the `resourceLogs` walk.
+struct PreparedRecord {
+    event_ms: i64,
+    position: Option<SourcePosition>,
+    severity: u8,
+    body: Option<Bytes>,
+    dims: Vec<Option<Bytes>>,
+    resource: Arc<ResourceScopePayload>,
+    resource_hash: u64,
+}
+
+/// Outcome of publishing one [`PreparedRecord`].
+enum RecordDisposition {
+    /// Past the lateness horizon or the target shard's purge horizon.
+    Late,
+    /// Admitted. `Some` is the shard that received the item.
+    Admitted { pushed_shard: Option<usize> },
 }
 
 impl Router {
@@ -238,42 +284,176 @@ impl Router {
             .and_then(|p| p.extract(log))
     }
 
+    fn source_key_from(&self, event: &LogEvent, position: Option<&SourcePosition>) -> SourceKey {
+        if let Some(pos) = position {
+            SourceKey::Partition(pos.topic.clone(), pos.partition)
+        } else if let Some(id_val) = event.get(&self.source_id_path) {
+            SourceKey::Source(Arc::from(value_to_string_lossy(id_val).into_owned()))
+        } else {
+            SourceKey::Default
+        }
+    }
+
+    fn stamp_route(&self, event: &mut LogEvent, route: &str, reason: &str) {
+        let _ = event.insert(&self.route_path, Value::from(route));
+        let _ = event.insert(&self.reason_path, Value::from(reason));
+    }
+
+    /// Tags the event `quarantine` / `reason`, increments `quarantined_total`, and passthroughs it.
+    ///
+    /// Reason strings stay `missing_timestamp`, `invalid_timestamp`, and `future_drift`.
+    /// OTLP record-level failures do not use this path: one batch can emit several
+    /// filtered envelopes, so those reasons are grouped instead.
+    fn quarantine_event(&mut self, mut event: LogEvent, reason: &str, out: &mut RouterOutput) {
+        self.stats.quarantined_total += 1;
+        self.stamp_route(&mut event, "quarantine", reason);
+        out.passthrough.push(event);
+    }
+
+    fn note_otlp_quarantine(
+        &mut self,
+        groups: &mut OtlpQuarantineGroups,
+        reason: &'static str,
+        res_idx: usize,
+        scope_idx: usize,
+        record: Value,
+    ) {
+        groups
+            .entry(reason)
+            .or_default()
+            .entry((res_idx, scope_idx))
+            .or_default()
+            .push(record);
+        self.stats.quarantined_total += 1;
+    }
+
+    /// Publishes `record` on the shard `(digest as u64) % horizons`.
+    ///
+    /// Native flat JSON and OTLP batches used to carry two copies of this
+    /// digest, lateness, and [`IngestItem`] construction. `on_admit` finishes
+    /// counter banks and exemplar attrs only after admission, because the two
+    /// envelopes look up metric fields differently and late records must not
+    /// change coercion counters. Envelope parsing stays outside this method.
+    /// `crates/logsluice/tests/router.rs` locks the observable behavior.
+    fn publish_prepared(
+        &mut self,
+        record: PreparedRecord,
+        now_ms: i64,
+        out: &mut RouterOutput,
+        on_admit: impl FnOnce(&mut Self) -> (Vec<[u64; 4]>, Vec<i64>, Vec<(String, Bytes)>),
+    ) -> RecordDisposition {
+        let digest = self.key_builder.digest_dims(
+            record.resource_hash,
+            record.severity,
+            record.body.as_deref(),
+            &record.dims,
+        );
+        let shard = ((digest as u64) % (self.horizons.len() as u64)) as usize;
+        let window_start = self.clock.start_of(record.event_ms);
+        let window_end = self.clock.end_of(window_start);
+        let allowed_lateness_ms = self.cfg.window.allowed_lateness.as_millis() as i64;
+        let watermark = self.watermark.watermark(now_ms).unwrap_or(i64::MIN);
+        let is_late = window_end.saturating_add(allowed_lateness_ms) <= watermark
+            || window_end <= self.horizons[shard].get();
+        if is_late {
+            self.stats.late_total += 1;
+            return RecordDisposition::Late;
+        }
+
+        let (counters, minmax_values, attrs) = on_admit(self);
+
+        let pushed = shard < out.per_shard.len();
+        if pushed {
+            out.per_shard[shard].push(IngestItem {
+                key: StorageKey24 {
+                    epoch_ms: window_start as u64,
+                    digest,
+                },
+                resource: record.resource,
+                resource_hash: record.resource_hash,
+                position: record.position,
+                event_ms: record.event_ms,
+                counters,
+                minmax_values,
+                exemplar: ExemplarSource {
+                    severity: record.severity,
+                    body: record.body,
+                    dims: record.dims,
+                    attrs,
+                },
+            });
+        }
+        RecordDisposition::Admitted {
+            pushed_shard: pushed.then_some(shard),
+        }
+    }
+
+    fn native_severity(&self, event: &LogEvent) -> u8 {
+        severity_from([
+            event.get(&self.severity_number_path),
+            event.get(&self.severity_camel_path),
+            event.get(&self.severity_path),
+            event.get(&self.level_path),
+        ])
+    }
+
+    fn native_dims(&self, event: &LogEvent) -> Vec<Option<Bytes>> {
+        let mut dims = Vec::with_capacity(self.cfg.group_by.len());
+        for (i, dim_name) in self.cfg.group_by.iter().enumerate() {
+            let raw_val = event.get(&self.group_by_paths[i]);
+            let normalizer = self.normalizers.get(dim_name);
+            let kernels = &self.kernels;
+            dims.push(dimension_bytes(normalizer, raw_val, |norm, val| {
+                norm.apply(event, val, kernels)
+            }));
+        }
+        dims
+    }
+
+    fn native_body(&self, event: &LogEvent) -> Option<Bytes> {
+        let policy = self.cfg.attributes_policy.body_policy;
+        let normalizer = self
+            .normalizers
+            .get("body")
+            .or_else(|| self.normalizers.get("message"));
+        let kernels = &self.kernels;
+        let raw_body = event
+            .get(&self.body_path)
+            .or_else(|| event.get(&self.message_path));
+        apply_body_policy(
+            policy,
+            normalizer,
+            kernels,
+            raw_body,
+            |norm, val, kernels| norm.apply(event, val, kernels),
+        )
+    }
+
     fn is_excluded_unmatched_key(&self, key: &str) -> bool {
         let stripped = key.strip_prefix("attributes.").unwrap_or(key);
-        if self.group_by_set.contains(key) || self.group_by_set.contains(stripped) {
+        let configured = |candidate: &str| {
+            self.group_by_set.contains(candidate)
+                || self.metric_field_names.contains(candidate)
+                || self
+                    .cfg
+                    .attributes_policy
+                    .exclude_attributes
+                    .contains(candidate)
+                || candidate == self.cfg.window.timestamp_field.as_str()
+                || candidate == self.cfg.window.source_id_field.as_str()
+                || candidate == self.cfg.output.route_field.as_str()
+                || self.cfg.source_position.as_ref().is_some_and(|sp| {
+                    candidate == sp.topic_field.as_str()
+                        || candidate == sp.partition_field.as_str()
+                        || candidate == sp.offset_field.as_str()
+                })
+        };
+        if matches_key_or_stripped(key, stripped, configured) {
             return true;
         }
-        if self.metric_field_names.contains(key) || self.metric_field_names.contains(stripped) {
-            return true;
-        }
-        if self.cfg.attributes_policy.exclude_attributes.contains(key)
-            || self
-                .cfg
-                .attributes_policy
-                .exclude_attributes
-                .contains(stripped)
-        {
-            return true;
-        }
-        if key == self.cfg.window.timestamp_field
-            || stripped == self.cfg.window.timestamp_field
-            || key == self.cfg.window.source_id_field
-            || stripped == self.cfg.window.source_id_field
-            || key == self.cfg.output.route_field
-            || stripped == self.cfg.output.route_field
-        {
-            return true;
-        }
-        if let Some(ref sp) = self.cfg.source_position
-            && (key == sp.topic_field
-                || stripped == sp.topic_field
-                || key == sp.partition_field
-                || stripped == sp.partition_field
-                || key == sp.offset_field
-                || stripped == sp.offset_field)
-        {
-            return true;
-        }
+        // Literal names are matched on the stripped key only. A key of
+        // `attributes.@timestamp` is excluded because stripping yields `@timestamp`;
+        // checking the raw key here would not add any of these names.
         matches!(
             stripped,
             "@timestamp"
@@ -464,221 +644,61 @@ impl Router {
     }
 
     fn route_native(&mut self, mut event: LogEvent, now_ms: i64, out: &mut RouterOutput) {
-        // 1. Timestamp extraction
-        let ts_val = event.get(&self.timestamp_path);
-        let event_ms = match ts_val {
+        let event_ms = match event.get(&self.timestamp_path) {
             None => {
-                let _ = event.insert(&self.route_path, Value::from("quarantine"));
-                let _ = event.insert(&self.reason_path, Value::from("missing_timestamp"));
-                self.stats.quarantined_total += 1;
-                out.passthrough.push(event);
+                self.quarantine_event(event, "missing_timestamp", out);
                 return;
             }
             Some(v) => match extract_timestamp_ms(v) {
                 Ok(ms) => ms,
                 Err(_) => {
-                    let _ = event.insert(&self.route_path, Value::from("quarantine"));
-                    let _ = event.insert(&self.reason_path, Value::from("invalid_timestamp"));
-                    self.stats.quarantined_total += 1;
-                    out.passthrough.push(event);
+                    self.quarantine_event(event, "invalid_timestamp", out);
                     return;
                 }
             },
         };
 
-        // Source position extraction
         let position = self.extract_position(&event);
-
-        let source_key = if let Some(ref pos) = position {
-            SourceKey::Partition(pos.topic.clone(), pos.partition)
-        } else if let Some(id_val) = event.get(&self.source_id_path) {
-            SourceKey::Source(Arc::from(value_to_string_lossy(id_val).into_owned()))
-        } else {
-            SourceKey::Default
-        };
-
-        // 2. Future drift check
+        let source_key = self.source_key_from(&event, position.as_ref());
         if self.watermark.observe(source_key, event_ms, now_ms) == Admit::Quarantine {
-            let _ = event.insert(&self.route_path, Value::from("quarantine"));
-            let _ = event.insert(&self.reason_path, Value::from("future_drift"));
-            self.stats.quarantined_total += 1;
-            out.passthrough.push(event);
+            self.quarantine_event(event, "future_drift", out);
             return;
         }
 
-        // 3. Extract dimensions and apply normalizers
-        let mut dims = Vec::with_capacity(self.cfg.group_by.len());
-        for (i, dim_name) in self.cfg.group_by.iter().enumerate() {
-            let path = &self.group_by_paths[i];
-            let raw_val = event.get(path);
-            let dim_bytes = match raw_val {
-                None => None,
-                Some(val) => {
-                    if let Some(norm) = self.normalizers.get(dim_name) {
-                        norm.apply(&event, val, &self.kernels)
-                    } else {
-                        Some(Bytes::from(value_to_string_lossy(val).into_owned()))
-                    }
-                }
-            };
-            dims.push(dim_bytes);
-        }
-
-        // Extract severity
-        let severity = event
-            .get(&self.severity_number_path)
-            .and_then(parse_severity_value)
-            .or_else(|| {
-                event
-                    .get(&self.severity_camel_path)
-                    .and_then(parse_severity_value)
-            })
-            .or_else(|| {
-                event
-                    .get(&self.severity_path)
-                    .and_then(parse_severity_value)
-            })
-            .or_else(|| event.get(&self.level_path).and_then(parse_severity_value))
-            .unwrap_or(0);
-
-        // Extract resource and scope according to preserve_resource_and_scope
-        let (resource_payload, resource_hash) = self.extract_native_resource(&event);
-
-        // Extract body according to body policy
-        let exemplar_body = match self.cfg.attributes_policy.body_policy {
-            BodyPolicy::Ignore => None,
-            BodyPolicy::KeepFirstExemplar | BodyPolicy::ReplaceWithTemplate => {
-                let raw_body = event
-                    .get(&self.body_path)
-                    .or_else(|| event.get(&self.message_path));
-                match raw_body {
-                    None => None,
-                    Some(val) => {
-                        if let Some(norm) = self
-                            .normalizers
-                            .get("body")
-                            .or_else(|| self.normalizers.get("message"))
-                        {
-                            norm.apply(&event, val, &self.kernels)
-                        } else if self.cfg.attributes_policy.body_policy
-                            == BodyPolicy::ReplaceWithTemplate
-                        {
-                            let input = value_to_bytes(val);
-                            let mut out_bytes = Vec::new();
-                            (self.kernels.fingerprint_log_bytes)(&input, &mut out_bytes);
-                            Some(Bytes::from(out_bytes))
-                        } else {
-                            Some(value_to_bytes(val))
-                        }
-                    }
-                }
-            }
-        };
-
-        // Compute 128-bit digest and target shard
-        let body_bytes_ref = exemplar_body.as_deref();
-        let dim_bytes_refs: Vec<Option<&[u8]>> =
-            dims.iter().map(|d| d.as_ref().map(|b| &**b)).collect();
-        let digest =
-            self.key_builder
-                .digest(resource_hash, severity, body_bytes_ref, &dim_bytes_refs);
-
-        let shard = ((digest as u64) % (self.horizons.len() as u64)) as usize;
-
-        // 4. Late / Horizon check against target shard
-        let window_start = self.clock.start_of(event_ms);
-        let window_end = self.clock.end_of(window_start);
-        let allowed_lateness_ms = self.cfg.window.allowed_lateness.as_millis() as i64;
-        let watermark = self.watermark.watermark(now_ms).unwrap_or(i64::MIN);
-
-        let is_late = window_end.saturating_add(allowed_lateness_ms) <= watermark
-            || window_end <= self.horizons[shard].get();
-
-        if is_late {
-            let _ = event.insert(&self.route_path, Value::from("late"));
-            let _ = event.insert(&self.reason_path, Value::from("late"));
-            self.stats.late_total += 1;
-            out.passthrough.push(event);
-            return;
-        }
-
-        // 5. Extract metrics
-        let mut counters = vec![[0u64; 4]; self.plan.layout().banks];
-        let mut minmax_values = vec![0i64; self.plan.layout().minmax_slots];
-
-        for (idx, spec) in self.plan.specs().iter().enumerate() {
-            if let Some((bank, lane)) = self.plan.counter_slot(idx) {
-                match spec.kind {
-                    AggregationKind::Count => {
-                        counters[bank][lane] = 1;
-                    }
-                    AggregationKind::Sum => {
-                        if let Some(ref path) = self.metric_paths[idx]
-                            && let Some(val) = event.get(path)
-                        {
-                            match metric_value(val) {
-                                MetricValue::Int(i) => {
-                                    counters[bank][lane] = i as u64;
-                                }
-                                MetricValue::Coerced(i) => {
-                                    counters[bank][lane] = i as u64;
-                                    self.stats.field_coercions_total += 1;
-                                }
-                                MetricValue::Invalid => {
-                                    counters[bank][lane] = 0;
-                                    self.stats.field_type_errors_total += 1;
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            } else if let Some(slot) = self.plan.minmax_slot(idx)
-                && let Some(ref path) = self.metric_paths[idx]
-                && let Some(val) = event.get(path)
-            {
-                match metric_value(val) {
-                    MetricValue::Int(i) | MetricValue::Coerced(i) => {
-                        minmax_values[slot] = i;
-                    }
-                    MetricValue::Invalid => {
-                        if let Ok(ms) = extract_timestamp_ms(val) {
-                            minmax_values[slot] = ms;
-                        } else {
-                            minmax_values[slot] = 0;
-                            self.stats.field_type_errors_total += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        let attrs = self.extract_native_unmatched_attrs(&event);
-
-        // Take finalizers for accepted event
-        let _ = event.take_finalizers();
-
-        let item = IngestItem {
-            key: StorageKey24 {
-                epoch_ms: window_start as u64,
-                digest,
-            },
-            resource: resource_payload,
-            resource_hash,
-            position,
+        let (resource, resource_hash) = self.extract_native_resource(&event);
+        let record = PreparedRecord {
             event_ms,
-            counters,
-            minmax_values,
-            exemplar: ExemplarSource {
-                severity,
-                body: exemplar_body,
-                dims,
-                attrs,
-            },
+            position,
+            severity: self.native_severity(&event),
+            body: self.native_body(&event),
+            dims: self.native_dims(&event),
+            resource,
+            resource_hash,
         };
 
-        if shard < out.per_shard.len() {
-            out.per_shard[shard].push(item);
+        match self.publish_prepared(record, now_ms, out, |router| {
+            let metric_paths = &router.metric_paths;
+            let (counters, minmax_values) = fill_metric_banks(
+                &router.plan,
+                router.cfg.window.timestamp_field.as_str(),
+                &mut router.stats,
+                |idx, _spec| {
+                    metric_paths[idx]
+                        .as_ref()
+                        .and_then(|path| event.get(path).map(Cow::Borrowed))
+                },
+                None,
+            );
+            let attrs = router.extract_native_unmatched_attrs(&event);
+            (counters, minmax_values, attrs)
+        }) {
+            RecordDisposition::Late => {
+                self.stamp_route(&mut event, "late", "late");
+                out.passthrough.push(event);
+            }
+            RecordDisposition::Admitted { .. } => {
+                let _ = event.take_finalizers();
+            }
         }
     }
 
@@ -686,37 +706,20 @@ impl Router {
         self.detected_otlp.store(true, Ordering::Relaxed);
 
         let outer_position = self.extract_position(&event);
-        let outer_source_key = if let Some(ref pos) = outer_position {
-            SourceKey::Partition(pos.topic.clone(), pos.partition)
-        } else if let Some(id_val) = event.get(&self.source_id_path) {
-            SourceKey::Source(Arc::from(value_to_string_lossy(id_val).into_owned()))
-        } else {
-            SourceKey::Default
-        };
+        let outer_source_key = self.source_key_from(&event, outer_position.as_ref());
 
-        if event
-            .get(&self.resource_logs_path)
-            .and_then(Value::as_array)
-            .is_none()
-        {
-            let _ = event.insert(&self.route_path, Value::from("quarantine"));
-            let _ = event.insert(&self.reason_path, Value::from("missing_timestamp"));
-            self.stats.quarantined_total += 1;
-            out.passthrough.push(event);
-            return;
-        }
         let Some(resource_logs) = event
             .get(&self.resource_logs_path)
             .and_then(Value::as_array)
             .map(Vec::as_slice)
         else {
+            self.quarantine_event(event, "missing_timestamp", out);
             return;
         };
 
         let mut routed_shards: BTreeSet<usize> = BTreeSet::new();
-        let mut quarantine_groups: BTreeMap<&'static str, BTreeMap<(usize, usize), Vec<Value>>> =
-            BTreeMap::new();
-        let mut late_records: BTreeMap<(usize, usize), Vec<Value>> = BTreeMap::new();
+        let mut quarantine_groups = OtlpQuarantineGroups::new();
+        let mut late_records = OtlpIndexedRecords::new();
 
         for (res_idx, rl) in resource_logs.iter().enumerate() {
             let Some(rl_obj) = rl.as_object() else {
@@ -810,17 +813,16 @@ impl Router {
 
                 for lr in log_records {
                     let Some(lr_obj) = lr.as_object() else {
-                        quarantine_groups
-                            .entry("missing_timestamp")
-                            .or_default()
-                            .entry((res_idx, scope_idx))
-                            .or_default()
-                            .push(lr.clone());
-                        self.stats.quarantined_total += 1;
+                        self.note_otlp_quarantine(
+                            &mut quarantine_groups,
+                            "missing_timestamp",
+                            res_idx,
+                            scope_idx,
+                            lr.clone(),
+                        );
                         continue;
                     };
 
-                    // 1. Timestamp extraction
                     let event_ms = if let Some(ts_val) = lr_obj
                         .get(self.cfg.window.timestamp_field.as_str())
                         .and_then(|v| extract_timestamp_ms(v).ok())
@@ -830,232 +832,139 @@ impl Router {
                         match extract_otlp_time_nano_ms(nano_val) {
                             Some(ms) => ms,
                             None => {
-                                quarantine_groups
-                                    .entry("invalid_timestamp")
-                                    .or_default()
-                                    .entry((res_idx, scope_idx))
-                                    .or_default()
-                                    .push(lr.clone());
-                                self.stats.quarantined_total += 1;
+                                self.note_otlp_quarantine(
+                                    &mut quarantine_groups,
+                                    "invalid_timestamp",
+                                    res_idx,
+                                    scope_idx,
+                                    lr.clone(),
+                                );
                                 continue;
                             }
                         }
                     } else {
-                        quarantine_groups
-                            .entry("missing_timestamp")
-                            .or_default()
-                            .entry((res_idx, scope_idx))
-                            .or_default()
-                            .push(lr.clone());
-                        self.stats.quarantined_total += 1;
+                        self.note_otlp_quarantine(
+                            &mut quarantine_groups,
+                            "missing_timestamp",
+                            res_idx,
+                            scope_idx,
+                            lr.clone(),
+                        );
                         continue;
                     };
 
-                    // 2. Future drift check
                     if self
                         .watermark
                         .observe(outer_source_key.clone(), event_ms, now_ms)
                         == Admit::Quarantine
                     {
-                        quarantine_groups
-                            .entry("future_drift")
-                            .or_default()
-                            .entry((res_idx, scope_idx))
-                            .or_default()
-                            .push(lr.clone());
-                        self.stats.quarantined_total += 1;
+                        self.note_otlp_quarantine(
+                            &mut quarantine_groups,
+                            "future_drift",
+                            res_idx,
+                            scope_idx,
+                            lr.clone(),
+                        );
                         continue;
                     }
 
-                    // Extract dimensions from log record attributes and apply normalizers
                     let lr_attrs = lr_obj.get("attributes");
                     let mut dims = Vec::with_capacity(self.cfg.group_by.len());
                     for dim_name in &self.cfg.group_by {
                         let raw_val = extract_value_from_otlp_record(lr_obj, lr_attrs, dim_name);
-                        let dim_bytes = match raw_val {
-                            None => None,
-                            Some(val) => {
-                                if let Some(norm) = self.normalizers.get(dim_name) {
-                                    norm.apply_with_resolver(&val, &self.kernels, |f| {
-                                        extract_value_from_otlp_record(lr_obj, lr_attrs, f)
-                                            .map(|v| value_to_string_lossy(&v).into_owned())
-                                    })
-                                } else {
-                                    Some(Bytes::from(value_to_string_lossy(&val).into_owned()))
-                                }
-                            }
-                        };
-                        dims.push(dim_bytes);
+                        let normalizer = self.normalizers.get(dim_name);
+                        let kernels = &self.kernels;
+                        dims.push(dimension_bytes(
+                            normalizer,
+                            raw_val.as_ref(),
+                            |norm, val| {
+                                norm.apply_with_resolver(val, kernels, |field| {
+                                    extract_value_from_otlp_record(lr_obj, lr_attrs, field)
+                                        .map(|v| value_to_string_lossy(&v).into_owned())
+                                })
+                            },
+                        ));
                     }
 
-                    // Extract severity
-                    let severity = lr_obj
-                        .get("severityNumber")
-                        .and_then(parse_severity_value)
-                        .or_else(|| lr_obj.get("severityText").and_then(parse_severity_value))
-                        .or_else(|| {
-                            extract_value_from_otlp_record(lr_obj, lr_attrs, "severity")
-                                .and_then(|v| parse_severity_value(&v))
-                        })
-                        .or_else(|| {
-                            extract_value_from_otlp_record(lr_obj, lr_attrs, "level")
-                                .and_then(|v| parse_severity_value(&v))
-                        })
+                    // The attribute scans only run when neither top-level
+                    // field parses, as before the shared record.
+                    let attr_severity = |name: &str| {
+                        extract_value_from_otlp_record(lr_obj, lr_attrs, name)
+                            .as_ref()
+                            .and_then(parse_severity_value)
+                    };
+                    let severity = [lr_obj.get("severityNumber"), lr_obj.get("severityText")]
+                        .into_iter()
+                        .find_map(|value| value.and_then(parse_severity_value))
+                        .or_else(|| attr_severity("severity"))
+                        .or_else(|| attr_severity("level"))
                         .unwrap_or(0);
 
-                    // Extract body and apply normalizers according to body policy
-                    let exemplar_body = match self.cfg.attributes_policy.body_policy {
-                        BodyPolicy::Ignore => None,
-                        BodyPolicy::KeepFirstExemplar | BodyPolicy::ReplaceWithTemplate => {
-                            let raw_body = extract_value_from_otlp_record(lr_obj, lr_attrs, "body")
-                                .or_else(|| lr_obj.get("body").cloned());
-                            match raw_body {
-                                None => None,
-                                Some(val) => {
-                                    let body_val = match &val {
-                                        Value::Object(map) => map
-                                            .get("stringValue")
-                                            .cloned()
-                                            .unwrap_or_else(|| val.clone()),
-                                        _ => val,
-                                    };
-                                    if let Some(norm) = self
-                                        .normalizers
-                                        .get("body")
-                                        .or_else(|| self.normalizers.get("message"))
-                                    {
-                                        norm.apply_with_resolver(&body_val, &self.kernels, |f| {
-                                            extract_value_from_otlp_record(lr_obj, lr_attrs, f)
-                                                .map(|v| value_to_string_lossy(&v).into_owned())
-                                        })
-                                    } else if self.cfg.attributes_policy.body_policy
-                                        == BodyPolicy::ReplaceWithTemplate
-                                    {
-                                        let input = value_to_bytes(&body_val);
-                                        let mut out_bytes = Vec::new();
-                                        (self.kernels.fingerprint_log_bytes)(
-                                            &input,
-                                            &mut out_bytes,
-                                        );
-                                        Some(Bytes::from(out_bytes))
-                                    } else {
-                                        Some(value_to_bytes(&body_val))
-                                    }
-                                }
-                            }
+                    let raw_body = extract_value_from_otlp_record(lr_obj, lr_attrs, "body")
+                        .or_else(|| lr_obj.get("body").cloned());
+                    let body_val = raw_body.map(|val| match val {
+                        Value::Object(mut map) => {
+                            map.remove("stringValue").unwrap_or(Value::Object(map))
                         }
-                    };
-
-                    // Compute 128-bit digest and target shard
-                    let body_ref = exemplar_body.as_deref();
-                    let dim_bytes_refs: Vec<Option<&[u8]>> =
-                        dims.iter().map(|d| d.as_ref().map(|b| &**b)).collect();
-                    let digest =
-                        self.key_builder
-                            .digest(resource_hash, severity, body_ref, &dim_bytes_refs);
-
-                    let shard = ((digest as u64) % (self.horizons.len() as u64)) as usize;
-
-                    // 3. Late / Horizon check against target shard
-                    let window_start = self.clock.start_of(event_ms);
-                    let window_end = self.clock.end_of(window_start);
-                    let allowed_lateness_ms = self.cfg.window.allowed_lateness.as_millis() as i64;
-                    let watermark = self.watermark.watermark(now_ms).unwrap_or(i64::MIN);
-
-                    let is_late = window_end.saturating_add(allowed_lateness_ms) <= watermark
-                        || window_end <= self.horizons[shard].get();
-
-                    if is_late {
-                        late_records
-                            .entry((res_idx, scope_idx))
-                            .or_default()
-                            .push(lr.clone());
-                        self.stats.late_total += 1;
-                        continue;
-                    }
-
-                    // 4. Extract metrics into counters and minmax_values
-                    let mut counters = vec![[0u64; 4]; self.plan.layout().banks];
-                    let mut minmax_values = vec![0i64; self.plan.layout().minmax_slots];
-
-                    for (idx, spec) in self.plan.specs().iter().enumerate() {
-                        let field_name = spec.field.as_deref().unwrap_or(spec.name.as_str());
-                        if let Some((bank, lane)) = self.plan.counter_slot(idx) {
-                            match spec.kind {
-                                AggregationKind::Count => {
-                                    counters[bank][lane] = 1;
-                                }
-                                AggregationKind::Sum => {
-                                    if let Some(val) =
-                                        extract_value_from_otlp_record(lr_obj, lr_attrs, field_name)
-                                    {
-                                        match metric_value(&val) {
-                                            MetricValue::Int(i) => {
-                                                counters[bank][lane] = i as u64;
-                                            }
-                                            MetricValue::Coerced(i) => {
-                                                counters[bank][lane] = i as u64;
-                                                self.stats.field_coercions_total += 1;
-                                            }
-                                            MetricValue::Invalid => {
-                                                counters[bank][lane] = 0;
-                                                self.stats.field_type_errors_total += 1;
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        } else if let Some(slot) = self.plan.minmax_slot(idx) {
-                            if let Some(val) =
-                                extract_value_from_otlp_record(lr_obj, lr_attrs, field_name)
-                            {
-                                match metric_value(&val) {
-                                    MetricValue::Int(i) | MetricValue::Coerced(i) => {
-                                        minmax_values[slot] = i;
-                                    }
-                                    MetricValue::Invalid => {
-                                        if let Ok(ms) = extract_timestamp_ms(&val) {
-                                            minmax_values[slot] = ms;
-                                        } else {
-                                            minmax_values[slot] = 0;
-                                            self.stats.field_type_errors_total += 1;
-                                        }
-                                    }
-                                }
-                            } else if field_name == "@timestamp"
-                                || field_name == self.cfg.window.timestamp_field.as_str()
-                                || field_name == "time"
-                            {
-                                minmax_values[slot] = event_ms;
-                            }
-                        }
-                    }
-
-                    let attrs = self.extract_otlp_unmatched_attrs(lr_attrs);
-
-                    let item = IngestItem {
-                        key: StorageKey24 {
-                            epoch_ms: window_start as u64,
-                            digest,
+                        other => other,
+                    });
+                    let policy = self.cfg.attributes_policy.body_policy;
+                    let normalizer = self
+                        .normalizers
+                        .get("body")
+                        .or_else(|| self.normalizers.get("message"));
+                    let kernels = &self.kernels;
+                    let exemplar_body = apply_body_policy(
+                        policy,
+                        normalizer,
+                        kernels,
+                        body_val.as_ref(),
+                        |norm, val, kernels| {
+                            norm.apply_with_resolver(val, kernels, |field| {
+                                extract_value_from_otlp_record(lr_obj, lr_attrs, field)
+                                    .map(|v| value_to_string_lossy(&v).into_owned())
+                            })
                         },
-                        resource: resource_payload.clone(),
-                        resource_hash,
-                        position: None,
+                    );
+
+                    let record = PreparedRecord {
                         event_ms,
-                        counters,
-                        minmax_values,
-                        exemplar: ExemplarSource {
-                            severity,
-                            body: exemplar_body,
-                            dims,
-                            attrs,
-                        },
+                        position: None,
+                        severity,
+                        body: exemplar_body,
+                        dims,
+                        resource: Arc::clone(&resource_payload),
+                        resource_hash,
                     };
-
-                    if shard < out.per_shard.len() {
-                        out.per_shard[shard].push(item);
-                        routed_shards.insert(shard);
+                    match self.publish_prepared(record, now_ms, out, |router| {
+                        let timestamp_field = router.cfg.window.timestamp_field.as_str();
+                        let (counters, minmax_values) = fill_metric_banks(
+                            &router.plan,
+                            timestamp_field,
+                            &mut router.stats,
+                            |_idx, spec| {
+                                let field_name =
+                                    spec.field.as_deref().unwrap_or(spec.name.as_str());
+                                extract_value_from_otlp_record(lr_obj, lr_attrs, field_name)
+                                    .map(Cow::Owned)
+                            },
+                            Some(event_ms),
+                        );
+                        let attrs = router.extract_otlp_unmatched_attrs(lr_attrs);
+                        (counters, minmax_values, attrs)
+                    }) {
+                        RecordDisposition::Late => {
+                            late_records
+                                .entry((res_idx, scope_idx))
+                                .or_default()
+                                .push(lr.clone());
+                        }
+                        RecordDisposition::Admitted {
+                            pushed_shard: Some(shard),
+                        } => {
+                            routed_shards.insert(shard);
+                        }
+                        RecordDisposition::Admitted { pushed_shard: None } => {}
                     }
                 }
             }
@@ -1103,7 +1012,7 @@ impl Router {
         &self,
         template_log: &LogEvent,
         resource_logs: &[Value],
-        grouped: &BTreeMap<(usize, usize), Vec<Value>>,
+        grouped: &OtlpIndexedRecords,
         route: &str,
         reason: &str,
     ) -> LogEvent {
@@ -1136,9 +1045,139 @@ impl Router {
         }
 
         let _ = filtered_log.insert(&self.resource_logs_path, Value::Array(filtered_rls));
-        let _ = filtered_log.insert(&self.route_path, Value::from(route));
-        let _ = filtered_log.insert(&self.reason_path, Value::from(reason));
+        self.stamp_route(&mut filtered_log, route, reason);
         filtered_log
+    }
+}
+
+/// True when `pred` holds for `key` or for `key` with a leading `attributes.` removed.
+///
+/// Callers still apply name literals to the stripped form alone.
+fn matches_key_or_stripped(key: &str, stripped: &str, pred: impl Fn(&str) -> bool) -> bool {
+    pred(key) || (key != stripped && pred(stripped))
+}
+
+fn severity_from<'a>(candidates: impl IntoIterator<Item = Option<&'a Value>>) -> u8 {
+    candidates
+        .into_iter()
+        .find_map(|value| value.and_then(parse_severity_value))
+        .unwrap_or(0)
+}
+
+fn dimension_bytes(
+    normalizer: Option<&NormalizerExecutor>,
+    raw: Option<&Value>,
+    normalize: impl FnOnce(&NormalizerExecutor, &Value) -> Option<Bytes>,
+) -> Option<Bytes> {
+    let val = raw?;
+    if let Some(norm) = normalizer {
+        normalize(norm, val)
+    } else {
+        Some(Bytes::from(value_to_string_lossy(val).into_owned()))
+    }
+}
+
+fn apply_body_policy(
+    policy: BodyPolicy,
+    normalizer: Option<&NormalizerExecutor>,
+    kernels: &SimdKernelTable,
+    raw_body: Option<&Value>,
+    normalize: impl FnOnce(&NormalizerExecutor, &Value, &SimdKernelTable) -> Option<Bytes>,
+) -> Option<Bytes> {
+    if policy == BodyPolicy::Ignore {
+        return None;
+    }
+    let val = raw_body?;
+    if let Some(norm) = normalizer {
+        normalize(norm, val, kernels)
+    } else if policy == BodyPolicy::ReplaceWithTemplate {
+        Some(fingerprint_body(kernels, val))
+    } else {
+        Some(value_to_bytes(val))
+    }
+}
+
+fn fingerprint_body(kernels: &SimdKernelTable, body_val: &Value) -> Bytes {
+    let input = value_to_bytes(body_val);
+    let mut out_bytes = Vec::with_capacity(input.len());
+    (kernels.fingerprint_log_bytes)(&input, &mut out_bytes);
+    Bytes::from(out_bytes)
+}
+
+/// Fills counter banks and min/max slots.
+///
+/// `missing_timestamp_ms` is `Some(event_ms)` on the OTLP path only. A missing
+/// min/max field named `@timestamp`, the configured timestamp field, or `time`
+/// then stores that millis value. Native passes `None` so a missing path stays
+/// zero. Coerced min/max values do not increment `field_coercions_total`.
+///
+/// `lookup` returns a [`Cow`] so the native path can borrow the event's value
+/// while OTLP hands over the value it already had to build.
+fn fill_metric_banks<'v>(
+    plan: &AggregationPlan,
+    timestamp_field: &str,
+    stats: &mut RouterStats,
+    mut lookup: impl FnMut(usize, &AggregationSpec) -> Option<Cow<'v, Value>>,
+    missing_timestamp_ms: Option<i64>,
+) -> (Vec<[u64; 4]>, Vec<i64>) {
+    let mut counters = vec![[0u64; 4]; plan.layout().banks];
+    let mut minmax_values = vec![0i64; plan.layout().minmax_slots];
+
+    for (idx, spec) in plan.specs().iter().enumerate() {
+        if let Some((bank, lane)) = plan.counter_slot(idx) {
+            match spec.kind {
+                AggregationKind::Count => {
+                    counters[bank][lane] = 1;
+                }
+                AggregationKind::Sum => {
+                    if let Some(val) = lookup(idx, spec) {
+                        counters[bank][lane] = sum_counter(stats, &val);
+                    }
+                }
+                AggregationKind::Min | AggregationKind::Max => {}
+            }
+        } else if let Some(slot) = plan.minmax_slot(idx) {
+            if let Some(val) = lookup(idx, spec) {
+                minmax_values[slot] = minmax_counter(stats, &val);
+            } else if let Some(event_ms) = missing_timestamp_ms {
+                let field_name = spec.field.as_deref().unwrap_or(spec.name.as_str());
+                if field_name == "@timestamp"
+                    || field_name == timestamp_field
+                    || field_name == "time"
+                {
+                    minmax_values[slot] = event_ms;
+                }
+            }
+        }
+    }
+
+    (counters, minmax_values)
+}
+
+fn sum_counter(stats: &mut RouterStats, val: &Value) -> u64 {
+    match metric_value(val) {
+        MetricValue::Int(i) => i as u64,
+        MetricValue::Coerced(i) => {
+            stats.field_coercions_total += 1;
+            i as u64
+        }
+        MetricValue::Invalid => {
+            stats.field_type_errors_total += 1;
+            0
+        }
+    }
+}
+
+fn minmax_counter(stats: &mut RouterStats, val: &Value) -> i64 {
+    match metric_value(val) {
+        MetricValue::Int(i) | MetricValue::Coerced(i) => i,
+        MetricValue::Invalid => match extract_timestamp_ms(val) {
+            Ok(ms) => ms,
+            Err(_) => {
+                stats.field_type_errors_total += 1;
+                0
+            }
+        },
     }
 }
 

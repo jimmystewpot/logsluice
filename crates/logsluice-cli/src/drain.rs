@@ -12,10 +12,9 @@ use hashbrown::{HashMap, HashSet};
 use logsluice_core::{
     codec::{
         plan::HeaderLayout,
-        tail::ExemplarTail,
         ticket::{EmitReason, Ticket, TicketEntry},
     },
-    emission::{SliceRecord, slice_id},
+    emission::SliceRecord,
     error::{AggError, AggResult},
     key::StorageKey24,
     resource::ResourceScopePayload,
@@ -178,50 +177,29 @@ pub fn run_drain(data_dir: &Path, format: &str) -> AggResult<()> {
                             }
                             next_seq = next_seq.wrapping_add(1);
 
-                            let (res, tail) = if let Some(row) = matching_row {
-                                let res = resources
+                            let (resource, tail) = if let Some(row) = matching_row {
+                                let resource = resources
                                     .get(&row.header.resource_scope_id)
                                     .cloned()
                                     .unwrap_or_else(|| Arc::clone(&default_res));
-                                let tail = row.tail.clone().unwrap_or_else(|| ExemplarTail {
-                                    severity: 0,
-                                    body: None,
-                                    dims: Vec::new(),
-                                    attrs: Vec::new(),
-                                });
-                                (res, tail)
+                                (resource, row.tail.clone())
                             } else {
-                                (
-                                    Arc::clone(&default_res),
-                                    ExemplarTail {
-                                        severity: 0,
-                                        body: None,
-                                        dims: Vec::new(),
-                                        attrs: Vec::new(),
-                                    },
-                                )
+                                (Arc::clone(&default_res), None)
                             };
 
-                            let sid = slice_id(
+                            let record = SliceRecord::from_parts(
+                                window_start_ms,
+                                window_end_ms,
+                                ticket.reason,
                                 &meta.emitter_id,
                                 window_epoch_ms,
                                 entry.digest,
                                 entry.slice_seq,
-                            );
-
-                            let record = SliceRecord {
-                                window_start_ms,
-                                window_end_ms,
-                                emit_reason: ticket.reason,
-                                emitter_id: meta.emitter_id.clone(),
-                                digest: entry.digest,
-                                slice_seq: entry.slice_seq,
-                                slice_id: sid,
-                                resource: res,
+                                resource,
                                 tail,
-                                counters: entry.delta.clone(),
-                                minmax: entry.minmax.clone(),
-                            };
+                                entry.delta.clone(),
+                                entry.minmax.clone(),
+                            );
 
                             let line = serde_json::to_string(&record)
                                 .map_err(|e| AggError::Codec(e.to_string()))?;
@@ -238,6 +216,9 @@ pub fn run_drain(data_dir: &Path, format: &str) -> AggResult<()> {
         }
 
         for epoch_ms in store.live_windows() {
+            let window_start_ms = i64::try_from(epoch_ms)
+                .map_err(|_| AggError::Codec("window_epoch_ms exceeds i64".to_string()))?;
+            let window_end_ms = clock.end_of(window_start_ms);
             let mut after = None;
             loop {
                 let rows = store.rows(epoch_ms, after, 500)?;
@@ -257,40 +238,24 @@ pub fn run_drain(data_dir: &Path, format: &str) -> AggResult<()> {
                     );
 
                     if non_zero {
-                        let res = resources
+                        let resource = resources
                             .get(&row.header.resource_scope_id)
                             .cloned()
                             .unwrap_or_else(|| Arc::clone(&default_res));
 
-                        let tail = row.tail.clone().unwrap_or_else(|| ExemplarTail {
-                            severity: 0,
-                            body: None,
-                            dims: Vec::new(),
-                            attrs: Vec::new(),
-                        });
-
-                        let sid = slice_id(
+                        let record = SliceRecord::from_parts(
+                            window_start_ms,
+                            window_end_ms,
+                            EmitReason::Drain,
                             &meta.emitter_id,
                             epoch_ms,
                             row.key.digest,
                             row.header.slice_seq,
+                            resource,
+                            row.tail,
+                            delta,
+                            row.header.minmax,
                         );
-                        let window_start_ms = epoch_ms as i64;
-                        let window_end_ms = clock.end_of(window_start_ms);
-
-                        let record = SliceRecord {
-                            window_start_ms,
-                            window_end_ms,
-                            emit_reason: EmitReason::Drain,
-                            emitter_id: meta.emitter_id.clone(),
-                            digest: row.key.digest,
-                            slice_seq: row.header.slice_seq,
-                            slice_id: sid,
-                            resource: res,
-                            tail,
-                            counters: delta,
-                            minmax: row.header.minmax.clone(),
-                        };
 
                         let line = serde_json::to_string(&record)
                             .map_err(|e| AggError::Codec(e.to_string()))?;

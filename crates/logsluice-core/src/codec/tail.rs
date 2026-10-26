@@ -3,7 +3,16 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::codec::cursor::Cursor;
 use crate::error::{AggError, AggResult};
+
+impl Default for ExemplarTail {
+    /// Same as [`ExemplarTail::missing`].
+    #[inline]
+    fn default() -> Self {
+        Self::missing()
+    }
+}
 
 /// Tail payload storing exemplar log message body, grouping dimensions, and unmatched attributes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +28,23 @@ pub struct ExemplarTail {
 }
 
 impl ExemplarTail {
+    /// Tail used when a header row has no exemplar payload.
+    ///
+    /// Severity is `0` and body, dimensions, and attributes are empty.
+    /// Live close and `logsluice drain` both substitute this through
+    /// [`crate::emission::SliceRecord::from_parts`] so a missing tail key
+    /// cannot drift between the two emitters.
+    #[inline]
+    #[must_use]
+    pub const fn missing() -> Self {
+        Self {
+            severity: 0,
+            body: None,
+            dims: Vec::new(),
+            attrs: Vec::new(),
+        }
+    }
+
     /// Serializes the exemplar tail into a versioned TLV byte buffer.
     ///
     /// Version byte is always `1u8`.
@@ -83,23 +109,23 @@ impl ExemplarTail {
             )));
         }
 
-        let version = bytes[0];
+        let mut cur = Cursor::new(bytes);
+        let version = cur.read_u8()?;
         if version != 1 {
             return Err(AggError::Codec(format!(
                 "unsupported ExemplarTail version: {version}"
             )));
         }
 
-        let severity = bytes[1];
-        let mut offset = 2;
+        let severity = cur.read_u8()?;
 
         // Body
-        let body_tag = read_u8(bytes, &mut offset)?;
+        let body_tag = cur.read_u8()?;
         let body = match body_tag {
             0 => None,
             1 => {
-                let len = read_u32_le(bytes, &mut offset)? as usize;
-                let data = read_slice(bytes, &mut offset, len)?;
+                let len = cur.read_u32()? as usize;
+                let data = cur.read_bytes(len)?;
                 Some(Bytes::copy_from_slice(data))
             }
             other => {
@@ -110,8 +136,8 @@ impl ExemplarTail {
         };
 
         // Dims
-        let dims_count = read_u32_le(bytes, &mut offset)? as usize;
-        let remaining_bytes = bytes.len() - offset;
+        let dims_count = cur.read_u32()? as usize;
+        let remaining_bytes = cur.remaining();
         // Each dim element needs at least 1 byte (tag 0 or tag 1 + len + data)
         if dims_count > remaining_bytes {
             return Err(AggError::Codec(format!(
@@ -120,12 +146,12 @@ impl ExemplarTail {
         }
         let mut dims = Vec::with_capacity(dims_count);
         for _ in 0..dims_count {
-            let dim_tag = read_u8(bytes, &mut offset)?;
+            let dim_tag = cur.read_u8()?;
             let dim = match dim_tag {
                 0 => None,
                 1 => {
-                    let len = read_u32_le(bytes, &mut offset)? as usize;
-                    let data = read_slice(bytes, &mut offset, len)?;
+                    let len = cur.read_u32()? as usize;
+                    let data = cur.read_bytes(len)?;
                     Some(Bytes::copy_from_slice(data))
                 }
                 other => {
@@ -138,8 +164,8 @@ impl ExemplarTail {
         }
 
         // Attrs
-        let attrs_count = read_u32_le(bytes, &mut offset)? as usize;
-        let remaining_bytes = bytes.len() - offset;
+        let attrs_count = cur.read_u32()? as usize;
+        let remaining_bytes = cur.remaining();
         // Each attr needs at least 8 bytes (u32 k_len + u32 v_len)
         if attrs_count > remaining_bytes / 8 {
             return Err(AggError::Codec(format!(
@@ -148,18 +174,20 @@ impl ExemplarTail {
         }
         let mut attrs = Vec::with_capacity(attrs_count);
         for _ in 0..attrs_count {
-            let k_len = read_u32_le(bytes, &mut offset)? as usize;
-            let k_bytes = read_slice(bytes, &mut offset, k_len)?;
-            let key = String::from_utf8(k_bytes.to_vec())
-                .map_err(|e| AggError::Codec(format!("invalid UTF-8 in attr key: {e}")))?;
+            let k_len = cur.read_u32()? as usize;
+            let k_bytes = cur.read_bytes(k_len)?;
+            let key = std::str::from_utf8(k_bytes)
+                .map_err(|e| AggError::Codec(format!("invalid UTF-8 in attr key: {e}")))?
+                .to_owned();
 
-            let v_len = read_u32_le(bytes, &mut offset)? as usize;
-            let v_bytes = read_slice(bytes, &mut offset, v_len)?;
+            let v_len = cur.read_u32()? as usize;
+            let v_bytes = cur.read_bytes(v_len)?;
             let val = Bytes::copy_from_slice(v_bytes);
 
             attrs.push((key, val));
         }
 
+        let offset = cur.offset();
         if offset != bytes.len() {
             return Err(AggError::Codec(format!(
                 "trailing bytes in ExemplarTail: consumed {offset}, total {}",
@@ -174,41 +202,4 @@ impl ExemplarTail {
             attrs,
         })
     }
-}
-
-#[inline]
-fn read_u8(bytes: &[u8], offset: &mut usize) -> AggResult<u8> {
-    if *offset >= bytes.len() {
-        return Err(AggError::Codec("unexpected EOF reading u8".to_string()));
-    }
-    let val = bytes[*offset];
-    *offset += 1;
-    Ok(val)
-}
-
-#[inline]
-fn read_u32_le(bytes: &[u8], offset: &mut usize) -> AggResult<u32> {
-    let next = *offset + 4;
-    if next > bytes.len() {
-        return Err(AggError::Codec("unexpected EOF reading u32".to_string()));
-    }
-    let slice = &bytes[*offset..next];
-    *offset = next;
-    let mut arr = [0u8; 4];
-    arr.copy_from_slice(slice);
-    Ok(u32::from_le_bytes(arr))
-}
-
-#[inline]
-fn read_slice<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> AggResult<&'a [u8]> {
-    let next = *offset + len;
-    if next > bytes.len() {
-        return Err(AggError::Codec(format!(
-            "unexpected EOF reading {len} bytes: offset {offset}, total {}",
-            bytes.len()
-        )));
-    }
-    let slice = &bytes[*offset..next];
-    *offset = next;
-    Ok(slice)
 }

@@ -26,6 +26,7 @@ fn test_shard_runtime(
         detected_otlp: Arc::new(AtomicBool::new(false)),
         output,
         router_stats: Arc::new(std::sync::Mutex::new(RouterStats::default())),
+        fail_next_flush: None,
     }
 }
 
@@ -148,10 +149,12 @@ shutdown:
 
     let cfg: SluiceConfig = serde_yaml_ng::from_str(&yaml).unwrap();
     let pipeline = SluicePipeline::new(cfg).unwrap();
+    let armed = pipeline.clone();
     let (tx, rx) = futures_mpsc::unbounded();
     let _out = Box::new(pipeline).transform_stream(rx);
-
-    StoreThread::fail_next_flush();
+    // Arm after spawn. The flag is read when the flush is sent, so the
+    // shard can already be parked in `select!`.
+    armed.arm_fail_next_flush();
 
     let mut log = LogEvent::default();
     let rfc = chrono::DateTime::from_timestamp_millis(1_728_000_000_000)

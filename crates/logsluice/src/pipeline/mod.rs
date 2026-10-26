@@ -59,6 +59,14 @@ impl ShardMicroBatch {
 #[derive(Clone, Debug)]
 pub struct SluicePipeline {
     cfg: SluiceConfig,
+    /// One-shot flush failure for the test that owns this pipeline.
+    ///
+    /// Cloned into every shard task. The store thread used to keep a
+    /// process-global `AtomicBool`, so the first shard to wake consumed it.
+    /// The flag lives here, and it is swapped only when that shard sends a
+    /// `StoreCommand::Flush`.
+    #[cfg(test)]
+    fail_next_flush: Arc<AtomicBool>,
 }
 
 /// Compatibility type alias for [`SluicePipeline`].
@@ -71,7 +79,22 @@ impl SluicePipeline {
     /// Returns [`AggError`](logsluice_core::error::AggError) if configuration validation or engine compilation fails.
     pub fn new(cfg: SluiceConfig) -> AggResult<Self> {
         let _ = cfg.engine()?;
-        Ok(Self { cfg })
+        Ok(Self {
+            cfg,
+            #[cfg(test)]
+            fail_next_flush: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Arms a one-shot `apply_flush` error on the next flush this pipeline sends.
+    ///
+    /// The arm can happen after [`SluicePipeline::transform_stream`] has spawned
+    /// the shard tasks. The flag is shared through [`Arc`] and read when the
+    /// `Flush` command is sent, so a shard already parked in `select!` still
+    /// observes it. Another pipeline in the process has its own flag.
+    #[cfg(test)]
+    pub(crate) fn arm_fail_next_flush(&self) {
+        self.fail_next_flush.store(true, Ordering::SeqCst);
     }
 
     /// Transforms an asynchronous input stream of [`LogEvent`]s into an output stream of summary,
@@ -85,11 +108,15 @@ impl SluicePipeline {
     {
         let (output_tx, output_rx) = futures_mpsc::channel::<LogEvent>(4096);
         let cfg = self.cfg;
+        #[cfg(test)]
+        let fail_next_flush = Some(Arc::clone(&self.fail_next_flush));
+        #[cfg(not(test))]
+        let fail_next_flush: Option<Arc<AtomicBool>> = None;
         let boxed_input: Pin<Box<dyn Stream<Item = LogEvent> + Send>> = Box::pin(input_rx);
 
         tokio::spawn(async move {
             // The failure is already on the output stream; the spawn has nowhere else to put it.
-            let _ = run_pipeline(cfg, boxed_input, output_tx).await;
+            let _ = run_pipeline(cfg, boxed_input, output_tx, fail_next_flush).await;
         });
 
         Box::pin(output_rx)
@@ -130,6 +157,8 @@ struct ShardRuntime {
     detected_otlp: Arc<AtomicBool>,
     output: futures_mpsc::Sender<LogEvent>,
     router_stats: Arc<Mutex<RouterStats>>,
+    /// Test-only one-shot flush failure shared with [`SluicePipeline`]; `None` in release builds.
+    fail_next_flush: Option<Arc<AtomicBool>>,
 }
 
 impl ShardRuntime {
@@ -140,6 +169,21 @@ impl ShardRuntime {
     async fn emit(&mut self, out: WorkerOutput<AckFinalizers>) -> bool {
         let mut cmds = out.commands.into_iter();
         while let Some(cmd) = cmds.next() {
+            // Swap only on Flush. Sampling at the top of the shard loop let the
+            // first idle shard take the flag, and a task already inside `select!`
+            // flushed once before it looked again. Test-only, so release builds
+            // carry no check even if `None` is not constant-propagated across
+            // the spawned tasks.
+            #[cfg(test)]
+            if matches!(cmd, StoreCommand::Flush(_))
+                && self.fail_next_flush.as_deref().is_some_and(|flag| {
+                    flag.load(Ordering::Relaxed) && flag.swap(false, Ordering::AcqRel)
+                })
+            {
+                self.store_handle.fail_next_flush();
+            }
+            #[cfg(not(test))]
+            let _ = &self.fail_next_flush;
             if let Err(unsent) = self.store_handle.try_send(cmd) {
                 self.worker.defer_command(unsent);
                 self.worker.requeue_commands(cmds);
@@ -436,10 +480,11 @@ async fn run_pipeline(
     cfg: SluiceConfig,
     input: Pin<Box<dyn Stream<Item = LogEvent> + Send>>,
     mut output_tx: futures_mpsc::Sender<LogEvent>,
+    fail_next_flush: Option<Arc<AtomicBool>>,
 ) -> AggResult<()> {
     let route_field = cfg.output.route_field.clone();
     let mut input = input;
-    if let Err(err) = run_pipeline_inner(cfg, &mut input, &mut output_tx).await {
+    if let Err(err) = run_pipeline_inner(cfg, &mut input, &mut output_tx, fail_next_flush).await {
         // `AckInner` defaults to Delivered. Events still sitting in the input
         // channel were never routed, and dropping the stream would ack them
         // as delivered. Nack the ones already buffered, then emit the
@@ -499,6 +544,7 @@ async fn run_pipeline_inner(
     cfg: SluiceConfig,
     input: &mut Pin<Box<dyn Stream<Item = LogEvent> + Send>>,
     output_tx: &mut futures_mpsc::Sender<LogEvent>,
+    fail_next_flush: Option<Arc<AtomicBool>>,
 ) -> AggResult<()> {
     let data_dir = cfg.storage.data_dir.clone();
     let shards = cfg.shards;
@@ -705,6 +751,7 @@ async fn run_pipeline_inner(
             detected_otlp: detected_otlp.clone(),
             output: output_tx.clone(),
             router_stats: router_stats_shared.clone(),
+            fail_next_flush: fail_next_flush.clone(),
         };
         let handle =
             tokio::spawn(runtime.shard_loop(store_events, store_thread, ingest_rx, control_rx));

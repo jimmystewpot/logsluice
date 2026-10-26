@@ -278,6 +278,24 @@ fn ticket_decoding_error_handling() {
     assert!(Ticket::decode(l, &bad_reason).is_err());
 }
 
+#[test]
+fn ticket_decode_rejects_an_entries_count_that_overflows_the_length() {
+    // `entry_len` is `20 + banks * 32`. `banks >= 1 << 28` makes
+    // `u32::MAX * entry_len` exceed `usize` on 64-bit, which is the branch
+    // Codecov cannot reach with a normal layout. The buffer stays 21 bytes:
+    // the overflow returns before `Vec::with_capacity`.
+    let layout = HeaderLayout {
+        banks: 1 << 28,
+        minmax_slots: 0,
+    };
+    let mut bytes = [0u8; 21];
+    bytes[16] = EmitReason::Close.to_u8();
+    bytes[17..21].copy_from_slice(&u32::MAX.to_le_bytes());
+    let err = Ticket::decode(layout, &bytes).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("overflow the length check"), "{message}");
+}
+
 proptest! {
     #[test]
     fn prop_test_numeric_header_roundtrip(

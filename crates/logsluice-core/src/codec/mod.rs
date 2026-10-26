@@ -1,5 +1,7 @@
 //! Codecs and plan mapping for headers, tails, and emission tickets.
 
+mod cursor;
+
 pub mod header;
 pub mod plan;
 pub mod tail;

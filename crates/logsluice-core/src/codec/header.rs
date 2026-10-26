@@ -1,5 +1,6 @@
 //! Fixed-width numeric aggregation header codec.
 
+use crate::codec::cursor::Cursor;
 use crate::codec::plan::HeaderLayout;
 use crate::error::{AggError, AggResult};
 
@@ -84,36 +85,26 @@ impl NumericHeader {
             )));
         }
 
-        let mut offset = 0;
+        let mut cur = Cursor::new(bytes);
 
-        let resource_scope_id = read_u32_le(bytes, &mut offset)?;
-        let slice_seq = read_u32_le(bytes, &mut offset)?;
-        let last_update_s = read_u32_le(bytes, &mut offset)?;
-        let flags = read_u32_le(bytes, &mut offset)?;
+        let resource_scope_id = cur.read_u32()?;
+        let slice_seq = cur.read_u32()?;
+        let last_update_s = cur.read_u32()?;
+        let flags = cur.read_u32()?;
 
         let mut total = Vec::with_capacity(layout.banks);
         for _ in 0..layout.banks {
-            let l0 = read_u64_le(bytes, &mut offset)?;
-            let l1 = read_u64_le(bytes, &mut offset)?;
-            let l2 = read_u64_le(bytes, &mut offset)?;
-            let l3 = read_u64_le(bytes, &mut offset)?;
-            total.push([l0, l1, l2, l3]);
+            total.push(cur.read_bank()?);
         }
 
         let mut emitted = Vec::with_capacity(layout.banks);
         for _ in 0..layout.banks {
-            let l0 = read_u64_le(bytes, &mut offset)?;
-            let l1 = read_u64_le(bytes, &mut offset)?;
-            let l2 = read_u64_le(bytes, &mut offset)?;
-            let l3 = read_u64_le(bytes, &mut offset)?;
-            emitted.push([l0, l1, l2, l3]);
+            emitted.push(cur.read_bank()?);
         }
 
         let mut minmax = Vec::with_capacity(layout.minmax_slots);
         for _ in 0..layout.minmax_slots {
-            let min_val = read_i64_le(bytes, &mut offset)?;
-            let max_val = read_i64_le(bytes, &mut offset)?;
-            minmax.push((min_val, max_val));
+            minmax.push(cur.read_minmax()?);
         }
 
         Ok(Self {
@@ -126,43 +117,4 @@ impl NumericHeader {
             minmax,
         })
     }
-}
-
-#[inline]
-fn read_u32_le(bytes: &[u8], offset: &mut usize) -> AggResult<u32> {
-    let next = *offset + 4;
-    if next > bytes.len() {
-        return Err(AggError::Codec("unexpected EOF reading u32".to_string()));
-    }
-    let slice = &bytes[*offset..next];
-    *offset = next;
-    let mut arr = [0u8; 4];
-    arr.copy_from_slice(slice);
-    Ok(u32::from_le_bytes(arr))
-}
-
-#[inline]
-fn read_u64_le(bytes: &[u8], offset: &mut usize) -> AggResult<u64> {
-    let next = *offset + 8;
-    if next > bytes.len() {
-        return Err(AggError::Codec("unexpected EOF reading u64".to_string()));
-    }
-    let slice = &bytes[*offset..next];
-    *offset = next;
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(slice);
-    Ok(u64::from_le_bytes(arr))
-}
-
-#[inline]
-fn read_i64_le(bytes: &[u8], offset: &mut usize) -> AggResult<i64> {
-    let next = *offset + 8;
-    if next > bytes.len() {
-        return Err(AggError::Codec("unexpected EOF reading i64".to_string()));
-    }
-    let slice = &bytes[*offset..next];
-    *offset = next;
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(slice);
-    Ok(i64::from_le_bytes(arr))
 }

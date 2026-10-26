@@ -1016,6 +1016,80 @@ fn deferred_flushes_swap_active_buffer_when_inflight_flush_completes() {
         ));
     }
 
+    // 1b. Two waiters in one FlushDone (drain + Closing window): the second
+    // waiter must not treat the buffer swapped by the first as committed (#41).
+    {
+        let (mut worker, res, res_hash, _dir) = make_worker(|c| {
+            c.window.duration = Duration::from_secs(60);
+            c.window.emit.close_jitter_max = Duration::ZERO;
+            c.window.max_close_delay = Duration::ZERO;
+        });
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 1, 1_000, &res, res_hash)],
+            1,
+            1_000,
+        );
+        let out = worker.flush_l1(1_000);
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
+
+        // Window 0 enters Closing and waits on the in-flight flush.
+        let out = worker.poll(Some(60_000), 60_000);
+        assert!(out.commands.is_empty());
+
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 2, 2_000, &res, res_hash)],
+            2,
+            60_000,
+        );
+        let out = worker.begin_drain(60_000);
+        assert!(out.commands.is_empty());
+
+        // First FlushDone: drain swaps the active buffer; the Closing window
+        // must keep waiting rather than starting its scan.
+        let out = worker.on_event(
+            StoreEvent::FlushDone {
+                finalizers: vec![1],
+                stats: Default::default(),
+                disk_bytes: 0,
+            },
+            60_000,
+        );
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
+        assert!(
+            !out.commands
+                .iter()
+                .any(|c| matches!(c, StoreCommand::Rows { .. }))
+        );
+
+        // Second FlushDone: swapped flush is durable, both waiters proceed.
+        let out = worker.on_event(
+            StoreEvent::FlushDone {
+                finalizers: vec![2],
+                stats: Default::default(),
+                disk_bytes: 0,
+            },
+            60_000,
+        );
+        assert!(out.commands.iter().any(|c| matches!(
+            c,
+            StoreCommand::Rows {
+                reason: EmitReason::Close,
+                ..
+            }
+        )));
+        assert!(out.commands.iter().any(|c| matches!(
+            c,
+            StoreCommand::Rows {
+                reason: EmitReason::Drain,
+                ..
+            }
+        )));
+    }
+
     // 2. Closing window with active buffer non-empty on FlushDone (line 1032)
     {
         let (mut worker, res, res_hash, _dir) = make_worker(|c| {

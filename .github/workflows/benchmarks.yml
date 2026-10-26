@@ -27,7 +27,9 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
       - name: Run Criterion hot_path quick suite
-        run: cargo bench -p logsluice-core --bench hot_path -- --quick
+        run: |
+          rm -rf target/criterion
+          cargo bench -p logsluice-core --bench hot_path -- --quick
 
   benchmark-continuous:
     name: Criterion Continuous Benchmark (main)
@@ -56,6 +58,7 @@ jobs:
       - name: Run Criterion hot_path in bencher format
         run: |
           set -o pipefail
+          rm -rf target/criterion
           cargo bench -p logsluice-core --bench hot_path -- --output-format bencher | tee bench-output.txt
       - name: Record benchmark result
         uses: benchmark-action/github-action-benchmark@v1

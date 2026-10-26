@@ -98,6 +98,10 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
         bench_wf.contains("set -o pipefail"),
         "benchmarks.yml must set -o pipefail when piping cargo bench output to tee"
     );
+    assert!(
+        bench_wf.contains("rm -rf target/criterion"),
+        "benchmarks.yml must remove target/criterion before cargo bench so empty cached base dirs do not corrupt bencher output"
+    );
 
     let dependabot = fs::read_to_string(root.join(".github/dependabot.yml")).unwrap();
     assert!(dependabot.contains("package-ecosystem: \"cargo\""));

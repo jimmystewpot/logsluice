@@ -26,6 +26,16 @@ use crate::store::thread::{StoreCommand, StoreEvent};
 use crate::worker::lifecycle::WindowPhase;
 use crate::worker::{EmitBatch, ShardWorker, UnackedTicket, WorkerOutput};
 
+/// Payload of a [`StoreEvent::Rows`], bundled so `on_rows` stays under
+/// clippy's argument limit.
+struct RowsEvent {
+    epoch_ms: u64,
+    reason: EmitReason,
+    rows: Vec<JoinedRow>,
+    next_after: Option<StorageKey24>,
+    recovery_ticket: Option<u64>,
+}
+
 /// Starts a flush of the active L1 buffer if it has data and no flush is in
 /// flight, then reports whether any buffered data is still not durable.
 ///
@@ -66,11 +76,13 @@ impl<F> ShardWorker<F> {
                 next_after,
                 recovery_ticket,
             } => self.on_rows(
-                epoch_ms,
-                reason,
-                rows,
-                next_after,
-                recovery_ticket,
+                RowsEvent {
+                    epoch_ms,
+                    reason,
+                    rows,
+                    next_after,
+                    recovery_ticket,
+                },
                 now_ms,
                 &mut output,
             ),
@@ -263,17 +275,14 @@ impl<F> ShardWorker<F> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn on_rows(
-        &mut self,
-        epoch_ms: u64,
-        reason: EmitReason,
-        rows: Vec<JoinedRow>,
-        next_after: Option<StorageKey24>,
-        recovery_ticket: Option<u64>,
-        now_ms: i64,
-        output: &mut WorkerOutput<F>,
-    ) {
+    fn on_rows(&mut self, event: RowsEvent, now_ms: i64, output: &mut WorkerOutput<F>) {
+        let RowsEvent {
+            epoch_ms,
+            reason,
+            rows,
+            next_after,
+            recovery_ticket,
+        } = event;
         self.store_queries_inflight = self.store_queries_inflight.saturating_sub(1);
 
         if let Some(ticket_id) = recovery_ticket {

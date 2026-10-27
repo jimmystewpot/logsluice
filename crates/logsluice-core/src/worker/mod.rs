@@ -41,7 +41,7 @@ pub const SPILL_RETRY_INTERVAL_MS: i64 = 60_000;
 struct UnackedTicket {
     ticket_id: u64,
     first_emitted_ms: i64,
-    records: Vec<SliceRecord>,
+    records: Arc<[SliceRecord]>,
     backoff_ms: i64,
     next_retry_ms: Option<i64>,
     spill_in_flight: bool,
@@ -183,7 +183,7 @@ pub struct EmitBatch {
     /// Associated delivery ticket ID.
     pub ticket_id: u64,
     /// Emitted aggregate slice records.
-    pub records: Vec<SliceRecord>,
+    pub records: Arc<[SliceRecord]>,
 }
 
 /// Snapshot of operational metrics and SLIs owned by the shard worker.

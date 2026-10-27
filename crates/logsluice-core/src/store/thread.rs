@@ -63,7 +63,7 @@ pub enum StoreCommand<F> {
         /// Delivery ticket ID being spilled.
         ticket_id: u64,
         /// Slice records to persist to the spill file.
-        records: Vec<SliceRecord>,
+        records: Arc<[SliceRecord]>,
     },
     /// Read all pending spilled ticket files from disk for replay.
     ReplaySpill,

@@ -623,11 +623,11 @@ async fn closed_output_channel_nacks_remaining_batches_and_stops_shard_loop() {
         emit: vec![
             EmitBatch {
                 ticket_id: 10,
-                records: vec![sample_slice_record(1)],
+                records: vec![sample_slice_record(1)].into(),
             },
             EmitBatch {
                 ticket_id: 20,
-                records: vec![sample_slice_record(2)],
+                records: vec![sample_slice_record(2)].into(),
             },
         ],
         release: Vec::new(),

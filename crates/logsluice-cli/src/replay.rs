@@ -56,7 +56,7 @@ impl DownstreamSink {
 
     /// Ingests an emitted delivery batch, recording duplicates and lane 0 counters.
     pub fn handle_batch(&mut self, batch: &EmitBatch) {
-        for record in &batch.records {
+        for record in batch.records.iter() {
             if !self.seen_slices.insert(record.slice_id.clone()) {
                 self.duplicates_removed += 1;
             } else {

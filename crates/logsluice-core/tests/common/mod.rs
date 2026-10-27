@@ -365,8 +365,8 @@ impl Harness {
     pub fn pump(&mut self, mut out: WorkerOutput<u32>) {
         loop {
             for batch in out.emit {
-                self.emitted.extend(batch.records.clone());
-                self.all_emitted.extend(batch.records);
+                self.emitted.extend(batch.records.iter().cloned());
+                self.all_emitted.extend(batch.records.iter().cloned());
                 self.unresolved_tickets.push(batch.ticket_id);
             }
             self.released.extend(out.release);

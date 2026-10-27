@@ -26,6 +26,32 @@ use crate::store::thread::{StoreCommand, StoreEvent};
 use crate::worker::lifecycle::WindowPhase;
 use crate::worker::{EmitBatch, ShardWorker, UnackedTicket, WorkerOutput};
 
+/// Coldest-first order: oldest `last_update_s`, then digest. Keys within a
+/// window are unique, so this is a total order and an unstable sort/select
+/// gives the same result as the stable sort it replaces.
+fn coldest_first(a: &JoinedRow, b: &JoinedRow) -> std::cmp::Ordering {
+    a.header
+        .last_update_s
+        .cmp(&b.header.last_update_s)
+        .then_with(|| a.key.digest.cmp(&b.key.digest))
+}
+
+/// Keeps the `n` coldest rows in place (O(len) select, no scratch buffer),
+/// optionally sorting that prefix coldest-first.
+fn keep_coldest(rows: &mut Vec<JoinedRow>, n: usize, sort: bool) {
+    if n == 0 {
+        rows.clear();
+        return;
+    }
+    if n < rows.len() {
+        rows.select_nth_unstable_by(n - 1, coldest_first);
+        rows.truncate(n);
+    }
+    if sort {
+        rows.sort_unstable_by(coldest_first);
+    }
+}
+
 /// Starts a flush of the active L1 buffer if it has data and no flush is in
 /// flight, then reports whether any buffered data is still not durable.
 ///
@@ -316,13 +342,7 @@ impl<F> ShardWorker<F> {
                     .evict_collected_rows
                     .extend(rows.into_iter().filter(|r| !r.key.is_overflow()));
                 if window.evict_collected_rows.len() > max_evict_keep * 2 {
-                    window.evict_collected_rows.sort_by(|a, b| {
-                        a.header
-                            .last_update_s
-                            .cmp(&b.header.last_update_s)
-                            .then_with(|| a.key.digest.cmp(&b.key.digest))
-                    });
-                    window.evict_collected_rows.truncate(max_evict_keep);
+                    keep_coldest(&mut window.evict_collected_rows, max_evict_keep, false);
                 }
                 if let Some(next) = next_after {
                     self.store_queries_inflight += 1;
@@ -339,19 +359,12 @@ impl<F> ShardWorker<F> {
                     let mut regular_rows = std::mem::take(&mut window.evict_collected_rows);
 
                     if !regular_rows.is_empty() {
-                        regular_rows.sort_by(|a, b| {
-                            a.header
-                                .last_update_s
-                                .cmp(&b.header.last_update_s)
-                                .then_with(|| a.key.digest.cmp(&b.key.digest))
-                        });
-
                         let evict_count = ((window.known.len() as f64 * 0.10).ceil() as usize)
                             .max(1)
                             .min(max_evict_keep)
                             .min(regular_rows.len());
-                        let to_evict: Vec<JoinedRow> =
-                            regular_rows.into_iter().take(evict_count).collect();
+                        keep_coldest(&mut regular_rows, evict_count, true);
+                        let to_evict = regular_rows;
 
                         let tickets = self.ledger.build(
                             epoch_ms,
@@ -742,5 +755,70 @@ impl<F> ShardWorker<F> {
         self.store_queries_inflight = 0;
         self.persist_tickets_inflight = 0;
         self.replay_spill_in_flight = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JoinedRow, coldest_first, keep_coldest};
+    use crate::codec::header::NumericHeader;
+    use crate::codec::plan::HeaderLayout;
+    use crate::key::StorageKey24;
+
+    fn row(last_update_s: u32, digest: u128) -> JoinedRow {
+        let mut header = NumericHeader::new_zeroed(
+            HeaderLayout {
+                banks: 1,
+                minmax_slots: 0,
+            },
+            1,
+        );
+        header.last_update_s = last_update_s;
+        JoinedRow {
+            key: StorageKey24 {
+                epoch_ms: 0,
+                digest,
+            },
+            header,
+            tail: None,
+        }
+    }
+
+    fn keys(rows: &[JoinedRow]) -> Vec<(u32, u128)> {
+        rows.iter()
+            .map(|r| (r.header.last_update_s, r.key.digest))
+            .collect()
+    }
+
+    #[test]
+    fn keep_coldest_matches_stable_sort_then_truncate() {
+        // Deterministic shuffle with repeated timestamps so the digest tie-break matters.
+        let mut seed = 0x9e37_79b9_u64;
+        let rows: Vec<JoinedRow> = (0..200u128)
+            .map(|d| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                row(
+                    ((seed >> 33) % 17) as u32,
+                    d.wrapping_mul(0x9e37) % 1000 + d * 1000,
+                )
+            })
+            .collect();
+        for n in [0, 1, 7, 50, 199, 200, 500] {
+            let mut expected = rows.clone();
+            expected.sort_by(coldest_first);
+            expected.truncate(n);
+
+            let mut got = rows.clone();
+            keep_coldest(&mut got, n, true);
+            assert_eq!(keys(&got), keys(&expected), "n = {n}");
+
+            let mut unsorted = rows.clone();
+            keep_coldest(&mut unsorted, n, false);
+            let mut unsorted_keys = keys(&unsorted);
+            unsorted_keys.sort_unstable();
+            let mut expected_keys = keys(&expected);
+            expected_keys.sort_unstable();
+            assert_eq!(unsorted_keys, expected_keys, "n = {n} (unsorted)");
+        }
     }
 }

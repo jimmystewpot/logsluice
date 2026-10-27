@@ -769,6 +769,11 @@ async fn run_pipeline_inner(
         .min(Duration::from_secs(1));
     let mut poll_interval = tokio::time::interval(poll_duration);
 
+    // Reused across events: `route` only pushes, and every inner Vec is
+    // emptied below, so this keeps its per-shard capacity instead of
+    // allocating a fresh `Vec<Vec<IngestItem>>` per event.
+    let mut router_out = RouterOutput::new(shards_count);
+
     'pipeline_loop: loop {
         tokio::select! {
             item = input.next() => {
@@ -777,11 +782,10 @@ async fn run_pipeline_inner(
                         let now_ms = chrono::Utc::now().timestamp_millis();
                         let finalizers = event.take_finalizers();
 
-                        let mut router_out = RouterOutput::new(shards_count);
                         router.route(event, now_ms, &mut router_out);
 
                         // Forward passthrough events with original finalizers preserved
-                        for mut pt in router_out.passthrough {
+                        for mut pt in router_out.passthrough.drain(..) {
                             pt.merge_finalizers(finalizers.clone());
                             if output_tx.send(pt).await.is_err() {
                                 finalizers.update_status(AckStatus::Errored);
@@ -796,10 +800,10 @@ async fn run_pipeline_inner(
                         }
 
                         // Buffer items per shard
-                        for (s_idx, mut items) in router_out.per_shard.into_iter().enumerate() {
+                        for (s_idx, items) in router_out.per_shard.iter_mut().enumerate() {
                             if !items.is_empty() {
                                 let mb = &mut micro_batches[s_idx];
-                                mb.items.append(&mut items);
+                                mb.items.append(items);
                                 mb.finalizer.merge(finalizers.clone());
                                 if mb.first_added.is_none() {
                                     mb.first_added = Some(tokio::time::Instant::now());

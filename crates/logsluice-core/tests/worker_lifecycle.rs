@@ -1355,4 +1355,169 @@ fn deferred_flushes_swap_active_buffer_when_inflight_flush_completes() {
             }
         ));
     }
+
+    // Issue #41: the scheduler sees a non-empty active buffer while a flush is
+    // already in flight, so `try_swap()` returns `None`. The pending flag must
+    // still be set so the emission runs once the flushes are durable.
+    fn finish_two_flushes(worker: &mut ShardWorker<u32>, now_ms: i64) -> Vec<StoreCommand<u32>> {
+        let out = worker.on_event(
+            StoreEvent::FlushDone {
+                finalizers: vec![1],
+                stats: Default::default(),
+                disk_bytes: 0,
+            },
+            now_ms,
+        );
+        assert_eq!(out.commands.len(), 1);
+        assert!(matches!(out.commands[0], StoreCommand::Flush(_)));
+        worker
+            .on_event(
+                StoreEvent::FlushDone {
+                    finalizers: vec![2],
+                    stats: Default::default(),
+                    disk_bytes: 0,
+                },
+                now_ms,
+            )
+            .commands
+    }
+
+    // 6. periodic: swap refused at schedule time (#41)
+    {
+        let (mut worker, res, res_hash, _dir) = make_worker(|c| {
+            c.window.duration = Duration::from_secs(60);
+            c.window.emit.strategy = EmitStrategy::Periodic;
+            c.window.emit.interval = Some(Duration::from_millis(500));
+        });
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 1, 1_000, &res, res_hash)],
+            1,
+            0,
+        );
+        let out = worker.flush_l1(0);
+        assert!(matches!(out.commands[..], [StoreCommand::Flush(_)]));
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 2, 1_500, &res, res_hash)],
+            2,
+            100,
+        );
+        let out = worker.poll(None, 500);
+        assert!(out.commands.is_empty());
+        let cmds = finish_two_flushes(&mut worker, 500);
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                StoreCommand::Rows {
+                    reason: EmitReason::Periodic,
+                    ..
+                }
+            )),
+            "periodic emission was dropped"
+        );
+    }
+
+    // 7. evict: swap refused at schedule time (#41)
+    {
+        let (mut worker, res, res_hash, _dir) = make_worker(|c| {
+            c.window.duration = Duration::from_secs(60);
+            c.cardinality.on_cap = OnCap::EvictCold;
+            c.cardinality.max_keys_per_window = 2;
+            c.cardinality.evict_high_water = 0.5;
+            c.cardinality.evict_interval = Duration::from_millis(500);
+        });
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 1, 1_000, &res, res_hash)],
+            1,
+            0,
+        );
+        let out = worker.flush_l1(0);
+        assert!(matches!(out.commands[..], [StoreCommand::Flush(_)]));
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 2, 1_500, &res, res_hash)],
+            2,
+            100,
+        );
+        let out = worker.poll(None, 500);
+        assert!(out.commands.is_empty());
+        let cmds = finish_two_flushes(&mut worker, 500);
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                StoreCommand::Rows {
+                    reason: EmitReason::Evict,
+                    ..
+                }
+            )),
+            "evict scan was never issued; evict_in_progress would stay set"
+        );
+    }
+
+    // 8. late revision: swap refused at schedule time (#41)
+    {
+        let (mut worker, res, res_hash, _dir) = make_worker(|c| {
+            c.window.duration = Duration::from_secs(60);
+            c.window.emit.close_jitter_max = Duration::ZERO;
+            c.window.max_close_delay = Duration::ZERO;
+            c.window.late_emit_interval = Duration::from_millis(500);
+        });
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 1, 1_000, &res, res_hash)],
+            1,
+            1_000,
+        );
+        let _ = worker.flush_l1(1_000);
+        let _ = worker.on_event(
+            StoreEvent::FlushDone {
+                finalizers: vec![1],
+                stats: Default::default(),
+                disk_bytes: 0,
+            },
+            1_000,
+        );
+        let _ = worker.poll(Some(60_000), 60_000);
+        let _ = worker.on_event(
+            StoreEvent::Rows {
+                epoch_ms: 0,
+                reason: EmitReason::Close,
+                rows: Vec::new(),
+                next_after: None,
+                recovery_ticket: None,
+            },
+            60_000,
+        );
+        // Late event, flushed explicitly so a flush is in flight.
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 99, 1_000, &res, res_hash)],
+            1,
+            60_100,
+        );
+        let out = worker.flush_l1(60_100);
+        assert!(matches!(out.commands[..], [StoreCommand::Flush(_)]));
+        // Second late event lands in the active buffer.
+        must_try_ingest(
+            &mut worker,
+            vec![make_item(0, 100, 1_000, &res, res_hash)],
+            2,
+            60_200,
+        );
+        let out = worker.poll(None, 60_600);
+        assert!(out.commands.is_empty());
+        let cmds = finish_two_flushes(&mut worker, 60_600);
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                StoreCommand::Rows {
+                    reason: EmitReason::LateRevision,
+                    ..
+                }
+            )),
+            "late revision was dropped"
+        );
+    }
 }

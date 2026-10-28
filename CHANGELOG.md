@@ -7,17 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-28
+
 ### Changed
 
-- Replaced point `get()` lookups on `_tail` during offline drain and keyed ticket replay with sequential merge-join scans (`ShardStore::rows_for_sorted`), eliminating random I/O bottlenecks when draining large PVC backlogs. Keyed scan reads now route through `ShardStore::counted_get` to enforce zero point lookups via the `scan_point_gets` metric and `drain: scan_point_gets=` CLI diagnostic output.
+- Expanded `Cargo.toml` package descriptions, crate-specific `keywords` and `categories`, and per-crate `README.md` landing pages for `logsluice-core`, `logsluice`, and `logsluice-cli` to clearly document the problems each crate solves and how it solves them for crates.io discoverability.
+- Fixed `aarch64-unknown-linux-gnu` release binary cross-compilation by installing `libc6-dev-arm64-cross` and made `publish-crates` idempotent when re-running on already-published crate versions.
 
-## [0.1.0] - 2026-10-20
+## [0.1.0] - 2026-10-28
 
 ### Added
 
 - **`logsluice-core` (`0.1.0`):**
   - Runtime-independent, Sans-I/O tumbling windowed aggregation engine (`ShardWorker`, `StoreThread`, `ShardStore`).
   - Single-database-per-shard `fjall` LSM storage with fixed-width `NumericHeader` (`w{epoch}_hdr`) and LZ4-compressed write-once `ExemplarTail` (`w{epoch}_tail`).
+  - Sequential merge-join scans (`ShardStore::rows`, `ShardStore::rows_for_sorted`) for window close, offline drain, and keyed ticket replay with `ShardStore::counted_get` enforcing zero point lookups (`scan_point_gets`).
   - Runtime-dispatched SIMD kernels (`AVX2` on `x86_64`, `NEON` on `aarch64`, and bit-identical scalar fallback) for counter accumulation, delta computation, min/max tracking, CIDR IP masking, and log template fingerprinting.
   - Lock-free double-buffered L1 coalescer (`L1Table` / `DoubleBuffer`) and pre-reserved `KnownKeySet`.
   - Per-partition watermark tracker (`WatermarkTracker`) with startup seed grace, caught-up idle detection, and wall-clock forced close.

@@ -77,8 +77,23 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
 
     let release_wf = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
     assert!(
-        release_wf.contains("gcc-aarch64-linux-gnu") && release_wf.contains("build-essential"),
-        "release.yml must install both build-essential and gcc-aarch64-linux-gnu"
+        release_wf.contains("gcc-aarch64-linux-gnu")
+            && release_wf.contains("libc6-dev-arm64-cross")
+            && release_wf.contains("build-essential"),
+        "release.yml must install build-essential, gcc-aarch64-linux-gnu, and libc6-dev-arm64-cross"
+    );
+    assert!(
+        release_wf.contains("fetch-depth: 0")
+            && release_wf.contains("git merge-base --is-ancestor HEAD origin/main"),
+        "release.yml must fetch full git history and verify tagged commit is an ancestor of origin/main"
+    );
+    assert!(
+        release_wf.contains("EXPECTED_TAG=\"v${CARGO_VERSION}\""),
+        "release.yml must verify pushed tag matches workspace Cargo.toml version"
+    );
+    assert!(
+        release_wf.contains("https://crates.io/api/v1/crates/"),
+        "release.yml must check crates.io before publishing so tag re-runs are idempotent"
     );
 
     let bench_wf = fs::read_to_string(root.join(".github/workflows/benchmarks.yml")).unwrap();
@@ -156,6 +171,23 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
                         "{crate_dir}/Cargo.toml must not contain inline version strings: {trimmed}"
                     );
                 }
+            }
+        }
+        let readme_path = root.join(crate_dir).join("README.md");
+        let readme = fs::read_to_string(&readme_path).unwrap();
+        assert!(
+            readme.contains("## The Problem It Solves")
+                && readme.contains("## How It Solves It")
+                && readme.contains("## When to Use Which Crate"),
+            "{crate_dir}/README.md must include '## The Problem It Solves', '## How It Solves It', and '## When to Use Which Crate' sections for crates.io discoverability"
+        );
+        for segment in readme.split("](").skip(1) {
+            if let Some((target, _)) = segment.split_once(')') {
+                let target = target.trim();
+                assert!(
+                    target.starts_with("https://") || target.starts_with('#'),
+                    "{crate_dir}/README.md contains non-absolute Markdown link target '{target}'; use https:// URLs so links work on crates.io"
+                );
             }
         }
     }

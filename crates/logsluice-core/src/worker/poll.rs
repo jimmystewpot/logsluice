@@ -14,6 +14,8 @@
 //! `process_closing_windows` flushes, then issues the close scan. `purge_closed_windows`
 //! drops a closed window only after lateness and only with no ticket still in flight.
 
+use std::sync::Arc;
+
 use crate::config::{EmitStrategy, OnCap};
 use crate::emission::EmitReason;
 use crate::key::StorageKey24;
@@ -65,7 +67,7 @@ impl<F> ShardWorker<F> {
                 unacked.spill_in_flight = true;
                 output.commands.push(StoreCommand::Spill {
                     ticket_id,
-                    records: unacked.records.clone(),
+                    records: Arc::clone(&unacked.records),
                 });
             }
         }
@@ -81,7 +83,7 @@ impl<F> ShardWorker<F> {
                 unacked.next_retry_ms = None;
                 output.emit.push(EmitBatch {
                     ticket_id: unacked.ticket_id,
-                    records: unacked.records.clone(),
+                    records: Arc::clone(&unacked.records),
                 });
             }
         }
@@ -132,8 +134,10 @@ impl<F> ShardWorker<F> {
                         if let Some(swapped) = self.double_buf.try_swap() {
                             self.last_flush_ms = now_ms;
                             output.commands.push(StoreCommand::Flush(swapped));
-                            window.periodic_flush_pending = true;
                         }
+                        // Even when the swap is refused because a flush is already
+                        // in flight, the emission must wait for it (#41).
+                        window.periodic_flush_pending = true;
                     } else if self.double_buf.flush_in_flight() {
                         window.periodic_flush_pending = true;
                     } else {
@@ -168,8 +172,10 @@ impl<F> ShardWorker<F> {
                     if let Some(swapped) = self.double_buf.try_swap() {
                         self.last_flush_ms = now_ms;
                         output.commands.push(StoreCommand::Flush(swapped));
-                        window.late_flush_pending = true;
                     }
+                    // Even when the swap is refused because a flush is already
+                    // in flight, the emission must wait for it (#41).
+                    window.late_flush_pending = true;
                 } else if self.double_buf.flush_in_flight() {
                     window.late_flush_pending = true;
                 } else {
@@ -210,8 +216,10 @@ impl<F> ShardWorker<F> {
                         if let Some(swapped) = self.double_buf.try_swap() {
                             self.last_flush_ms = now_ms;
                             output.commands.push(StoreCommand::Flush(swapped));
-                            window.evict_flush_pending = true;
                         }
+                        // Even when the swap is refused because a flush is already
+                        // in flight, the emission must wait for it (#41).
+                        window.evict_flush_pending = true;
                     } else if self.double_buf.flush_in_flight() {
                         window.evict_flush_pending = true;
                     } else {

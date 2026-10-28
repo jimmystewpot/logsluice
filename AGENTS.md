@@ -9,7 +9,7 @@ This document defines the architecture boundaries, coding standards, core state-
 - **`crates/logsluice-core` (`logsluice_core`):**
   - Runtime-independent, Sans-I/O windowed aggregation engine.
   - Must **never** depend on `tokio` or any collector framework. All disk I/O runs on a dedicated per-shard OS thread (`StoreThread`) communicating with `ShardWorker` via `StoreCommand` / `StoreEvent` channels.
-  - `src/worker/` is decomposed by responsibility (`mod.rs`, `events.rs`, `lifecycle.rs`, `poll.rs`, `recovery.rs`, `spill.rs`), and `src/codec/` shares wire cursor primitives via `cursor.rs`. Fault-injection hooks in `StoreThread` are compiled out (`#[cfg(test)]`) in non-test builds.
+  - `src/worker/` is decomposed by responsibility (`mod.rs`, `events.rs`, `lifecycle.rs`, `poll.rs`, `recovery.rs`, `spill.rs`), and `src/codec/` shares wire cursor primitives via `cursor.rs`. `StoreCommand` fault-injection variants (`TestPause`, `FailNextPersist`, `FailNextFlush`, `FailNextRows`, `FailNextSpill`) are `#[doc(hidden)]` test hooks, and pipeline-level flush fault injection (`SluicePipeline::fail_next_flush`) is gated behind `#[cfg(test)]`.
 - **`crates/logsluice` (`logsluice`):**
   - Standalone async `tokio` multi-shard pipeline (`SluicePipeline`), configuration (`SluiceConfig`), self-contained `LogEvent` / `FieldPath` / `AckNotifier`, field normalisers, native & OTLP JSON router/renderer, and `logsluice_*` metrics.
   - Must **never** depend on unpublished external collector crates (`vector-core`, `vector-lib`), ensuring 100% standalone `crates.io` publishability.
@@ -32,8 +32,8 @@ This document defines the architecture boundaries, coding standards, core state-
    - `missing_docs = "warn"` (enforced as error in CI via `-D warnings`) — every public struct, enum, trait, function, and module in `src/**` must have rustdoc comments.
    - Prefer `crate::` imports over `super::` in non-test modules (`super::` is permitted inside `#[cfg(test)]`).
 3. **Australian Business English & `crates.io` README Hygiene:**
-   - All documentation, `README.md` files, comments, and user-facing prose must be written in **Australian Business English** (e.g. *normaliser*, *normalisation*, *serialisation*, *acknowledgement*, *initialise*, *behaviour*, *optimise*, *artefact*), while keeping Rust symbols and YAML configuration keys (`Normalizer`, `normalizers:`, `AckFinalizers`, `serde`) exact.
-   - Each publishable crate's `README.md` (`crates/*/README.md`) must include `## The Problem It Solves`, `## How It Solves It`, and `## When to Use Which Crate`, and every Markdown link target (`](...)`) in `crates/*/README.md` must use an absolute `https://` URL (or `#` anchor) so links work when rendered on `crates.io` (enforced by `crates/logsluice-core/tests/repo_hygiene.rs`).
+   - All Markdown documentation, `README.md` files, and new or modified comments/user-facing prose must be written in **Australian Business English** (e.g. *normaliser*, *normalisation*, *serialisation*, *acknowledgement*, *initialise*, *behaviour*, *optimise*, *licence* as a noun), while keeping Rust symbols, SPDX identifiers, and YAML configuration keys (`Normalizer`, `normalizers:`, `AckFinalizers`, `Apache-2.0`, `serde`) exact.
+   - Each publishable crate's `README.md` (`crates/*/README.md`) must include `## The Problem It Solves`, `## How It Solves It`, `## When to Use Which Crate`, and `## Licence`, and every Markdown link target (`](...)`) in `crates/*/README.md` must use an absolute `https://` URL (or `#` anchor) so links work when rendered on `crates.io` (enforced by `crates/logsluice-core/tests/repo_hygiene.rs`).
 
 ---
 

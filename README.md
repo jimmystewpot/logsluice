@@ -15,11 +15,11 @@ It collapses high-volume telemetry streams (300,000+ EPS per cluster across wind
 
 ## Crate Architecture
 
-| Crate / Path | `crates.io` | Description |
+| Crate / Path | `crates.io` & `docs.rs` | Description |
 | :--- | :--- | :--- |
-| [`crates/logsluice-core`](crates/logsluice-core) | [![Crates.io](https://img.shields.io/crates/v/logsluice-core.svg)](https://crates.io/crates/logsluice-core) | Runtime-independent, Sans-I/O windowed aggregation engine: SIMD/scalar kernels, XXH3-128 key builder, double-buffered L1 coalescer, Fjall LSM `ShardStore` & `StoreThread`, watermark/offset/cardinality/ticket state machines, and `SpillWriter`. |
-| [`crates/logsluice`](crates/logsluice) | [![Crates.io](https://img.shields.io/crates/v/logsluice.svg)](https://crates.io/crates/logsluice) | Standalone async `tokio` multi-shard pipeline (`SluicePipeline`), `SluiceConfig`, self-contained `LogEvent` / `FieldPath` / `AckNotifier`, SIMD field normalisers, native & OTLP JSON (`ExportLogsServiceRequest`) router and renderer, and `logsluice_*` metrics. |
-| [`crates/logsluice-cli`](crates/logsluice-cli) | [![Crates.io](https://img.shields.io/crates/v/logsluice-cli.svg)](https://crates.io/crates/logsluice-cli) | Deterministic crash-recovery verification harness (`logsluice replay`) and offline PVC state drain tool (`logsluice drain`). |
+| [`crates/logsluice-core`](crates/logsluice-core) | [![Crates.io](https://img.shields.io/crates/v/logsluice-core.svg)](https://crates.io/crates/logsluice-core) [![Docs.rs](https://docs.rs/logsluice-core/badge.svg)](https://docs.rs/logsluice-core) | Runtime-independent, Sans-I/O windowed aggregation engine: SIMD/scalar kernels, XXH3-128 key builder, double-buffered L1 coalescer, Fjall LSM `ShardStore` & `StoreThread`, watermark/offset/cardinality/ticket state machines, and `SpillWriter`. |
+| [`crates/logsluice`](crates/logsluice) | [![Crates.io](https://img.shields.io/crates/v/logsluice.svg)](https://crates.io/crates/logsluice) [![Docs.rs](https://docs.rs/logsluice/badge.svg)](https://docs.rs/logsluice) | Standalone async `tokio` multi-shard pipeline (`SluicePipeline`), `SluiceConfig`, self-contained `LogEvent` / `FieldPath` / `AckNotifier`, SIMD field normalisers, native & OTLP JSON (`ExportLogsServiceRequest`) router and renderer, and `logsluice_*` metrics. |
+| [`crates/logsluice-cli`](crates/logsluice-cli) | [![Crates.io](https://img.shields.io/crates/v/logsluice-cli.svg)](https://crates.io/crates/logsluice-cli) [![Docs.rs](https://docs.rs/logsluice-cli/badge.svg)](https://docs.rs/logsluice-cli) | Deterministic crash-recovery verification harness (`logsluice replay`) and offline PVC state drain tool (`logsluice drain`). |
 | [`bridges/logsluice-vector`](bridges/logsluice-vector) | *(workspace-excluded)* | Optional thin adapter bridging `vector_lib::event::LogEvent` / `EventFinalizers` and `vector_core::transform::TaskTransform` to `logsluice::SluicePipeline`. |
 
 ---
@@ -85,6 +85,6 @@ cargo bench -p logsluice-core --bench hot_path -- --quick
 
 ---
 
-## License
+## Licence
 
 Licensed under the [Apache License, Version 2.0](LICENSE).

@@ -72,6 +72,6 @@ logsluice drain --data-dir /var/lib/logsluice --format ndjson > drained-slices.n
 - **Use [`logsluice`](https://crates.io/crates/logsluice)** to embed a standalone async `tokio` pipeline, OTLP/JSON router, field normalisers, and slice renderer in your Rust service or collector.
 - **Use [`logsluice-core`](https://crates.io/crates/logsluice-core)** if you need the runtime-independent, Sans-I/O tumbling-window aggregation engine and Fjall LSM store without `tokio`.
 
-## License
+## Licence
 
 Licensed under the Apache License, Version 2.0 ([`LICENSE`](https://github.com/jimmystewpot/logsluice/blob/main/LICENSE)).

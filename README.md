@@ -1,11 +1,13 @@
 # `logsluice`
 
+[![Crates.io](https://img.shields.io/crates/v/logsluice.svg)](https://crates.io/crates/logsluice)
+[![Docs.rs](https://docs.rs/logsluice/badge.svg)](https://docs.rs/logsluice)
 [![CI](https://github.com/jimmystewpot/logsluice/actions/workflows/ci.yml/badge.svg)](https://github.com/jimmystewpot/logsluice/actions/workflows/ci.yml)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=jimmystewpot_logsluice&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=jimmystewpot_logsluice)
 [![codecov](https://codecov.io/gh/jimmystewpot/logsluice/graph/badge.svg)](https://codecov.io/gh/jimmystewpot/logsluice)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-**`logsluice`** is a high-throughput, crash-exact, LSM-backed tumbling windowed log aggregation engine and OpenTelemetry (`OTLP`) / native log rollup pipeline written in Rust.
+**`logsluice`** is a high-throughput, crash-exact, LSM-backed tumbling-window log aggregation engine and OpenTelemetry (`OTLP`) / native log rollup pipeline written in Rust.
 
 It collapses high-volume telemetry streams (300,000+ EPS per cluster across windows up to 24 hours and 8M+ active keys per window) into immutable, deterministically identified summary slices (`window.slice_id`) backed by [`fjall`](https://crates.io/crates/fjall) LSM storage and runtime-dispatched SIMD kernels (`AVX2` on `x86_64`, `NEON` on `aarch64`, with bit-identical scalar fallback).
 
@@ -15,9 +17,9 @@ It collapses high-volume telemetry streams (300,000+ EPS per cluster across wind
 
 | Crate / Path | `crates.io` | Description |
 | :--- | :--- | :--- |
-| [`crates/logsluice-core`](crates/logsluice-core) | `logsluice-core` | Runtime-independent, Sans-I/O windowed aggregation engine: SIMD/scalar kernels, XXH3-128 key builder, double-buffered L1 coalescer, Fjall LSM `ShardStore` & `StoreThread`, watermark/offset/cardinality/ticket state machines, and `SpillWriter`. |
-| [`crates/logsluice`](crates/logsluice) | `logsluice` | Standalone async `tokio` multi-shard pipeline (`SluicePipeline`), `SluiceConfig`, self-contained `LogEvent` / `FieldPath` / `AckNotifier`, SIMD field normalizers, native & OTLP JSON (`ExportLogsServiceRequest`) router and renderer, and `logsluice_*` metrics. |
-| [`crates/logsluice-cli`](crates/logsluice-cli) | `logsluice-cli` (bin: `logsluice`) | Deterministic crash-recovery verification harness (`logsluice replay`) and offline PVC state drain tool (`logsluice drain`). |
+| [`crates/logsluice-core`](crates/logsluice-core) | [![Crates.io](https://img.shields.io/crates/v/logsluice-core.svg)](https://crates.io/crates/logsluice-core) | Runtime-independent, Sans-I/O windowed aggregation engine: SIMD/scalar kernels, XXH3-128 key builder, double-buffered L1 coalescer, Fjall LSM `ShardStore` & `StoreThread`, watermark/offset/cardinality/ticket state machines, and `SpillWriter`. |
+| [`crates/logsluice`](crates/logsluice) | [![Crates.io](https://img.shields.io/crates/v/logsluice.svg)](https://crates.io/crates/logsluice) | Standalone async `tokio` multi-shard pipeline (`SluicePipeline`), `SluiceConfig`, self-contained `LogEvent` / `FieldPath` / `AckNotifier`, SIMD field normalisers, native & OTLP JSON (`ExportLogsServiceRequest`) router and renderer, and `logsluice_*` metrics. |
+| [`crates/logsluice-cli`](crates/logsluice-cli) | [![Crates.io](https://img.shields.io/crates/v/logsluice-cli.svg)](https://crates.io/crates/logsluice-cli) | Deterministic crash-recovery verification harness (`logsluice replay`) and offline PVC state drain tool (`logsluice drain`). |
 | [`bridges/logsluice-vector`](bridges/logsluice-vector) | *(workspace-excluded)* | Optional thin adapter bridging `vector_lib::event::LogEvent` / `EventFinalizers` and `vector_core::transform::TaskTransform` to `logsluice::SluicePipeline`. |
 
 ---

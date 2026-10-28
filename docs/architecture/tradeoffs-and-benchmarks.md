@@ -42,7 +42,7 @@
 **The workload:**
 * A fixed-size header (about 112 B) is updated in place on every flush, for up to 8M keys per window.
 * An exemplar tail (about 250–500 B) is written once per key.
-* Keys are uniformly hashed, which is the worst case for leveled compaction: every flushed file covers the whole key range.
+* Keys are uniformly hashed, which is the worst case for levelled compaction: every flushed file covers the whole key range.
 
 | | **B: chosen** | A: fallback |
 |---|---|---|
@@ -196,7 +196,7 @@ Journal replay, key-only `_hdr` iteration (about 1.2–2.4 GB, sequential), rebu
 | Disk at threshold | New keys go to overflow (or are dropped, or are blocked); known keys keep updating; closing and purging still succeed. |
 | Stuck or unassigned partition | Wall-clock forced close at `end + max_close_delay`; `forced_closes_total` increments. |
 | Scan or DDoS | The resource is capped at its fair share; others are unaffected; overflow totals stay exact. |
-| Config change to grouping, normalizers or aggregations | Startup refused (pod-meta codec schema mismatch). Drain offline (`logsluice drain`), then redeploy. |
+| Config change to grouping, normalisers or aggregations | Startup refused (pod-meta codec schema mismatch). Drain offline (`logsluice drain`), then redeploy. |
 | Pod permanently removed | Partial slices drained on SIGTERM; any remainder via `logsluice drain` from the PVC. |
 
 ---

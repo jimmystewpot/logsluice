@@ -181,14 +181,42 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
                 && readme.contains("## When to Use Which Crate"),
             "{crate_dir}/README.md must include '## The Problem It Solves', '## How It Solves It', and '## When to Use Which Crate' sections for crates.io discoverability"
         );
-        for segment in readme.split("](").skip(1) {
-            if let Some((target, _)) = segment.split_once(')') {
-                let target = target.trim();
-                assert!(
-                    target.starts_with("https://") || target.starts_with('#'),
-                    "{crate_dir}/README.md contains non-absolute Markdown link target '{target}'; use https:// URLs so links work on crates.io"
-                );
+        for line in readme.lines() {
+            let mut rest = line;
+            while let Some(idx) = rest.find("](") {
+                rest = &rest[idx + 2..];
+                if let Some((target, after)) = rest.split_once(')') {
+                    let target = target.trim();
+                    assert!(
+                        target.starts_with("https://") || target.starts_with('#'),
+                        "{crate_dir}/README.md contains non-absolute Markdown link target '{target}'; use https:// URLs so links work on crates.io"
+                    );
+                    rest = after;
+                } else {
+                    break;
+                }
             }
         }
     }
+
+    let root_readme = fs::read_to_string(root.join("README.md")).unwrap();
+    for badge in [
+        "https://img.shields.io/crates/v/logsluice.svg",
+        "https://img.shields.io/crates/v/logsluice-core.svg",
+        "https://img.shields.io/crates/v/logsluice-cli.svg",
+        "https://docs.rs/logsluice/badge.svg",
+    ] {
+        assert!(
+            root_readme.contains(badge),
+            "root README.md must include badge {badge}"
+        );
+    }
+
+    let agents_md = fs::read_to_string(root.join("AGENTS.md")).unwrap();
+    assert!(
+        agents_md.contains("Australian Business English")
+            && agents_md.contains("Arc<[SliceRecord]>")
+            && agents_md.contains("select_nth_unstable_by"),
+        "AGENTS.md must document the Australian Business English standard and current hot-path/engine invariants"
+    );
 }

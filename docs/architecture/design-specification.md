@@ -116,7 +116,7 @@ Downstream idempotency **requires** the sink table to deduplicate on `window.sli
 │  1. Envelope detection / OTLP 1→N unpack (Arc<ResourceScopePayload>)    │
 │  2. Timestamp extraction, future-drift guard → route "quarantine"       │
 │  3. Partition watermark update; window assignment; late check → "late"  │
-│  4. Normalizers (SIMD CIDR / log fingerprint) on grouping fields        │
+│  4. Normalisers (SIMD CIDR / log fingerprint) on grouping fields        │
 │  5. XXH3-128 digest → StorageKey24; shard = digest_low64 % shards       │
 │  6. Append ShardIngressItem to per-shard micro-batch (256 items / 1ms)  │
 │     carries (topic, partition, offset) when configured                  │
@@ -154,7 +154,7 @@ data_dir/pod_meta.json                   pod-wide: salt, emitter_id, shards, win
 data_dir/shard_{n}/                      one fjall Database, one journal, one block cache
   ├── _meta                               copy of pod_meta fields, cross-checked on open (shards, salt, codec_schema,
   │                                       window_duration_ms, window_offset_ms)
-  ├── _resources                          ResourceScopeId(u32) → serialized (resource attrs, scope); refcount by window
+  ├── _resources                          ResourceScopeId(u32) → serialised (resource attrs, scope); refcount by window
   ├── _offsets                            (topic, partition) → highest offset durably applied by THIS shard
   ├── _tickets                            ticket_id(u64) → emission intent (Section 6.2)
   ├── w{epoch}_hdr                        StorageKey24 → NumericHeader (fixed width)
@@ -168,7 +168,7 @@ data_dir/shard_{n}/                      one fjall Database, one journal, one bl
 ### 4.2 Keys and Headers
 
 **`StorageKey24`** (`#[repr(C, align(8))]`, big-endian): `[window_epoch: u64 | digest: u128]`.
-* `digest = XXH3-128(salt, resource_scope_hash, severity, normalized_body, group_by values…)`.
+* `digest = XXH3-128(salt, resource_scope_hash, severity, normalised_body, group_by values…)`.
 * `salt` is generated on first start and **persisted in `_meta`**. Starting with a mismatched salt is refused (`AggError::MetaMismatch { field: "salt", .. }`).
 * Collision probability at 10⁷ keys per window is about 1.5×10⁻²⁵.
 
@@ -262,7 +262,7 @@ stateDiagram-v2
 * **Per-partition (default when `source_position` is configured).**
   * For each `(topic, partition)`: `W_p = max(event_time) − allowed_skew`.
   * Global `W = min(W_p)` over **known, non-idle** partitions.
-  * **Startup seed grace (normative):** On startup, `WatermarkTracker` is initialized with `started_ms = now_ms` (current wall-clock epoch ms) and `seed_grace_ms = window.max_close_delay`. All `(topic, partition)` pairs recovered from `_offsets` across shards are registered via `seed_known`. While any seeded partition remains unseen and `now_ms − started_ms <= seed_grace_ms`, `watermark()` returns `None` so caught-up partitions cannot prematurely close windows ahead of lagging partitions after a restart.
+  * **Startup seed grace (normative):** On startup, `WatermarkTracker` is initialised with `started_ms = now_ms` (current wall-clock epoch ms) and `seed_grace_ms = window.max_close_delay`. All `(topic, partition)` pairs recovered from `_offsets` across shards are registered via `seed_known`. While any seeded partition remains unseen and `now_ms − started_ms <= seed_grace_ms`, `watermark()` returns `None` so caught-up partitions cannot prematurely close windows ahead of lagging partitions after a restart.
 * **Idle rule.** A partition is excluded as idle only if it has been quiet for `idle_timeout` **and** its last event time was within `caught_up_threshold` (default 2m) of wall clock when it went quiet. A partition that is lagging is never treated as idle.
 * **Fallback (no Kafka metadata).** Per-source tracking on `source_id_field`, capped at `max_tracked_sources` with LRU eviction into `__default__`.
 * **Future-drift guard.** Events with `t > now + max_future_drift` are tagged `quarantine`. They never advance `W`.
@@ -282,7 +282,7 @@ stateDiagram-v2
 * **Per-resource fair share.** A single `ResourceScopeId` may hold at most `max_resource_share` of the shard cap (default 25%). New keys beyond its share go to that resource's overflow key `StorageKey24::overflow(epoch, resource_scope_id)`. Other resources are unaffected.
 * **`on_cap`**:
   * `overflow` (default): new keys over the cap go to their resource's overflow key. Totals stay exact; only per-key detail is lost.
-  * `evict_cold` (opt-in): when the shard reaches `evict_high_water` (90% of the cap), it scans the window (skipping overflow keys and keys currently present in `l1_active`) and emits Δ for the coldest 10% of keys by `last_update_s` as `evict` slices.
+  * `evict_cold` (opt-in): when the shard reaches `evict_high_water` (90% of the cap), it scans the window (skipping overflow keys and keys currently present in `l1_active`), selects the coldest 10% of keys by `last_update_s` in $O(N)$ via `select_nth_unstable_by`, and emits Δ as `evict` slices.
   * **Conditional Eviction Deletion Invariant (normative):** Because new events for an evicting key can arrive while the `evict` scan or ticket delivery is in flight (including across a crash/restart):
     1. When an event arrives in `try_ingest` for a known key, if `evict_in_progress` is true or `ledger.is_inflight(&key)` is true, `ShardWorker` attaches `Some(exemplar.into_tail())` to the L1 accumulation so its tail is preserved if the key was concurrently evicted.
     2. In `ShardStore::apply_ack`, when `ticket.reason == EmitReason::Evict`, after advancing `stored.emitted_counters += entry.delta` and `stored.slice_seq += 1`, the store **deletes the key from `w{epoch}_hdr` and `w{epoch}_tail` if and only if `stored.total_counters == stored.emitted_counters`**, returning the `Vec<(u128, u32)>` of `(digest, resource_scope_id)` pairs that were actually deleted in `StoreEvent::AckApplied { ticket_id, evicted_keys }`.
@@ -315,8 +315,8 @@ In `Closed`, late events update `total_counters` and mark the key in a small dir
 * **Attribute policies:**
   * `resource_attributes_exclude`: strips dynamic churn (`k8s.pod.uid`, `process.pid`, `service.instance.id`) in both `vector_native` and `otlp` modes.
   * `body_policy`:
-    * `keep_first_exemplar`: stores raw/normalized body in `ExemplarTail.body` and renders it to `"body"` (`vector_native`) or `logRecord.body` (`otlp`).
-    * `replace_with_template`: stores normalized/fingerprinted body in `ExemplarTail.body`, **omits `"body"`**, and renders the value into `attributes_policy.template_target_field` (default `"log.template"`) in `render_native` and as a `logRecord` attribute in `render_otlp`.
+    * `keep_first_exemplar`: stores raw/normalised body in `ExemplarTail.body` and renders it to `"body"` (`vector_native`) or `logRecord.body` (`otlp`).
+    * `replace_with_template`: stores normalised/fingerprinted body in `ExemplarTail.body`, **omits `"body"`**, and renders the value into `attributes_policy.template_target_field` (default `"log.template"`) in `render_native` and as a `logRecord` attribute in `render_otlp`.
     * `ignore`: omits body from digest and tail (`None`).
   * `unmatched_log_attributes`:
     * `drop` (default): `ExemplarTail.attrs` is empty.
@@ -340,11 +340,11 @@ In `Closed`, late events update `total_counters` and mark the key in a small dir
 ### 6.2 Output: Emission Tickets and Deterministic `slice_id`
 1. **Build.** Select up to `max_records_per_ticket` (default 500) keys whose Δ > 0 and that have no ticket in flight. For each, record `(digest, slice_seq, Δ, minmax snapshot)`.
 2. **Persist intent.** Write the ticket to `_tickets`, group-committed about every 100ms, and persist the journal **before** any record leaves the transform.
-3. **Render and send.** Render records with `slice_id = "{emitter_id}:{window_epoch}:{digest_hex}:{slice_seq}"` and attach an `AckFinalizer` via `AckNotifier`.
+3. **Render and send.** Render records (shared via `Arc<[SliceRecord]>`) with `slice_id = "{emitter_id}:{window_epoch}:{digest_hex}:{slice_seq}"` and attach an `AckFinalizer` via `AckNotifier`.
 4. **On `Delivered`.** In one batch: `emitted_counters += Δ`, `slice_seq += 1`, and delete the ticket (plus conditional key deletion when `reason == EmitReason::Evict` per Section 5.6). The journal persist may be lazy: if it is lost, the ticket is re-emitted with **the same `slice_id`s** and deduplicated downstream.
 5. **On `Errored` / `Rejected`.** Retry with backoff, keeping the same `slice_id`s. After `max_closing_duration`, render the ticket's records into `shard_{n}/spill/`, acknowledge the ticket in `_tickets` so the window can close and purge, and replay spilled files every 60s once acknowledgements recover.
 6. **On recovery.** Re-emit every non-spilled ticket verbatim, then resume normal operation.
-7. **Serialization.** A key with a ticket in flight is excluded from new tickets until that ticket resolves.
+7. **Serialisation.** A key with a ticket in flight is excluded from new tickets until that ticket resolves.
 
 ### 6.3 Upstream Finalizers
 Source finalizers (`AckFinalizers`) are held per micro-batch until the L1 flush that contains them has been committed and journal-persisted by `StoreThread`.
@@ -489,7 +489,7 @@ shutdown:
 * `max_close_delay ≤ allowed_skew`; `allowed_lateness > max_close_delay`.
 * `control_reserve_bytes ≥ max_disk_bytes`.
 * `shards` differs from the value persisted in `_meta`.
-* Pod metadata mismatch: `shards`, hash `salt`, `window_duration_ms`, `window_offset_ms`, or `codec_schema` differ between the active configuration, `data_dir/pod_meta.json`, and the per-shard copy in `_meta`. `codec_schema` begins with the 8-byte `HeaderLayout` prefix (`[banks: u32_le][minmax_slots: u32_le]`) followed by the canonical serialization of `aggregations`, `group_by`, `normalizers`, and `attributes_policy` (`body_policy`, `template_target_field`, `preserve_resource_and_scope`, `resource_attributes_exclude`, `unmatched_log_attributes`, `exclude_attributes`). **v1 refuses to start**; the operator drains the old state offline (`logsluice drain`) before changing shard count, window duration/offset, grouping, normalizers, attribute policies, or aggregations.
+* Pod metadata mismatch: `shards`, hash `salt`, `window_duration_ms`, `window_offset_ms`, or `codec_schema` differ between the active configuration, `data_dir/pod_meta.json`, and the per-shard copy in `_meta`. `codec_schema` begins with the 8-byte `HeaderLayout` prefix (`[banks: u32_le][minmax_slots: u32_le]`) followed by the canonical serialisation of `aggregations`, `group_by`, `normalizers`, and `attributes_policy` (`body_policy`, `template_target_field`, `preserve_resource_and_scope`, `resource_attributes_exclude`, `unmatched_log_attributes`, `exclude_attributes`). **v1 refuses to start**; the operator drains the old state offline (`logsluice drain`) before changing shard count, window duration/offset, grouping, normalisers, attribute policies, or aggregations.
 * Any aggregation other than `count | sum | min | max`.
 * `max_resource_share` outside (0, 1].
 

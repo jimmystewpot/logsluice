@@ -1,6 +1,24 @@
 # `logsluice-cli`
 
-Deterministic crash-recovery replay harness (`logsluice replay`) and offline PVC state drain utility (`logsluice drain`) for [`logsluice`](https://github.com/jimmystewpot/logsluice).
+[![Crates.io](https://img.shields.io/crates/v/logsluice-cli.svg)](https://crates.io/crates/logsluice-cli)
+[![Docs.rs](https://docs.rs/logsluice-cli/badge.svg)](https://docs.rs/logsluice-cli)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/jimmystewpot/logsluice/blob/main/LICENSE)
+
+Command-line operational and verification utility (`logsluice`) for the [`logsluice`](https://crates.io/crates/logsluice) log aggregation engine.
+
+## The Problem It Solves
+
+Operating stateful, disk-backed log aggregation pipelines in production introduces two operational challenges:
+
+1. **Proving Crash & NACK Exactness Before Deployment:** It is difficult to verify that a windowed aggregation engine preserves exact counter conservation (`emitted == ingested`) when worker threads crash mid-flush or downstream sinks return negative acknowledgements (NACKs).
+2. **Draining Stranded State from Offline Kubernetes PVCs:** When a StatefulSet pod is scaled down, migrated, or decommissioned before its tumbling windows finish closing, un-emitted counter deltas remain persisted in the pod's unmounted persistent volume (`data_dir`).
+
+## How It Solves It
+
+`logsluice-cli` provides two focused subcommands built on [`logsluice-core`](https://crates.io/crates/logsluice-core):
+
+- **`logsluice replay` (Deterministic Fault-Injection Verification):** Generates seeded synthetic event streams across multiple shards, injects periodic worker/store crashes (`--crash-every`) and downstream sink NACKs (`--nack-rate`), deduplicates emitted `window.slice_id` records, and asserts exact end-to-end counter conservation (`totals_match=true`).
+- **`logsluice drain` (Zero-Point-Lookup Offline PVC Drain):** Opens an offline `data_dir` on an unmounted volume, drains pending `spill/*.ndjson` files, streams all live Fjall LSM window partitions via sequential forward merge-join scans (`scan_point_gets=0`), and emits every remaining `total - emitted` counter delta as newline-delimited JSON (`ndjson`) on `stdout` with `emit_reason = "Drain"`.
 
 ## Installation
 
@@ -13,8 +31,6 @@ This installs the `logsluice` binary.
 ## Subcommands
 
 ### `logsluice replay`
-
-Deterministically generates synthetic events and drives them through `logsluice-core` `ShardWorker` and `StoreThread` instances, optionally injecting periodic crash-recovery cycles (`--crash-every`) and negative acknowledgments (`--nack-rate`), then verifies exact end-to-end counter conservation after deduplicating emitted `slice_id` records.
 
 ```bash
 logsluice replay \
@@ -41,17 +57,20 @@ Flags:
 - `--window-duration-ms <MS>`: Tumbling window duration in milliseconds (default: `10000`).
 - `--data-dir <PATH>`: Storage root directory.
 - `--crash-every <M>`: Simulate worker/store crash and recovery every `M` events.
-- `--nack-rate <RATE>`: Simulated downstream negative acknowledgment rate in `[0.0, 1.0]`.
+- `--nack-rate <RATE>`: Simulated downstream negative acknowledgement rate in `[0.0, 1.0]`.
 - `--stop-before-close`: Flush L1 to Fjall L2 and exit before advancing watermarks past window close (useful for testing `logsluice drain`).
 
 ### `logsluice drain`
-
-Scans an offline `data_dir` (e.g., an unmounted Kubernetes PVC during pod decommission or incident recovery), drains any pending `spill/*.ndjson` files, computes `total - emitted` counter deltas across all live Fjall window partitions, and emits each non-zero delta as a newline-delimited JSON (`ndjson`) `SliceRecord` on `stdout` with `emit_reason = "Drain"`.
 
 ```bash
 logsluice drain --data-dir /var/lib/logsluice --format ndjson > drained-slices.ndjson
 ```
 
+## Related Crates
+
+- [`logsluice`](https://crates.io/crates/logsluice): Standalone async `tokio` pipeline, OTLP/JSON router, field normalisers, and slice renderer.
+- [`logsluice-core`](https://crates.io/crates/logsluice-core): Runtime-independent, Sans-I/O tumbling-window aggregation engine and Fjall LSM store.
+
 ## License
 
-Licensed under the Apache License, Version 2.0 ([`LICENSE`](../../LICENSE)).
+Licensed under the Apache License, Version 2.0 ([`LICENSE`](https://github.com/jimmystewpot/logsluice/blob/main/LICENSE)).

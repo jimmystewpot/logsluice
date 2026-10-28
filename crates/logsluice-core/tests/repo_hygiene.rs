@@ -173,5 +173,15 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
                 }
             }
         }
+        let readme_path = root.join(crate_dir).join("README.md");
+        let readme = fs::read_to_string(&readme_path).unwrap();
+        assert!(
+            readme.contains("## The Problem It Solves") && readme.contains("## How It Solves It"),
+            "{crate_dir}/README.md must include '## The Problem It Solves' and '## How It Solves It' sections for crates.io discoverability"
+        );
+        assert!(
+            !readme.contains("](../") && !readme.contains("](../../"),
+            "{crate_dir}/README.md must use absolute URLs rather than relative parent links so links work on crates.io"
+        );
     }
 }

@@ -28,11 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Crash-exact input offset high-water marks (`PositionTracker`) and output emission ticket ledger (`TicketLedger` with deterministic `slice_id`s and NDJSON `SpillWriter`).
   - Per-resource fair-share cardinality protection (`CardinalityGuard`) supporting `overflow` and lossless `evict_cold` modes.
 - **`logsluice` (`0.1.0`):**
-  - Standalone async `tokio` multi-shard pipeline (`SluicePipeline`) with self-contained `LogEvent`, `FieldPath`, and `AckNotifier` end-to-end delivery acknowledgments.
+  - Standalone async `tokio` multi-shard pipeline (`SluicePipeline`) with self-contained `LogEvent`, `FieldPath`, and `AckNotifier` end-to-end delivery acknowledgements.
   - Symmetric auto-detecting native JSON and OpenTelemetry (`OTLP` `ExportLogsServiceRequest`) router and chunked envelope renderer.
   - Prometheus-compatible `logsluice_*` metrics exporter.
 - **`logsluice-cli` (`0.1.0`):**
-  - `logsluice replay` deterministic crash-recovery and negative-acknowledgment verification harness.
+  - `logsluice replay` deterministic crash-recovery and negative-acknowledgement verification harness.
   - `logsluice drain` offline PVC state drain tool.
 - **`bridges/logsluice-vector`:**
   - Optional Vector `TaskTransform` adapter bridging `vector_lib::event::LogEvent` to `logsluice::SluicePipeline`.

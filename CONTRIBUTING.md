@@ -6,7 +6,7 @@ Thank you for your interest in contributing to `logsluice`!
 
 - Rust `1.85+` (Rust 2024 edition; configured automatically via `rust-toolchain.toml`).
 - Standard `cargo` tools (`rustfmt`, `clippy`).
-- Optional: [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) for supply-chain and license checks, and [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) for local coverage reports.
+- Optional: [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) for supply-chain and licence checks, and [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) for local coverage reports.
 
 ## Building & Testing
 
@@ -33,9 +33,9 @@ cargo bench -p logsluice-core --bench hot_path -- --quick
 
 1. **Workspace Dependency Inheritance:** Add new dependencies to `[workspace.dependencies]` in the root `Cargo.toml` and reference them via `{ workspace = true }` in member crates.
 2. **No Panics in Library Code:** `unwrap()`, `expect()`, `dbg!()`, and `todo!()` are denied by workspace Clippy lints in non-test code. Propagate errors via `AggError` / `AggResult`.
-3. **Documentation:** All public items in library crates require doc comments (`missing_docs = "warn"`).
+3. **Documentation & Language:** All public items in library crates require doc comments (`missing_docs = "warn"`). Write all documentation, `README.md` files, and prose in Australian Business English.
 4. **SIMD Safety & Bit-Parity:** Any modification to SIMD kernels in `crates/logsluice-core/src/simd/` must wrap unsafe intrinsics in explicit `unsafe { ... }` blocks and pass `crates/logsluice-core/tests/simd_parity.rs`.
 
-## License
+## Licence
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in `logsluice` by you shall be licensed under the [Apache License, Version 2.0](LICENSE), without any additional terms or conditions.

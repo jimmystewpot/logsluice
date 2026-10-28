@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }))
     .ok_or("expected JSON object")?;
 
-    // Optional: attach an end-to-end acknowledgment receiver
+    // Optional: attach an end-to-end acknowledgement receiver
     let (ev, ack_rx) = ev.with_ack_notifier();
 
     let output_stream = Box::new(pipeline).transform_stream(stream::iter(vec![ev]));

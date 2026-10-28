@@ -16,7 +16,7 @@ cargo build --release -p logsluice-cli
 
 ### 1.1 Deterministic Replay & Crash-Recovery Verification (`logsluice replay`)
 
-`logsluice replay` generates a deterministic synthetic stream of log events and drives multi-shard `ShardWorker` + `StoreThread` instances while optionally injecting process crashes (`--crash-every`) and downstream negative acknowledgments (`--nack-rate`). It verifies that deduplicated downstream slice sums (`slice_id`) match exact ground-truth totals.
+`logsluice replay` generates a deterministic synthetic stream of log events and drives multi-shard `ShardWorker` + `StoreThread` instances while optionally injecting process crashes (`--crash-every`) and downstream negative acknowledgements (`--nack-rate`). It verifies that deduplicated downstream slice sums (`slice_id`) match exact ground-truth totals.
 
 ```bash
 logsluice replay \
@@ -91,7 +91,7 @@ At $8\text{M}$ keys per window:
 ## 3. Standard Operational Procedures
 
 ### 3.1 Schema or Shard-Count Migration
-`logsluice` persists `shards`, `salt`, `window_duration_ms`, `window_offset_ms`, and `codec_schema` in `pod_meta.json` and each shard's `_meta` keyspace. Starting a pod with modified grouping fields, normalizers, or shard count returns `AggError::MetaMismatch` to prevent silent hash-routing or binary-layout corruption.
+`logsluice` persists `shards`, `salt`, `window_duration_ms`, `window_offset_ms`, and `codec_schema` in `pod_meta.json` and each shard's `_meta` keyspace. Starting a pod with modified grouping fields, normalisers, or shard count returns `AggError::MetaMismatch` to prevent silent hash-routing or binary-layout corruption.
 
 **Migration steps:**
 1. Stop the collector pod cleanly (`SIGTERM` triggers `emit_partial` drain).
@@ -100,7 +100,7 @@ At $8\text{M}$ keys per window:
 4. Deploy the updated configuration.
 
 ### 3.2 Handling Downstream Sink Outages
-When downstream acknowledgments fail (`AckStatus::Errored` or `AckStatus::Rejected`), `ShardWorker` retries tickets with exponential backoff using identical `slice_id`s. If an outage exceeds `window.max_closing_duration`, pending tickets are written to `shard_{n}/spill/*.ndjson` so the closed window's LSM keyspaces can be purged on schedule. Once downstream acknowledgments recover, spill files are replayed automatically every 60 seconds.
+When downstream acknowledgements fail (`AckStatus::Errored` or `AckStatus::Rejected`), `ShardWorker` retries tickets with exponential backoff using identical `slice_id`s. If an outage exceeds `window.max_closing_duration`, pending tickets are written to `shard_{n}/spill/*.ndjson` so the closed window's LSM keyspaces can be purged on schedule. Once downstream acknowledgements recover, spill files are replayed automatically every 60 seconds.
 
 ---
 
@@ -113,9 +113,9 @@ When downstream acknowledgments fail (`AckStatus::Errored` or `AckStatus::Reject
 | `logsluice_events_routed_total` | Counter | `route` | Events routed to `late` or `quarantine` passthrough |
 | `logsluice_keys_known` | Gauge | `shard` | Active distinct keys tracked in `KnownKeySet` on the shard |
 | `logsluice_keys_overflowed_total` | Counter | `shard` | New keys redirected to per-resource overflow buckets (`shard_cap`, `resource_share`, or `disk_full`) |
-| `logsluice_keys_evicted_total` | Counter | `shard` | Cold keys evicted via `evict_cold` after slice acknowledgment |
+| `logsluice_keys_evicted_total` | Counter | `shard` | Cold keys evicted via `evict_cold` after slice acknowledgement |
 | `logsluice_tickets_inflight` | Gauge | `shard` | Emission tickets currently awaiting downstream `AckStatus` |
-| `logsluice_slices_reemitted_total` | Counter | `shard` | Slices re-emitted after negative acknowledgment or crash recovery |
+| `logsluice_slices_reemitted_total` | Counter | `shard` | Slices re-emitted after negative acknowledgement or crash recovery |
 | `logsluice_forced_closes_total` | Counter | `shard` | Windows forced into `Closing` by wall-clock `max_close_delay` |
 | `logsluice_disk_bytes` | Gauge | `shard` | Current on-disk footprint (`fjall` + spill files) for the shard |
 | `logsluice_resources_table_entries` | Gauge | `shard` | Interned `(resource, scope)` entries in `_resources` |

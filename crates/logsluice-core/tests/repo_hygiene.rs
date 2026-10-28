@@ -178,17 +178,49 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
         assert!(
             readme.contains("## The Problem It Solves")
                 && readme.contains("## How It Solves It")
-                && readme.contains("## When to Use Which Crate"),
-            "{crate_dir}/README.md must include '## The Problem It Solves', '## How It Solves It', and '## When to Use Which Crate' sections for crates.io discoverability"
+                && readme.contains("## When to Use Which Crate")
+                && readme.contains("## Licence"),
+            "{crate_dir}/README.md must include '## The Problem It Solves', '## How It Solves It', '## When to Use Which Crate', and '## Licence' sections"
         );
         for segment in readme.split("](").skip(1) {
-            if let Some((target, _)) = segment.split_once(')') {
-                let target = target.trim();
-                assert!(
-                    target.starts_with("https://") || target.starts_with('#'),
-                    "{crate_dir}/README.md contains non-absolute Markdown link target '{target}'; use https:// URLs so links work on crates.io"
-                );
-            }
+            let target = segment
+                .split_once(')')
+                .map(|(target, _)| target.trim())
+                .unwrap_or_else(|| {
+                    panic!("{crate_dir}/README.md contains unclosed Markdown link target")
+                });
+            assert!(
+                target.starts_with("https://") || target.starts_with('#'),
+                "{crate_dir}/README.md contains non-absolute Markdown link target '{target}'; use https:// URLs so links work on crates.io"
+            );
         }
     }
+
+    let root_readme = fs::read_to_string(root.join("README.md")).unwrap();
+    assert!(
+        root_readme.contains("## Licence"),
+        "root README.md must use Australian Business English heading '## Licence'"
+    );
+    for badge in [
+        "https://img.shields.io/crates/v/logsluice.svg",
+        "https://img.shields.io/crates/v/logsluice-core.svg",
+        "https://img.shields.io/crates/v/logsluice-cli.svg",
+        "https://docs.rs/logsluice/badge.svg",
+        "https://docs.rs/logsluice-core/badge.svg",
+        "https://docs.rs/logsluice-cli/badge.svg",
+    ] {
+        assert!(
+            root_readme.contains(badge),
+            "root README.md must include badge {badge}"
+        );
+    }
+
+    let agents_md = fs::read_to_string(root.join("AGENTS.md")).unwrap();
+    assert!(
+        agents_md.contains("Australian Business English")
+            && agents_md.contains("#[doc(hidden)]")
+            && agents_md.contains("Arc<[SliceRecord]>")
+            && agents_md.contains("select_nth_unstable_by"),
+        "AGENTS.md must document the Australian Business English standard and current hot-path/engine invariants"
+    );
 }

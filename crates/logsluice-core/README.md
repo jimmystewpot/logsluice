@@ -31,6 +31,6 @@ Stateful log aggregation and rollup engines in high-volume observability pipelin
 - **Use `logsluice-core`** directly if you are embedding the Sans-I/O aggregation engine into your own collector, custom thread-per-core runtime, or bespoke wire protocol.
 - **Use [`logsluice-cli`](https://crates.io/crates/logsluice-cli)** for the `logsluice replay` verification harness and `logsluice drain` offline Kubernetes PVC recovery tool.
 
-## License
+## Licence
 
 Licensed under the Apache License, Version 2.0 ([`LICENSE`](https://github.com/jimmystewpot/logsluice/blob/main/LICENSE)).

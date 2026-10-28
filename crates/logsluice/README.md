@@ -34,6 +34,6 @@ Run the included OpenTelemetry reduction example:
 cargo run -p logsluice --example otlp_reduce
 ```
 
-## License
+## Licence
 
 Licensed under the Apache License, Version 2.0 ([`LICENSE`](https://github.com/jimmystewpot/logsluice/blob/main/LICENSE)).

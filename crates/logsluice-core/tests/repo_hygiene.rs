@@ -80,6 +80,15 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
         release_wf.contains("gcc-aarch64-linux-gnu") && release_wf.contains("build-essential"),
         "release.yml must install both build-essential and gcc-aarch64-linux-gnu"
     );
+    assert!(
+        release_wf.contains("fetch-depth: 0")
+            && release_wf.contains("git merge-base --is-ancestor HEAD origin/main"),
+        "release.yml must fetch full git history and verify tagged commit is an ancestor of origin/main"
+    );
+    assert!(
+        release_wf.contains("EXPECTED_TAG=\"v${CARGO_VERSION}\""),
+        "release.yml must verify pushed tag matches workspace Cargo.toml version"
+    );
 
     let bench_wf = fs::read_to_string(root.join(".github/workflows/benchmarks.yml")).unwrap();
     assert!(

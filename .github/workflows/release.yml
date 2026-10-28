@@ -13,6 +13,21 @@ jobs:
     runs-on: arc-runner-logsluice
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Verify release tag is on main and matches Cargo.toml
+        run: |
+          git fetch origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "error: tag ${GITHUB_REF_NAME} ($(git rev-parse HEAD)) is not an ancestor of origin/main" >&2
+            exit 1
+          fi
+          CARGO_VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml | head -n 1)"
+          EXPECTED_TAG="v${CARGO_VERSION}"
+          if [ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]; then
+            echo "error: tag ${GITHUB_REF_NAME} does not match Cargo.toml workspace version (${EXPECTED_TAG})" >&2
+            exit 1
+          fi
       - name: Install C linker and build tools
         run: |
           if ! command -v cc >/dev/null 2>&1; then
@@ -52,6 +67,21 @@ jobs:
           - aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Verify release tag is on main and matches Cargo.toml
+        run: |
+          git fetch origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "error: tag ${GITHUB_REF_NAME} ($(git rev-parse HEAD)) is not an ancestor of origin/main" >&2
+            exit 1
+          fi
+          CARGO_VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml | head -n 1)"
+          EXPECTED_TAG="v${CARGO_VERSION}"
+          if [ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]; then
+            echo "error: tag ${GITHUB_REF_NAME} does not match Cargo.toml workspace version (${EXPECTED_TAG})" >&2
+            exit 1
+          fi
       - name: Install C linker and build tools
         run: |
           sudo apt-get update

@@ -1,6 +1,6 @@
 [package]
 name = "logsluice-core"
-description = "High-performance, crash-safe windowed log aggregation and reduction engine backed by Fjall LSM and SIMD kernels."
+description = "Sans-I/O tumbling-window log aggregation and deduplication engine. Collapses high-volume event streams into crash-exact summary slices using L1 double-buffered coalescing, SIMD kernels, and Fjall LSM storage with fair-share cardinality protection."
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
@@ -8,9 +8,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation.workspace = true
-keywords.workspace = true
-categories.workspace = true
+documentation = "https://docs.rs/logsluice-core"
+keywords = ["logging", "aggregation", "deduplication", "lsm", "simd"]
+categories = ["data-structures", "algorithms", "database", "concurrency"]
 
 [lints]
 workspace = true

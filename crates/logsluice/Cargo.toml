@@ -1,6 +1,6 @@
 [package]
 name = "logsluice"
-description = "Standalone async Tokio pipeline, OTLP/JSON log router, field normalizers, and slice renderer for logsluice."
+description = "Async Tokio log reduction pipeline for OpenTelemetry (OTLP) and JSON telemetry streams. Cuts observability ingestion volume 10-40x via sharded tumbling-window rollups, CIDR/template normalisation, and end-to-end delivery acknowledgements."
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
@@ -9,8 +9,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["opentelemetry", "logging", "observability", "telemetry", "aggregation"]
+categories = ["asynchronous", "development-tools::profiling", "concurrency", "data-structures"]
 
 [lints]
 workspace = true

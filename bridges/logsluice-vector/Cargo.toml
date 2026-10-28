@@ -2,7 +2,7 @@
 name = "logsluice-vector"
 description = "Optional Vector TaskTransform and LogEvent/EventFinalizers adapter bridge for logsluice."
 readme = "README.md"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"

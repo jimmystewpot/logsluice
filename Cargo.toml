@@ -10,7 +10,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -22,8 +22,8 @@ categories = ["development-tools::profiling", "data-structures"]
 
 [workspace.dependencies]
 # Internal workspace crates (version + path required for crates.io publishing)
-logsluice-core = { version = "0.1.0", path = "crates/logsluice-core" }
-logsluice = { version = "0.1.0", path = "crates/logsluice" }
+logsluice-core = { version = "0.1.1", path = "crates/logsluice-core" }
+logsluice = { version = "0.1.1", path = "crates/logsluice" }
 
 # Production dependencies
 bytes = { version = "1.11", features = ["serde"] }

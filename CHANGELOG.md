@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-28
+
+### Changed
+
+- Expanded `Cargo.toml` package descriptions, crate-specific `keywords` and `categories`, and per-crate `README.md` landing pages for `logsluice-core`, `logsluice`, and `logsluice-cli` to clearly document the problems each crate solves and how it solves them for crates.io discoverability.
+- Fixed `aarch64-unknown-linux-gnu` release binary cross-compilation by installing `libc6-dev-arm64-cross` and made `publish-crates` idempotent when re-running on already-published crate versions.
+
 ## [0.1.0] - 2026-10-28
 
 ### Added

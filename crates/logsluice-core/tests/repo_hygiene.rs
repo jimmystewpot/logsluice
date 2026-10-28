@@ -176,12 +176,19 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
         let readme_path = root.join(crate_dir).join("README.md");
         let readme = fs::read_to_string(&readme_path).unwrap();
         assert!(
-            readme.contains("## The Problem It Solves") && readme.contains("## How It Solves It"),
-            "{crate_dir}/README.md must include '## The Problem It Solves' and '## How It Solves It' sections for crates.io discoverability"
+            readme.contains("## The Problem It Solves")
+                && readme.contains("## How It Solves It")
+                && readme.contains("## When to Use Which Crate"),
+            "{crate_dir}/README.md must include '## The Problem It Solves', '## How It Solves It', and '## When to Use Which Crate' sections for crates.io discoverability"
         );
-        assert!(
-            !readme.contains("](../") && !readme.contains("](../../"),
-            "{crate_dir}/README.md must use absolute URLs rather than relative parent links so links work on crates.io"
-        );
+        for segment in readme.split("](").skip(1) {
+            if let Some((target, _)) = segment.split_once(')') {
+                let target = target.trim();
+                assert!(
+                    target.starts_with("https://") || target.starts_with('#'),
+                    "{crate_dir}/README.md contains non-absolute Markdown link target '{target}'; use https:// URLs so links work on crates.io"
+                );
+            }
+        }
     }
 }

@@ -66,10 +66,11 @@ Flags:
 logsluice drain --data-dir /var/lib/logsluice --format ndjson > drained-slices.ndjson
 ```
 
-## Related Crates
+## When to Use Which Crate
 
-- [`logsluice`](https://crates.io/crates/logsluice): Standalone async `tokio` pipeline, OTLP/JSON router, field normalisers, and slice renderer.
-- [`logsluice-core`](https://crates.io/crates/logsluice-core): Runtime-independent, Sans-I/O tumbling-window aggregation engine and Fjall LSM store.
+- **Use `logsluice-cli`** to install the `logsluice` binary for deterministic crash-recovery testing (`logsluice replay`) and offline Kubernetes PVC state draining (`logsluice drain`).
+- **Use [`logsluice`](https://crates.io/crates/logsluice)** to embed a standalone async `tokio` pipeline, OTLP/JSON router, field normalisers, and slice renderer in your Rust service or collector.
+- **Use [`logsluice-core`](https://crates.io/crates/logsluice-core)** if you need the runtime-independent, Sans-I/O tumbling-window aggregation engine and Fjall LSM store without `tokio`.
 
 ## License
 

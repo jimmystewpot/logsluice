@@ -132,8 +132,10 @@ impl<F> ShardWorker<F> {
                         if let Some(swapped) = self.double_buf.try_swap() {
                             self.last_flush_ms = now_ms;
                             output.commands.push(StoreCommand::Flush(swapped));
-                            window.periodic_flush_pending = true;
                         }
+                        // Even when the swap is refused because a flush is already
+                        // in flight, the emission must wait for it (#41).
+                        window.periodic_flush_pending = true;
                     } else if self.double_buf.flush_in_flight() {
                         window.periodic_flush_pending = true;
                     } else {
@@ -168,8 +170,10 @@ impl<F> ShardWorker<F> {
                     if let Some(swapped) = self.double_buf.try_swap() {
                         self.last_flush_ms = now_ms;
                         output.commands.push(StoreCommand::Flush(swapped));
-                        window.late_flush_pending = true;
                     }
+                    // Even when the swap is refused because a flush is already
+                    // in flight, the emission must wait for it (#41).
+                    window.late_flush_pending = true;
                 } else if self.double_buf.flush_in_flight() {
                     window.late_flush_pending = true;
                 } else {
@@ -210,8 +214,10 @@ impl<F> ShardWorker<F> {
                         if let Some(swapped) = self.double_buf.try_swap() {
                             self.last_flush_ms = now_ms;
                             output.commands.push(StoreCommand::Flush(swapped));
-                            window.evict_flush_pending = true;
                         }
+                        // Even when the swap is refused because a flush is already
+                        // in flight, the emission must wait for it (#41).
+                        window.evict_flush_pending = true;
                     } else if self.double_buf.flush_in_flight() {
                         window.evict_flush_pending = true;
                     } else {

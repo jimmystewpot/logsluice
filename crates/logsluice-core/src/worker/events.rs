@@ -289,13 +289,14 @@ impl<F> ShardWorker<F> {
             });
             match records {
                 Some(Ok(records)) => {
+                    let records: Arc<[SliceRecord]> = records.into();
                     self.stats.slices_reemitted_total += records.len() as u64;
                     self.unacked_tickets.insert(
                         ticket_id,
                         UnackedTicket {
                             ticket_id,
                             first_emitted_ms: now_ms,
-                            records: records.clone(),
+                            records: Arc::clone(&records),
                             backoff_ms: 5_000,
                             next_retry_ms: None,
                             spill_in_flight: false,
@@ -462,12 +463,13 @@ impl<F> ShardWorker<F> {
             ) else {
                 continue;
             };
+            let records: Arc<[SliceRecord]> = records.into();
             self.unacked_tickets.insert(
                 ticket_id,
                 UnackedTicket {
                     ticket_id,
                     first_emitted_ms: now_ms,
-                    records: records.clone(),
+                    records: Arc::clone(&records),
                     backoff_ms: 5_000,
                     next_retry_ms: None,
                     spill_in_flight: false,
@@ -724,7 +726,10 @@ impl<F> ShardWorker<F> {
         self.stats.spill_quarantined_total += quarantined;
         for (ticket_id, records) in entries {
             self.spilled_tickets.insert(ticket_id);
-            output.emit.push(EmitBatch { ticket_id, records });
+            output.emit.push(EmitBatch {
+                ticket_id,
+                records: records.into(),
+            });
         }
     }
 

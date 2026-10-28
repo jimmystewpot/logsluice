@@ -520,7 +520,7 @@ fn store_thread_emits_spill_failed_on_io_errors() {
 
     h.send(StoreCommand::Spill {
         ticket_id: 2,
-        records: Vec::new(),
+        records: Vec::new().into(),
     })
     .unwrap();
     match common::recv(&mut ev, Duration::from_secs(5)) {

@@ -77,8 +77,10 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
 
     let release_wf = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
     assert!(
-        release_wf.contains("gcc-aarch64-linux-gnu") && release_wf.contains("build-essential"),
-        "release.yml must install both build-essential and gcc-aarch64-linux-gnu"
+        release_wf.contains("gcc-aarch64-linux-gnu")
+            && release_wf.contains("libc6-dev-arm64-cross")
+            && release_wf.contains("build-essential"),
+        "release.yml must install build-essential, gcc-aarch64-linux-gnu, and libc6-dev-arm64-cross"
     );
     assert!(
         release_wf.contains("fetch-depth: 0")
@@ -88,6 +90,10 @@ fn workspace_manifests_use_workspace_dependencies_and_sonar_pins() {
     assert!(
         release_wf.contains("EXPECTED_TAG=\"v${CARGO_VERSION}\""),
         "release.yml must verify pushed tag matches workspace Cargo.toml version"
+    );
+    assert!(
+        release_wf.contains("https://crates.io/api/v1/crates/"),
+        "release.yml must check crates.io before publishing so tag re-runs are idempotent"
     );
 
     let bench_wf = fs::read_to_string(root.join(".github/workflows/benchmarks.yml")).unwrap();

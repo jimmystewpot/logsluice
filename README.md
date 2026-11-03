@@ -80,6 +80,7 @@ cargo bench -p logsluice-core --bench hot_path -- --quick
 
 - [Architecture & Engine Design Specification](docs/architecture/design-specification.md)
 - [Design Trade-offs & Measured Benchmark Gates](docs/architecture/tradeoffs-and-benchmarks.md)
+- [Research Foundations & Academic Literature](docs/architecture/research-foundations.md)
 - [Operations & CLI Runbook (`logsluice replay` / `logsluice drain` / Sizing / Metrics)](docs/operations/cli-and-runbook.md)
 - [Vector & Custom Collector Integration Guide](docs/integration/vector.md)
 

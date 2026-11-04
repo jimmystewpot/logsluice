@@ -18,7 +18,7 @@ jobs:
     name: Format & Clippy
     runs-on: arc-runner-logsluice
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
       - name: Install C linker and build tools
         run: |
           if ! command -v cc >/dev/null 2>&1; then
@@ -39,7 +39,7 @@ jobs:
     name: Supply-Chain Audit (cargo-deny)
     runs-on: arc-runner-logsluice
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-deny
@@ -51,7 +51,7 @@ jobs:
     name: Test
     runs-on: arc-runner-logsluice
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
       - name: Install C linker and build tools
         run: |
           if ! command -v cc >/dev/null 2>&1; then
@@ -68,7 +68,7 @@ jobs:
     name: crates.io Package Verification
     runs-on: arc-runner-logsluice
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
       - name: Install C linker and build tools
         run: |
           if ! command -v cc >/dev/null 2>&1; then
